@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-primary: 37 99 235;
+    --color-secondary: 226 232 240;
+    --color-tertiary: 148 163 184;
+    --color-background: 248 250 252;
+    --color-foreground: 15 23 42;
+    --color-success: 22 163 74;
+    --color-warning: 217 119 6;
+    --color-error: 220 38 38;
+    --color-info: 2 132 199;
+  }
+
+  .dark {
+    --color-primary: 96 165 250;
+    --color-secondary: 30 41 59;
+    --color-tertiary: 100 116 139;
+    --color-background: 15 23 42;
+    --color-foreground: 241 245 249;
+    --color-success: 34 197 94;
+    --color-warning: 245 158 11;
+    --color-error: 248 113 113;
+    --color-info: 56 189 248;
+  }
+
+  html,
+  body,
+  #root {
+    background-color: transparent;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer components {
+  .popover-shell {
+    @apply h-full w-full rounded-popover border border-tertiary/30 bg-background/95 text-foreground shadow-2xl backdrop-blur-xl flex flex-col overflow-hidden;
+  }
+
+  .surface-card {
+    @apply rounded-card border border-tertiary/25 bg-secondary/60 p-3 text-foreground transition-colors;
+  }
+
+  .ui-input {
+    @apply w-full rounded-lg border border-tertiary/35 bg-background px-3 py-2 text-sm text-foreground placeholder:text-tertiary focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30 transition;
+  }
+
+  .ui-btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .ui-btn-primary {
+    @apply ui-btn bg-primary text-background hover:bg-primary/90;
+  }
+
+  .ui-btn-secondary {
+    @apply ui-btn border border-tertiary/35 bg-secondary text-foreground hover:bg-secondary/80;
+  }
+
+  .ui-btn-danger {
+    @apply ui-btn bg-error/15 text-error border border-error/30 hover:bg-error/25;
+  }
+
+  .ui-badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+
+  .overlay-canvas {
+    @apply fixed inset-0 h-screen w-screen overflow-hidden bg-transparent pointer-events-none select-none;
+  }
+
+  .speech-bubble {
+    @apply max-w-xs rounded-2xl border border-primary/40 bg-background/95 px-3.5 py-2.5 text-xs font-medium leading-relaxed text-foreground shadow-xl backdrop-blur-md;
+  }
+}
