@@ -34,7 +34,7 @@ impl Default for AppConfig {
             ollama_api_key: String::new(),
             vision_model: "deepseek-v4.1-flash:cloud".to_string(),
             max_steps: 20,
-            step_delay_ms: 900,
+            step_delay_ms: 250,
             confirm_risky_actions: true,
         }
     }
@@ -67,9 +67,9 @@ impl AppConfig {
                 "max_steps must be between 1 and 50".to_string(),
             ));
         }
-        if !(200..=5000).contains(&self.step_delay_ms) {
+        if !(50..=5000).contains(&self.step_delay_ms) {
             return Err(ConfigError::Validation(
-                "step_delay_ms must be between 200 and 5000".to_string(),
+                "step_delay_ms must be between 50 and 5000".to_string(),
             ));
         }
         Ok(self)
@@ -254,7 +254,7 @@ mod tests {
         assert!(cfg.clone().sanitized().is_err());
 
         cfg.max_steps = 20;
-        cfg.step_delay_ms = 50;
+        cfg.step_delay_ms = 20;
         assert!(cfg.sanitized().is_err());
     }
 }

@@ -64,7 +64,7 @@ export const AppConfigSchema = z.object({
   ollamaApiKey: z.string(),
   visionModel: z.string().min(1),
   maxSteps: z.number().int().min(1).max(50),
-  stepDelayMs: z.number().int().min(200).max(5000),
+  stepDelayMs: z.number().int().min(50).max(5000),
   confirmRiskyActions: z.boolean(),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;

@@ -37,12 +37,99 @@ pub struct NextActionContext {
     pub base64_jpeg: String,
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FollowUpAction {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub narration: String,
+    pub action_type: String,
+    #[serde(default)]
+    pub target_ocr_id: Option<u32>,
+    #[serde(default)]
+    pub x_norm: Option<f64>,
+    #[serde(default)]
+    pub y_norm: Option<f64>,
+    #[serde(default)]
+    pub from_x_norm: Option<f64>,
+    #[serde(default)]
+    pub from_y_norm: Option<f64>,
+    #[serde(default)]
+    pub to_x_norm: Option<f64>,
+    #[serde(default)]
+    pub to_y_norm: Option<f64>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub replace: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub submit: bool,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub modifiers: Vec<String>,
+    #[serde(default)]
+    pub scroll_delta_y: Option<i32>,
+    #[serde(default)]
+    pub scroll_delta_x: Option<i32>,
+    #[serde(default)]
+    pub app_name: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub requires_confirmation: bool,
+}
+
+impl FollowUpAction {
+    pub fn into_planned_decision(self, plan_step_index: u32) -> PlannedActionDecision {
+        PlannedActionDecision {
+            thought: String::new(),
+            narration: self.narration,
+            plan_step_index,
+            action_type: self.action_type,
+            target_ocr_id: self.target_ocr_id,
+            x_norm: self.x_norm,
+            y_norm: self.y_norm,
+            from_x_norm: self.from_x_norm,
+            from_y_norm: self.from_y_norm,
+            to_x_norm: self.to_x_norm,
+            to_y_norm: self.to_y_norm,
+            text: self.text,
+            replace: self.replace,
+            submit: self.submit,
+            key: self.key,
+            modifiers: self.modifiers,
+            scroll_delta_y: self.scroll_delta_y,
+            scroll_delta_x: self.scroll_delta_x,
+            app_name: self.app_name,
+            url: self.url,
+            path: self.path,
+            wait_ms: self.wait_ms,
+            requires_confirmation: self.requires_confirmation,
+            summary: None,
+            plan_steps: Vec::new(),
+            follow_up_actions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedActionDecision {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub thought: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub narration: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub plan_step_index: u32,
     pub action_type: String,
     #[serde(default)]
@@ -61,13 +148,13 @@ pub struct PlannedActionDecision {
     pub to_y_norm: Option<f64>,
     #[serde(default)]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub replace: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub submit: bool,
     #[serde(default)]
     pub key: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub modifiers: Vec<String>,
     #[serde(default)]
     pub scroll_delta_y: Option<i32>,
@@ -81,10 +168,14 @@ pub struct PlannedActionDecision {
     pub path: Option<String>,
     #[serde(default)]
     pub wait_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub requires_confirmation: bool,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub plan_steps: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub follow_up_actions: Vec<FollowUpAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +188,7 @@ pub struct StepVerification {
     pub recovery_hint: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VerifyStepContext {
     pub goal: String,
@@ -138,6 +230,7 @@ struct OllamaChatRequest {
     messages: Vec<OllamaChatMessage>,
     stream: bool,
     think: bool,
+    keep_alive: String,
     format: serde_json::Value,
     options: OllamaChatOptions,
 }
@@ -145,6 +238,7 @@ struct OllamaChatRequest {
 #[derive(Debug, Serialize)]
 struct OllamaChatOptions {
     temperature: f32,
+    num_predict: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -173,11 +267,14 @@ impl OllamaAgentClient {
         let http = Client::builder()
             .timeout(AGENT_REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(8))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .map_err(|e| AgentError::Http(e.to_string()))?;
         Ok(Self { http })
     }
 
+    #[allow(dead_code)]
     pub async fn create_task_plan(
         &self,
         base_url: &str,
@@ -217,6 +314,7 @@ Respond strictly as a single valid JSON object with a \"steps\" array of short i
             Some(vec![base64_jpeg]),
             schema,
             0.2,
+            512,
             parse_task_plan_response,
         )
         .await
@@ -243,33 +341,29 @@ Respond strictly as a single valid JSON object with a \"steps\" array of short i
         let recent_block = format_lines_block(&ctx.recent_steps, "(none yet)");
         let ocr_block = format_lines_block(&ctx.ocr_lines, "(no visible targets)");
 
-        let system_prompt = "You are a precise, warm, playful macOS computer-use companion (like Bluey). \
-The screenshot has Set-of-Mark numbered boxes ([1], [2], ...) and a subtle 0.1-0.9 normalized coordinate grid overlaid on it. \
-Blue boxes are clickable macOS Accessibility UI elements (buttons, inputs, links, tabs); amber boxes are OCR text regions. \
-Each line in Visible targets lists [N] (Role) \"Label\" @(x=..., y=...) in normalized [0.0, 1.0] top-left coordinates. \
-Inspect the screenshot, Visible targets, plan, and recent steps, then choose the SINGLE best next action.\n\
+        let system_prompt = "You are a fast, precise macOS computer-use companion. \
+Screenshot overlays: Set-of-Mark boxes [N] (blue=Accessibility UI element, amber=OCR text) and 0.1-0.9 normalized grid. \
+Visible targets lists [N] (Role) \"Label\" @(x=..., y=...) in normalized [0.0, 1.0] top-left coordinates.\n\
 Available action_type values:\n\
-- \"click\", \"double_click\", \"right_click\": STRONGLY prefer target_ocr_id matching an exact [N] ID from Visible targets or the image overlay. Only use x_norm and y_norm (reading directly from the 0.1-0.9 grid) if no numbered box covers the exact element. Never invent a target_ocr_id that is not in Visible targets.\n\
-- \"drag\": drag from from_x_norm/from_y_norm to to_x_norm/to_y_norm (in [0.0, 1.0]) for sliders, drag-and-drop, or text selection.\n\
-- \"type_text\": set text (types into currently focused input). Set replace=true to clear existing/garbled text (Cmd+A + Backspace) first, and submit=true to press Return after typing.\n\
-- \"paste_text\": set text (uses clipboard + Cmd+V; fast and reliable for multi-line or long text in Notes/editors/forms). Supports replace=true and submit=true.\n\
-- \"read_clipboard\": reads current macOS clipboard text so you can inspect copied content on the next step.\n\
-- \"press_key\": set key (e.g. \"enter\", \"tab\", \"escape\", \"space\", \"backspace\", \"forward_delete\", \"a\"-\"z\", \"up\", \"down\") and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
-- \"scroll\": set scroll_delta_y (negative scrolls down, positive scrolls up), optional scroll_delta_x (horizontal), and optional target_ocr_id or x_norm/y_norm.\n\
-- \"open_app\": set app_name directly (prefer this over Spotlight when launching an app).\n\
-- \"focus_app\": set app_name to switch focus back to an already-open app.\n\
-- \"open_url\": set url (https:// or http://) AND optional app_name (e.g. \"Safari\" or \"Google Chrome\") to open a website directly in that browser in ONE step.\n\
-- \"open_path\": set path (e.g. \"~/Downloads/file.pdf\") to open a local file or folder.\n\
-- \"wait\": set wait_ms (100..5000) if waiting for a page or app to load.\n\
-- \"done\": set summary once the goal is visibly completed on screen.\n\
-- \"fail\": set summary explaining why the task cannot proceed.\n\
+- \"click\", \"double_click\", \"right_click\": set target_ocr_id matching an exact [N] ID from Visible targets, or x_norm and y_norm if no box covers it.\n\
+- \"drag\": set from_x_norm, from_y_norm, to_x_norm, to_y_norm in [0.0, 1.0].\n\
+- \"type_text\" / \"paste_text\": set text, optional replace=true (Cmd+A+Backspace first), optional submit=true (press Return). Prefer paste_text for multi-line or long text.\n\
+- \"read_clipboard\": reads current macOS clipboard text.\n\
+- \"press_key\": set key and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
+- \"scroll\": set scroll_delta_y (neg=down, pos=up), optional scroll_delta_x, optional target_ocr_id or x_norm/y_norm.\n\
+- \"open_app\" / \"focus_app\": set app_name.\n\
+- \"open_url\": set url (https/http) and optional app_name (e.g. \"Safari\" or \"Google Chrome\").\n\
+- \"open_path\": set path.\n\
+- \"wait\": set wait_ms (100..5000).\n\
+- \"done\" / \"fail\": set summary.\n\
 Rules:\n\
-1. To open a URL in a specific browser (e.g. Safari), use ONE open_url action with BOTH url and app_name. NEVER re-type the same URL into the address bar after open_url!\n\
-2. Never click an already-focused address bar expecting it to clear text—use open_url directly, press_key cmd+l, or type_text/paste_text with replace=true.\n\
-3. narration must be ONE friendly, concise line (max 16 words) telling the user what you are doing right now.\n\
-4. Set requires_confirmation=true before deleting, sending messages/emails, submitting forms, purchasing, or making irreversible changes.\n\
-5. Do not repeat an identical failed or ineffective step; adapt if the UI did not change.\n\
-6. Respond strictly as ONE raw JSON object with keys narration, plan_step_index, action_type, requires_confirmation, and relevant action fields (no markdown fences).";
+1. Always include required keys: narration, plan_step_index, action_type, requires_confirmation, plus only the fields needed for that action_type (omit unused fields).\n\
+2. When Plan is (no plan), include plan_steps (2-5 short imperative steps).\n\
+3. Optionally include follow_up_actions (0-3 steps) ONLY for deterministic sequences that do not need a fresh screenshot (e.g. click input -> paste_text with submit=true; open_app -> press_key cmd+n -> paste_text; open_url -> scroll). Never put done or fail in follow_up_actions.\n\
+4. Use ONE open_url with app_name to open a site; never re-type the same URL afterward.\n\
+5. narration: max 14 friendly words. Set requires_confirmation=true before deleting, sending, submitting forms, or purchasing.\n\
+6. Respond strictly as ONE raw JSON object (no markdown fences).\n\
+Example: {\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_type\":\"open_app\",\"app_name\":\"Calculator\",\"requires_confirmation\":false,\"plan_steps\":[\"Open Calculator\",\"Type 42*18\",\"Check result\"],\"follow_up_actions\":[{\"narration\":\"Compute 42*18\",\"action_type\":\"type_text\",\"text\":\"42*18\",\"submit\":true,\"requires_confirmation\":false}]}";
 
         let user_prompt = format!(
             "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible targets:\n{}",
@@ -285,10 +379,49 @@ Rules:\n\
             ocr_block
         );
 
+        let follow_up_action_enum = serde_json::json!([
+            "click",
+            "double_click",
+            "right_click",
+            "drag",
+            "type_text",
+            "paste_text",
+            "read_clipboard",
+            "press_key",
+            "scroll",
+            "open_app",
+            "focus_app",
+            "open_url",
+            "open_path",
+            "wait"
+        ]);
+
+        let follow_up_item_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "narration": { "type": "string" },
+                "action_type": { "type": "string", "enum": follow_up_action_enum },
+                "target_ocr_id": { "type": "integer" },
+                "x_norm": { "type": "number" },
+                "y_norm": { "type": "number" },
+                "text": { "type": "string" },
+                "replace": { "type": "boolean" },
+                "submit": { "type": "boolean" },
+                "key": { "type": "string" },
+                "modifiers": { "type": "array", "items": { "type": "string" } },
+                "scroll_delta_y": { "type": "integer" },
+                "app_name": { "type": "string" },
+                "url": { "type": "string" },
+                "path": { "type": "string" },
+                "wait_ms": { "type": "integer" },
+                "requires_confirmation": { "type": "boolean" }
+            },
+            "required": ["narration", "action_type", "requires_confirmation"]
+        });
+
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "thought": { "type": "string" },
                 "narration": { "type": "string" },
                 "plan_step_index": { "type": "integer" },
                 "action_type": {
@@ -312,26 +445,34 @@ Rules:\n\
                         "fail"
                     ]
                 },
-                "target_ocr_id": { "type": ["integer", "null"] },
-                "x_norm": { "type": ["number", "null"] },
-                "y_norm": { "type": ["number", "null"] },
-                "from_x_norm": { "type": ["number", "null"] },
-                "from_y_norm": { "type": ["number", "null"] },
-                "to_x_norm": { "type": ["number", "null"] },
-                "to_y_norm": { "type": ["number", "null"] },
-                "text": { "type": ["string", "null"] },
+                "target_ocr_id": { "type": "integer" },
+                "x_norm": { "type": "number" },
+                "y_norm": { "type": "number" },
+                "from_x_norm": { "type": "number" },
+                "from_y_norm": { "type": "number" },
+                "to_x_norm": { "type": "number" },
+                "to_y_norm": { "type": "number" },
+                "text": { "type": "string" },
                 "replace": { "type": "boolean" },
                 "submit": { "type": "boolean" },
-                "key": { "type": ["string", "null"] },
+                "key": { "type": "string" },
                 "modifiers": { "type": "array", "items": { "type": "string" } },
-                "scroll_delta_y": { "type": ["integer", "null"] },
-                "scroll_delta_x": { "type": ["integer", "null"] },
-                "app_name": { "type": ["string", "null"] },
-                "url": { "type": ["string", "null"] },
-                "path": { "type": ["string", "null"] },
-                "wait_ms": { "type": ["integer", "null"] },
+                "scroll_delta_y": { "type": "integer" },
+                "scroll_delta_x": { "type": "integer" },
+                "app_name": { "type": "string" },
+                "url": { "type": "string" },
+                "path": { "type": "string" },
+                "wait_ms": { "type": "integer" },
                 "requires_confirmation": { "type": "boolean" },
-                "summary": { "type": ["string", "null"] }
+                "summary": { "type": "string" },
+                "plan_steps": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "follow_up_actions": {
+                    "type": "array",
+                    "items": follow_up_item_schema
+                }
             },
             "required": ["narration", "plan_step_index", "action_type", "requires_confirmation"]
         });
@@ -345,11 +486,13 @@ Rules:\n\
             Some(vec![ctx.base64_jpeg]),
             schema,
             0.15,
+            1024,
             parse_action_decision_response,
         )
         .await
     }
 
+    #[allow(dead_code)]
     pub async fn verify_step_outcome(
         &self,
         base_url: &str,
@@ -408,6 +551,7 @@ Respond strictly as ONE raw JSON object with keys status, observation, goal_achi
             Some(vec![ctx.after_base64_jpeg]),
             schema,
             0.1,
+            512,
             parse_step_verification_response,
         )
         .await
@@ -462,11 +606,13 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
             Some(vec![ctx.base64_jpeg]),
             schema,
             0.2,
+            512,
             parse_recovery_plan_response,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_structured_json<T, F>(
         &self,
         base_url: &str,
@@ -477,6 +623,7 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
         images: Option<Vec<String>>,
         schema: serde_json::Value,
         base_temp: f32,
+        num_predict: u32,
         parser: F,
     ) -> Result<T, AgentError>
     where
@@ -514,8 +661,12 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
                 ],
                 stream: false,
                 think: false,
+                keep_alive: "15m".to_string(),
                 format,
-                options: OllamaChatOptions { temperature },
+                options: OllamaChatOptions {
+                    temperature,
+                    num_predict,
+                },
             };
 
             match self.post_chat_once(base_url, api_key, &req).await {
@@ -524,7 +675,7 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
                     Err(err) => {
                         last_err = Some(err);
                         if attempt < 2 {
-                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            tokio::time::sleep(Duration::from_millis(150)).await;
                             continue;
                         }
                     }
@@ -533,7 +684,7 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
                     let retryable = is_retryable_error(&err);
                     last_err = Some(err);
                     if retryable && attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(350)).await;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                         continue;
                     }
                     break;
@@ -614,14 +765,9 @@ pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> 
     Ok(TaskPlan { steps })
 }
 
-pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDecision, AgentError> {
-    let chat: OllamaChatResponse = serde_json::from_str(raw_json)
-        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
-    let mut decision: PlannedActionDecision = parse_json_from_message(&chat)?;
-
-    decision.action_type = decision.action_type.trim().to_ascii_lowercase();
-    let valid_action = matches!(
-        decision.action_type.as_str(),
+fn is_supported_follow_up_action(action_type: &str) -> bool {
+    matches!(
+        action_type,
         "click"
             | "double_click"
             | "right_click"
@@ -636,9 +782,17 @@ pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDec
             | "open_url"
             | "open_path"
             | "wait"
-            | "done"
-            | "fail"
-    );
+    )
+}
+
+pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDecision, AgentError> {
+    let chat: OllamaChatResponse = serde_json::from_str(raw_json)
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let mut decision: PlannedActionDecision = parse_json_from_message(&chat)?;
+
+    decision.action_type = decision.action_type.trim().to_ascii_lowercase();
+    let valid_action = is_supported_follow_up_action(decision.action_type.as_str())
+        || matches!(decision.action_type.as_str(), "done" | "fail");
     if !valid_action {
         return Err(AgentError::MalformedPayload(format!(
             "unsupported action_type \"{}\"",
@@ -662,6 +816,38 @@ pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDec
         .summary
         .map(|s| sanitize_line(&s, 280))
         .filter(|s| !s.is_empty());
+
+    decision.plan_steps = decision
+        .plan_steps
+        .into_iter()
+        .map(|s| sanitize_line(&s, 140))
+        .filter(|s| !s.is_empty())
+        .take(6)
+        .collect();
+
+    decision.follow_up_actions = decision
+        .follow_up_actions
+        .into_iter()
+        .filter_map(|mut act| {
+            act.action_type = act.action_type.trim().to_ascii_lowercase();
+            if !is_supported_follow_up_action(act.action_type.as_str()) {
+                return None;
+            }
+            act.narration = sanitize_line(&act.narration, 180);
+            if act.narration.is_empty() {
+                act.narration = format!("Performing {}", act.action_type);
+            }
+            act.target_ocr_id = act.target_ocr_id.filter(|id| *id >= 1);
+            act.x_norm = act.x_norm.map(|v| v.clamp(0.0, 1.0));
+            act.y_norm = act.y_norm.map(|v| v.clamp(0.0, 1.0));
+            act.from_x_norm = act.from_x_norm.map(|v| v.clamp(0.0, 1.0));
+            act.from_y_norm = act.from_y_norm.map(|v| v.clamp(0.0, 1.0));
+            act.to_x_norm = act.to_x_norm.map(|v| v.clamp(0.0, 1.0));
+            act.to_y_norm = act.to_y_norm.map(|v| v.clamp(0.0, 1.0));
+            Some(act)
+        })
+        .take(3)
+        .collect();
 
     Ok(decision)
 }
@@ -760,7 +946,7 @@ fn parse_json_from_message<T: DeserializeOwned>(
     let detail = if preview_source.is_empty() {
         "empty assistant content".to_string()
     } else {
-        format!("unparseable assistant output: {}", sanitize_line(&preview_source, 120))
+        format!("unparseable assistant output: {}", sanitize_line(&preview_source, 260))
     };
 
     Err(AgentError::MalformedPayload(detail))
@@ -982,5 +1168,52 @@ mod tests {
             parse_action_decision_response(empty_content),
             Err(AgentError::MalformedPayload(_))
         ));
+    }
+
+    #[test]
+    fn parses_plan_steps_and_follow_up_actions_with_caps_and_filtering() {
+        let raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"narration\":\"Opening Notes\",\"plan_step_index\":0,\"action_type\":\"open_app\",\"app_name\":\"Notes\",\"requires_confirmation\":false,\"plan_steps\":[\"Open Notes\",\"Create new note\",\"\",\"Paste checklist\"],\"follow_up_actions\":[{\"narration\":\"New note\",\"action_type\":\"press_key\",\"key\":\"n\",\"modifiers\":[\"cmd\"],\"requires_confirmation\":false},{\"narration\":\"Bad terminal\",\"action_type\":\"done\",\"requires_confirmation\":false},{\"narration\":\"Click area\",\"action_type\":\"click\",\"x_norm\":1.5,\"y_norm\":-0.2,\"target_ocr_id\":0,\"requires_confirmation\":false},{\"narration\":\"Paste\",\"action_type\":\"paste_text\",\"text\":\"- Task\",\"submit\":true,\"requires_confirmation\":false},{\"narration\":\"Extra\",\"action_type\":\"scroll\",\"scroll_delta_y\":-3,\"requires_confirmation\":false}]}"
+            }
+        }"#;
+
+        let dec = parse_action_decision_response(raw).expect("valid batched decision");
+        assert_eq!(dec.plan_steps, vec!["Open Notes", "Create new note", "Paste checklist"]);
+        assert_eq!(dec.follow_up_actions.len(), 3);
+        assert_eq!(dec.follow_up_actions[0].action_type, "press_key");
+        assert_eq!(dec.follow_up_actions[1].action_type, "click");
+        assert_eq!(dec.follow_up_actions[1].x_norm, Some(1.0));
+        assert_eq!(dec.follow_up_actions[1].y_norm, Some(0.0));
+        assert_eq!(dec.follow_up_actions[1].target_ocr_id, None);
+        assert_eq!(dec.follow_up_actions[2].action_type, "paste_text");
+
+        let converted = dec.follow_up_actions[2].clone().into_planned_decision(1);
+        assert_eq!(converted.plan_step_index, 1);
+        assert_eq!(converted.action_type, "paste_text");
+        assert!(converted.submit);
+    }
+
+    #[test]
+    fn handles_explicit_null_fields_gracefully() {
+        let raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"narration\":null,\"plan_step_index\":null,\"action_type\":\"open_app\",\"app_name\":\"Calculator\",\"modifiers\":null,\"replace\":null,\"submit\":null,\"requires_confirmation\":null,\"plan_steps\":null,\"follow_up_actions\":null}"
+            }
+        }"#;
+
+        let dec = parse_action_decision_response(raw).expect("null fields should default cleanly");
+        assert_eq!(dec.action_type, "open_app");
+        assert_eq!(dec.app_name.as_deref(), Some("Calculator"));
+        assert_eq!(dec.narration, "Performing open_app");
+        assert_eq!(dec.plan_step_index, 0);
+        assert!(dec.modifiers.is_empty());
+        assert!(!dec.replace);
+        assert!(!dec.submit);
+        assert!(!dec.requires_confirmation);
+        assert!(dec.plan_steps.is_empty());
+        assert!(dec.follow_up_actions.is_empty());
     }
 }

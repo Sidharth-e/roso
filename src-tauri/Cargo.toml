@@ -35,3 +35,9 @@ objc2-core-foundation = { version = "0.3", features = ["CFBase", "CFData", "CFCG
 objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGDataProvider", "CGColorSpace", "CGWindow", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "objc2"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPanel", "NSWindow", "NSResponder", "NSScreen", "NSEvent", "NSGraphics", "NSColor", "NSView", "objc2-core-foundation"] }
 objc2-vision = { version = "0.3", features = ["VNObservation", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "objc2-core-graphics"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.image]
+opt-level = 3

@@ -110,7 +110,7 @@ export function PointerOverlay() {
                   scale: 1,
                 }}
                 exit={{ opacity: 0, scale: 0.94 }}
-                transition={{ duration: 0.2 }}
+                transition={{ duration: 0.12 }}
                 className="fixed left-0 top-0 rounded-md border-2 border-primary bg-primary/10 shadow-sm pointer-events-none"
               />
             ) : null}
@@ -131,9 +131,9 @@ export function PointerOverlay() {
               }}
               transition={{
                 type: "spring",
-                stiffness: 240,
-                damping: 24,
-                mass: 0.8,
+                stiffness: 420,
+                damping: 30,
+                mass: 0.5,
               }}
               className="fixed left-0 top-0 pointer-events-none"
             >
@@ -175,9 +175,9 @@ export function PointerOverlay() {
                   exit={{ opacity: 0, y: -6, scale: 0.94 }}
                   transition={{
                     type: "spring",
-                    stiffness: 280,
-                    damping: 24,
-                    delay: 0.08,
+                    stiffness: 420,
+                    damping: 30,
+                    delay: 0,
                   }}
                   className={`speech-bubble ${bubbleOffsetClass}`}
                 >

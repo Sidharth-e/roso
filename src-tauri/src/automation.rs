@@ -936,7 +936,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             .ok_or(AutomationError::EventCreationFailed)?;
             CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(12));
 
             let clicks = if *double { 2 } else { 1 };
             for click_state in 1..=clicks {
@@ -957,10 +957,10 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                     click_state,
                 );
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-                thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(10));
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
                 if click_state < clicks {
-                    thread::sleep(Duration::from_millis(45));
+                    thread::sleep(Duration::from_millis(25));
                 }
             }
             Ok(())
@@ -984,7 +984,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             .ok_or(AutomationError::EventCreationFailed)?;
             CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
-            thread::sleep(Duration::from_millis(35));
+            thread::sleep(Duration::from_millis(15));
 
             let down = CGEvent::new_mouse_event(
                 Some(&source),
@@ -995,9 +995,9 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             .ok_or(AutomationError::EventCreationFailed)?;
             CGEvent::set_flags(Some(&down), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(Duration::from_millis(12));
 
-            let steps = 12;
+            let steps = 8;
             for step in 1..=steps {
                 let t = f64::from(step) / f64::from(steps);
                 let ix = sx + (ex - sx) * t;
@@ -1011,7 +1011,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 .ok_or(AutomationError::EventCreationFailed)?;
                 CGEvent::set_flags(Some(&drag_ev), CGEventFlags::empty());
                 CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&drag_ev));
-                thread::sleep(Duration::from_millis(14));
+                thread::sleep(Duration::from_millis(6));
             }
 
             let up = CGEvent::new_mouse_event(
@@ -1074,14 +1074,14 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                         );
                     }
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-                    thread::sleep(Duration::from_millis(12));
+                    thread::sleep(Duration::from_millis(5));
                     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(3));
             }
 
             if *submit {
-                thread::sleep(Duration::from_millis(30));
+                thread::sleep(Duration::from_millis(15));
                 post_key_chord(
                     &source,
                     ParsedKeyChord {
@@ -1106,7 +1106,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 .take(4000)
                 .collect();
             write_clipboard_text(&filtered)?;
-            thread::sleep(Duration::from_millis(30));
+            thread::sleep(Duration::from_millis(12));
 
             if *replace {
                 select_all_and_delete(&source)?;
@@ -1124,7 +1124,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             )?;
 
             if *submit {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(25));
                 post_key_chord(
                     &source,
                     ParsedKeyChord {
@@ -1159,7 +1159,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             .ok_or(AutomationError::EventCreationFailed)?;
             CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(8));
 
             let clamped_y = (*delta_y).clamp(-20, 20);
             let clamped_x = (*delta_x).clamp(-20, 20);
@@ -1194,7 +1194,7 @@ fn select_all_and_delete(
             ctrl: false,
         },
     )?;
-    thread::sleep(Duration::from_millis(40));
+    thread::sleep(Duration::from_millis(18));
     post_key_chord(
         source,
         ParsedKeyChord {
@@ -1205,7 +1205,7 @@ fn select_all_and_delete(
             ctrl: false,
         },
     )?;
-    thread::sleep(Duration::from_millis(40));
+    thread::sleep(Duration::from_millis(18));
     Ok(())
 }
 
@@ -1237,7 +1237,7 @@ fn post_key_chord(
             .ok_or(AutomationError::EventCreationFailed)?;
         CGEvent::set_flags(Some(&m_down), active_flags);
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&m_down));
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(3));
     }
 
     let down = CGEvent::new_keyboard_event(Some(source), chord.keycode, true)
@@ -1247,11 +1247,11 @@ fn post_key_chord(
     CGEvent::set_flags(Some(&down), active_flags);
     CGEvent::set_flags(Some(&up), active_flags);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-    thread::sleep(Duration::from_millis(18));
+    thread::sleep(Duration::from_millis(6));
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
 
     for (mk, flag) in mod_keys.iter().rev() {
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(3));
         active_flags.remove(*flag);
         let m_up = CGEvent::new_keyboard_event(Some(source), *mk, false)
             .ok_or(AutomationError::EventCreationFailed)?;

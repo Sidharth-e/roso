@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
 
-const MAX_OCR_LINES: usize = 120;
+const MAX_OCR_LINES: usize = 80;
 
 #[derive(Debug, Error)]
 pub enum OcrError {
@@ -109,15 +109,10 @@ pub fn vision_bbox_to_screen_rect(
     }
 }
 
-pub fn build_unified_targets(
-    rgba: &RgbaImage,
-    pid: u64,
-    metrics: ScreenMetrics,
-) -> ScreenTargetMap {
-    let ax_targets = extract_ax_elements(pid, metrics);
+pub fn extract_ocr_targets(rgba: &RgbaImage, metrics: ScreenMetrics) -> Vec<RawTarget> {
     let raw_ocr = extract_raw_ocr_from_rgba(rgba).unwrap_or_default();
 
-    let ocr_targets: Vec<RawTarget> = raw_ocr
+    raw_ocr
         .into_iter()
         .map(|(text, bbox)| {
             let rect = vision_bbox_to_screen_rect(
@@ -137,7 +132,20 @@ pub fn build_unified_targets(
                 center_y: rect.center_y,
             }
         })
-        .collect();
+        .collect()
+}
+
+pub fn build_unified_targets(
+    rgba: &RgbaImage,
+    pid: u64,
+    metrics: ScreenMetrics,
+) -> ScreenTargetMap {
+    let (ax_targets, ocr_targets) = std::thread::scope(|scope| {
+        let ax_handle = scope.spawn(|| extract_ax_elements(pid, metrics));
+        let ocr_targets = extract_ocr_targets(rgba, metrics);
+        let ax_targets = ax_handle.join().unwrap_or_default();
+        (ax_targets, ocr_targets)
+    });
 
     merge_targets(ax_targets, ocr_targets, metrics)
 }
@@ -147,10 +155,15 @@ pub fn merge_targets(
     ocr_targets: Vec<RawTarget>,
     metrics: ScreenMetrics,
 ) -> ScreenTargetMap {
-    let mut combined: Vec<RawTarget> = Vec::with_capacity(ax_targets.len() + ocr_targets.len());
-    combined.extend(ax_targets);
+    let mut combined: Vec<RawTarget> = Vec::with_capacity(MAX_OCR_LINES);
+    for ax in ax_targets.into_iter().take(MAX_OCR_LINES) {
+        combined.push(ax);
+    }
 
     for ocr_item in ocr_targets {
+        if combined.len() >= MAX_OCR_LINES {
+            break;
+        }
         let ocr_lower = ocr_item.label.to_ascii_lowercase();
         let duplicated = combined.iter().any(|ax| {
             let close_center = (ax.center_x - ocr_item.center_x).abs() <= 16.0
@@ -178,8 +191,6 @@ pub fn merge_targets(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });
-
-    combined.truncate(MAX_OCR_LINES);
 
     let safe_w = metrics.logical_width.max(1.0);
     let safe_h = metrics.logical_height.max(1.0);
@@ -238,6 +249,7 @@ pub fn merge_targets(
 mod macos_ax_tree {
     use super::*;
     use std::ffi::{c_void, CStr};
+    use std::time::{Duration, Instant};
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -329,10 +341,43 @@ mod macos_ax_tree {
         CfGuard::new(ptr)
     }
 
-    fn copy_attr(element: *const c_void, attr_name: &str) -> Option<CfGuard> {
-        let attr = make_cf_string(attr_name)?;
+    struct AxAttrKeys {
+        focused_window: CfGuard,
+        main_window: CfGuard,
+        menu_bar: CfGuard,
+        role: CfGuard,
+        position: CfGuard,
+        size: CfGuard,
+        title: CfGuard,
+        description: CfGuard,
+        placeholder: CfGuard,
+        help: CfGuard,
+        value: CfGuard,
+        children: CfGuard,
+    }
+
+    impl AxAttrKeys {
+        fn new() -> Option<Self> {
+            Some(Self {
+                focused_window: make_cf_string("AXFocusedWindow")?,
+                main_window: make_cf_string("AXMainWindow")?,
+                menu_bar: make_cf_string("AXMenuBar")?,
+                role: make_cf_string("AXRole")?,
+                position: make_cf_string("AXPosition")?,
+                size: make_cf_string("AXSize")?,
+                title: make_cf_string("AXTitle")?,
+                description: make_cf_string("AXDescription")?,
+                placeholder: make_cf_string("AXPlaceholderValue")?,
+                help: make_cf_string("AXHelp")?,
+                value: make_cf_string("AXValue")?,
+                children: make_cf_string("AXChildren")?,
+            })
+        }
+    }
+
+    fn copy_attr_key(element: *const c_void, attr_key: &CfGuard) -> Option<CfGuard> {
         let mut out: *const c_void = std::ptr::null();
-        let err = unsafe { AXUIElementCopyAttributeValue(element, attr.as_ptr(), &mut out) };
+        let err = unsafe { AXUIElementCopyAttributeValue(element, attr_key.as_ptr(), &mut out) };
         if err == 0 {
             CfGuard::new(out)
         } else {
@@ -340,8 +385,8 @@ mod macos_ax_tree {
         }
     }
 
-    fn copy_string_attr(element: *const c_void, attr_name: &str) -> Option<String> {
-        let val = copy_attr(element, attr_name)?;
+    fn copy_string_attr_key(element: *const c_void, attr_key: &CfGuard) -> Option<String> {
+        let val = copy_attr_key(element, attr_key)?;
         unsafe {
             if CFGetTypeID(val.as_ptr()) != CFStringGetTypeID() {
                 return None;
@@ -373,15 +418,15 @@ mod macos_ax_tree {
         }
     }
 
-    fn copy_children(element: *const c_void) -> Vec<CfGuard> {
-        let Some(arr) = copy_attr(element, "AXChildren") else {
+    fn copy_children_key(element: *const c_void, children_key: &CfGuard) -> Vec<CfGuard> {
+        let Some(arr) = copy_attr_key(element, children_key) else {
             return Vec::new();
         };
         unsafe {
             if CFGetTypeID(arr.as_ptr()) != CFArrayGetTypeID() {
                 return Vec::new();
             }
-            let count = CFArrayGetCount(arr.as_ptr()).min(80);
+            let count = CFArrayGetCount(arr.as_ptr()).min(50);
             let mut children = Vec::with_capacity(count.max(0) as usize);
             for i in 0..count {
                 let raw_child = CFArrayGetValueAtIndex(arr.as_ptr(), i);
@@ -396,9 +441,13 @@ mod macos_ax_tree {
         }
     }
 
-    fn copy_position_and_size(element: *const c_void) -> Option<(AxCgPoint, AxCgSize)> {
-        let pos_val = copy_attr(element, "AXPosition")?;
-        let size_val = copy_attr(element, "AXSize")?;
+    fn copy_position_and_size_key(
+        element: *const c_void,
+        pos_key: &CfGuard,
+        size_key: &CfGuard,
+    ) -> Option<(AxCgPoint, AxCgSize)> {
+        let pos_val = copy_attr_key(element, pos_key)?;
+        let size_val = copy_attr_key(element, size_key)?;
         let mut pt = AxCgPoint { x: 0.0, y: 0.0 };
         let mut sz = AxCgSize {
             width: 0.0,
@@ -453,35 +502,45 @@ mod macos_ax_tree {
         let Ok(pid_i32) = i32::try_from(pid) else {
             return Vec::new();
         };
+        let Some(keys) = AxAttrKeys::new() else {
+            return Vec::new();
+        };
         let Some(app_el) = CfGuard::new(unsafe { AXUIElementCreateApplication(pid_i32) }) else {
             return Vec::new();
         };
 
         let mut queue: VecDeque<(CfGuard, usize)> = VecDeque::new();
-        if let Some(win) = copy_attr(app_el.as_ptr(), "AXFocusedWindow")
-            .or_else(|| copy_attr(app_el.as_ptr(), "AXMainWindow"))
+        if let Some(win) = copy_attr_key(app_el.as_ptr(), &keys.focused_window)
+            .or_else(|| copy_attr_key(app_el.as_ptr(), &keys.main_window))
         {
             queue.push_back((win, 0));
         }
-        if let Some(menubar) = copy_attr(app_el.as_ptr(), "AXMenuBar") {
+        if let Some(menubar) = copy_attr_key(app_el.as_ptr(), &keys.menu_bar) {
             queue.push_back((menubar, 0));
         }
 
         let mut results: Vec<RawTarget> = Vec::new();
         let mut visited: usize = 0;
-        const MAX_VISITED: usize = 300;
-        const MAX_DEPTH: usize = 10;
-        const MAX_TARGETS: usize = 60;
+        let start = Instant::now();
+        const MAX_VISITED: usize = 180;
+        const MAX_DEPTH: usize = 8;
+        const MAX_TARGETS: usize = 45;
+        const AX_TIME_BUDGET: Duration = Duration::from_millis(120);
 
         while let Some((node, depth)) = queue.pop_front() {
             if visited >= MAX_VISITED || results.len() >= MAX_TARGETS {
                 break;
             }
+            if visited % 4 == 0 && start.elapsed() >= AX_TIME_BUDGET {
+                break;
+            }
             visited += 1;
 
-            if let Some(ax_role) = copy_string_attr(node.as_ptr(), "AXRole") {
+            if let Some(ax_role) = copy_string_attr_key(node.as_ptr(), &keys.role) {
                 if let Some(clean_role) = map_interactive_role(&ax_role) {
-                    if let Some((pt, sz)) = copy_position_and_size(node.as_ptr()) {
+                    if let Some((pt, sz)) =
+                        copy_position_and_size_key(node.as_ptr(), &keys.position, &keys.size)
+                    {
                         let rel_x = pt.x - metrics.origin_x;
                         let rel_y = pt.y - metrics.origin_y;
                         let cx = rel_x + sz.width * 0.5;
@@ -496,11 +555,11 @@ mod macos_ax_tree {
                             && sz.height <= metrics.logical_height * 0.95;
 
                         if in_bounds {
-                            let label = copy_string_attr(node.as_ptr(), "AXTitle")
-                                .or_else(|| copy_string_attr(node.as_ptr(), "AXDescription"))
-                                .or_else(|| copy_string_attr(node.as_ptr(), "AXPlaceholderValue"))
-                                .or_else(|| copy_string_attr(node.as_ptr(), "AXHelp"))
-                                .or_else(|| copy_string_attr(node.as_ptr(), "AXValue"))
+                            let label = copy_string_attr_key(node.as_ptr(), &keys.title)
+                                .or_else(|| copy_string_attr_key(node.as_ptr(), &keys.description))
+                                .or_else(|| copy_string_attr_key(node.as_ptr(), &keys.placeholder))
+                                .or_else(|| copy_string_attr_key(node.as_ptr(), &keys.help))
+                                .or_else(|| copy_string_attr_key(node.as_ptr(), &keys.value))
                                 .unwrap_or_else(|| clean_role.to_string());
 
                             results.push(RawTarget {
@@ -520,7 +579,7 @@ mod macos_ax_tree {
             }
 
             if depth < MAX_DEPTH {
-                for child in copy_children(node.as_ptr()) {
+                for child in copy_children_key(node.as_ptr(), &keys.children) {
                     queue.push_back((child, depth + 1));
                 }
             }
@@ -559,13 +618,16 @@ fn extract_raw_ocr_from_rgba(
         VNRequestTextRecognitionLevel,
     };
 
-    let (width, height) = rgba.dimensions();
+    let scaled_storage = crate::capture::downscale_rgba_for_ocr(rgba, 1440);
+    let ocr_rgba = scaled_storage.as_ref().unwrap_or(rgba);
+
+    let (width, height) = ocr_rgba.dimensions();
     if width == 0 || height == 0 {
         return Ok(Vec::new());
     }
 
     autoreleasepool(|_| {
-        let raw_bytes = rgba.as_raw();
+        let raw_bytes = ocr_rgba.as_raw();
         let cf_data = CFData::from_bytes(raw_bytes);
         let provider =
             CGDataProvider::with_cf_data(Some(&cf_data)).ok_or(OcrError::CgImageCreation)?;
@@ -600,8 +662,8 @@ fn extract_raw_ocr_from_rgba(
             );
 
             let request = VNRecognizeTextRequest::new();
-            request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-            request.setUsesLanguageCorrection(true);
+            request.setRecognitionLevel(VNRequestTextRecognitionLevel::Fast);
+            request.setUsesLanguageCorrection(false);
 
             let vn_request_ref: &VNRequest = request.as_ref();
             let requests = NSArray::from_slice(&[vn_request_ref]);

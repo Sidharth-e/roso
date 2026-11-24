@@ -614,14 +614,14 @@ export function TrayControl() {
                   id="step-delay-input"
                   label="Step Delay (ms)"
                   type="number"
-                  min={200}
+                  min={50}
                   max={5000}
-                  step={100}
+                  step={50}
                   value={configDraft.stepDelayMs}
                   onChange={(e) =>
                     setConfigDraft({
                       ...configDraft,
-                      stepDelayMs: Number(e.target.value) || 900,
+                      stepDelayMs: Number(e.target.value) || 250,
                     })
                   }
                 />

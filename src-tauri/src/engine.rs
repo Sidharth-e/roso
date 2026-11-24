@@ -3,17 +3,17 @@ use crate::automation::{
     has_accessibility_permission, is_kill_switch_pressed, AgentAction, MouseButtonKind,
 };
 use crate::capture::{
-    capture_primary_display_in_ram, compute_frame_diff_ratio, has_screen_recording_permission,
-    render_annotated_jpeg_base64, ActiveWindowMetadata, ScreenMetrics,
+    annotate_rgb_and_encode_jpeg_base64, capture_raw_frame_in_ram, compute_frame_diff_ratio,
+    downscale_rgba_to_rgb, has_screen_recording_permission, read_active_window_metadata,
+    ActiveWindowMetadata, ScreenMetrics, MAX_DOWNSCALED_WIDTH,
 };
 use crate::classifier::{
     AgentError, NextActionContext, OllamaAgentClient, PlannedActionDecision, RecoveryContext,
-    VerifyStepContext,
 };
 use crate::config::{
     append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord,
 };
-use crate::ocr::{build_unified_targets, ScreenTargetMap};
+use crate::ocr::{extract_ax_elements, extract_ocr_targets, merge_targets, ScreenTargetMap};
 use crate::overlay::{
     emit_pointer_cue, hide_tray_popover, show_tray_popover, update_tray_status_title,
     PointerCuePayload,
@@ -402,90 +402,28 @@ impl TaskEngine {
         });
 
         let cfg = self.config();
-        let api_key = cfg.resolved_api_key();
-
-        let initial_capture = tokio::task::spawn_blocking(capture_and_ground_screen).await;
-
-        let init_cap = match initial_capture {
-            Ok(Ok(cap)) => cap,
-            Ok(Err(err)) => {
-                self.finalize_task(
-                    &app_handle,
-                    &task_id,
-                    TaskPhase::Failed,
-                    "failed",
-                    err.to_string(),
-                    Some(err.to_string()),
-                );
-                return;
-            }
-            Err(err) => {
-                self.finalize_task(
-                    &app_handle,
-                    &task_id,
-                    TaskPhase::Failed,
-                    "failed",
-                    err.to_string(),
-                    Some(err.to_string()),
-                );
-                return;
-            }
-        };
-
-        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
-            return;
-        }
-
-        let mut plan_steps = match self
-            .client
-            .create_task_plan(
-                &cfg.ollama_base_url,
-                &api_key,
-                &cfg.vision_model,
-                &goal,
-                &init_cap.active_window.app_name,
-                &init_cap.target_map.formatted_lines,
-                init_cap.annotated_jpeg,
-            )
-            .await
-        {
-            Ok(plan) => plan.steps,
-            Err(_) => vec![goal.clone()],
-        };
-
-        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
-            return;
-        }
-
-        {
-            let mut st = self.state.lock();
-            if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                st.plan_steps = plan_steps.clone();
-                st.active_app = init_cap.active_window.app_name;
-                st.phase = TaskPhase::Running;
-                st.last_narration = format!("Plan ready ({} steps). Starting...", plan_steps.len());
-            }
-        }
-        let snap = self.snapshot();
-        update_tray_status_title(&app_handle, Some(&snap));
-        let _ = app_handle.emit("engine-snapshot", &snap);
 
         hide_tray_popover(&app_handle);
-        if sleep_interruptible(Duration::from_millis(320), &mut stop_rx).await {
+        if sleep_interruptible(Duration::from_millis(60), &mut stop_rx).await {
             return;
         }
 
         let max_steps = cfg.max_steps;
+        let mut plan_steps: Vec<String> = Vec::new();
         let mut recent_steps: Vec<String> = Vec::new();
-        let mut action_signatures: Vec<String> = Vec::new();
+        let mut stalled_action_signatures: Vec<String> = Vec::new();
+        let mut all_action_signatures: Vec<String> = Vec::new();
         let mut last_pointer_pos: Option<(f64, f64)> = None;
         let mut consecutive_agent_errors: u32 = 0;
+        let mut consecutive_stalls: u32 = 0;
+        let mut consecutive_waits: u32 = 0;
         let mut recovery_count: u32 = 0;
         let mut last_opened_url: Option<String> = None;
         let mut last_action_was_open_url = false;
         let mut cached_capture: Option<GroundedCapture> = None;
+        let mut step_num: u32 = 0;
 
-        for step_num in 1..=max_steps {
+        while step_num < max_steps {
             if *stop_rx.borrow() || !self.is_current_task(&task_id) {
                 return;
             }
@@ -567,7 +505,7 @@ impl TaskEngine {
                     NextActionContext {
                         goal: goal.clone(),
                         plan_steps: plan_steps.clone(),
-                        step_number: step_num,
+                        step_number: step_num + 1,
                         max_steps,
                         active_app: before_cap.active_window.app_name.clone(),
                         window_title: before_cap.active_window.window_title.clone(),
@@ -587,8 +525,9 @@ impl TaskEngine {
                 }
                 Err(err) => {
                     consecutive_agent_errors += 1;
+                    step_num += 1;
                     let msg = err.to_string();
-                    if consecutive_agent_errors < 3 {
+                    if consecutive_agent_errors < 3 && step_num < max_steps {
                         let retry_rec = TaskStepRecord {
                             step_number: step_num,
                             timestamp: Utc::now(),
@@ -613,7 +552,8 @@ impl TaskEngine {
                             &mut recent_steps,
                             format!("Step {step_num} model error (retrying): {msg}"),
                         );
-                        if sleep_interruptible(Duration::from_millis(750), &mut stop_rx).await {
+                        cached_capture = Some(before_cap);
+                        if sleep_interruptible(Duration::from_millis(300), &mut stop_rx).await {
                             return;
                         }
                         continue;
@@ -635,99 +575,275 @@ impl TaskEngine {
                 return;
             }
 
-            let metrics = before_cap.screen_metrics;
-            let (action, (overlay_x, overlay_y), target_dims, target_text) =
-                match resolve_action_from_decision(&decision, &before_cap.target_map, metrics) {
-                    Ok(v) => v,
-                    Err(reason) => {
-                        let step_rec = TaskStepRecord {
-                            step_number: step_num,
-                            timestamp: Utc::now(),
-                            action_type: decision.action_type.clone(),
-                            description: format!("Invalid target: {reason}"),
-                            narration: decision.narration.clone(),
-                            status: "skipped".to_string(),
-                            target_ocr_id: decision.target_ocr_id,
-                            target_x: None,
-                            target_y: None,
-                            verification_note: Some(reason.clone()),
-                        };
-                        self.record_step(
-                            &app_handle,
-                            &task_id,
-                            step_num,
-                            decision.plan_step_index,
-                            &before_cap.active_window.app_name,
-                            step_rec,
-                        );
-                        push_recent_step(
-                            &mut recent_steps,
-                            format!(
-                                "Step {step_num} skipped: {reason}. Pick an exact [N] ID from Visible targets or valid x_norm/y_norm."
-                            ),
-                        );
-                        continue;
+            if plan_steps.is_empty() && !decision.plan_steps.is_empty() {
+                plan_steps = decision.plan_steps.clone();
+                {
+                    let mut st = self.state.lock();
+                    if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                        st.plan_steps = plan_steps.clone();
+                        st.active_app = before_cap.active_window.app_name.clone();
+                        st.phase = TaskPhase::Running;
                     }
-                };
-
-            let action_label = action_type_label(&action).to_string();
-            let action_desc = describe_action(&action);
-            let is_terminal = matches!(action, AgentAction::Done { .. } | AgentAction::Fail { .. });
-
-            if !is_terminal
-                && is_duplicate_url_action(
-                    &action,
-                    last_opened_url.as_deref(),
-                    last_action_was_open_url,
-                )
-            {
-                let step_rec = TaskStepRecord {
-                    step_number: step_num,
-                    timestamp: Utc::now(),
-                    action_type: action_label,
-                    description: action_desc,
-                    narration: "Already opened this URL—advancing instead of duplicating."
-                        .to_string(),
-                    status: "skipped".to_string(),
-                    target_ocr_id: decision.target_ocr_id,
-                    target_x: None,
-                    target_y: None,
-                    verification_note: Some("Duplicate URL entry blocked".to_string()),
-                };
-                self.record_step(
-                    &app_handle,
-                    &task_id,
-                    step_num,
-                    decision.plan_step_index,
-                    &before_cap.active_window.app_name,
-                    step_rec,
-                );
-                last_action_was_open_url = false;
-                push_recent_step(
-                    &mut recent_steps,
-                    "DUPLICATE URL BLOCKED: Already opened/entered this URL—wait or proceed to the next step (e.g. scroll or done)."
-                        .to_string(),
-                );
-                continue;
+                }
+                let plan_snap = self.snapshot();
+                update_tray_status_title(&app_handle, Some(&plan_snap));
+                let _ = app_handle.emit("engine-snapshot", &plan_snap);
+            } else {
+                let mut st = self.state.lock();
+                if st.task_id.as_deref() == Some(&task_id) && st.phase == TaskPhase::Planning {
+                    st.phase = TaskPhase::Running;
+                }
             }
 
-            let action_sig = format!(
-                "{action_label}|{}|{action_desc}",
-                decision.target_ocr_id.unwrap_or(0)
-            );
-            let mut repetition_warned = false;
+            let metrics = before_cap.screen_metrics;
+            let action_queue = build_turn_action_queue(decision);
+            let queue_len = action_queue.len();
 
-            if !is_terminal {
-                match detect_repetition_level(&action_signatures, &action_sig) {
-                    RepetitionLevel::Abort => {
-                        let msg =
-                            "Stopped: repeated the same action without making progress.".to_string();
+            let mut executed_count: u32 = 0;
+            let mut last_executed_action: Option<AgentAction> = None;
+            let mut last_action_desc = String::new();
+            let mut last_action_output_note: Option<String> = None;
+            let mut last_err_text: Option<String> = None;
+            let mut last_cue_pos: (f64, f64) = (metrics.logical_width * 0.5, 56.0);
+            let mut batch_repetition_warned = false;
+            let mut turn_signatures: Vec<String> = Vec::new();
+
+            for (batch_idx, item_decision) in action_queue.into_iter().enumerate() {
+                if step_num >= max_steps || *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                    break;
+                }
+
+                while *pause_rx.borrow() {
+                    tokio::select! {
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = pause_rx.changed() => {}
+                    }
+                }
+
+                if !self.is_current_task(&task_id) {
+                    return;
+                }
+
+                step_num += 1;
+
+                let (action, (overlay_x, overlay_y), target_dims, target_text) =
+                    match resolve_action_from_decision(
+                        &item_decision,
+                        &before_cap.target_map,
+                        metrics,
+                    ) {
+                        Ok(v) => v,
+                        Err(reason) => {
+                            let step_rec = TaskStepRecord {
+                                step_number: step_num,
+                                timestamp: Utc::now(),
+                                action_type: item_decision.action_type.clone(),
+                                description: format!("Invalid target: {reason}"),
+                                narration: item_decision.narration.clone(),
+                                status: "skipped".to_string(),
+                                target_ocr_id: item_decision.target_ocr_id,
+                                target_x: None,
+                                target_y: None,
+                                verification_note: Some(reason.clone()),
+                            };
+                            self.record_step(
+                                &app_handle,
+                                &task_id,
+                                step_num,
+                                item_decision.plan_step_index,
+                                &before_cap.active_window.app_name,
+                                step_rec,
+                            );
+                            push_recent_step(
+                                &mut recent_steps,
+                                format!(
+                                    "Step {step_num} skipped: {reason}. Pick an exact [N] ID from Visible targets or valid x_norm/y_norm."
+                                ),
+                            );
+                            break;
+                        }
+                    };
+
+                let action_label = action_type_label(&action).to_string();
+                let action_desc = describe_action(&action);
+                let is_terminal =
+                    matches!(action, AgentAction::Done { .. } | AgentAction::Fail { .. });
+
+                if !is_terminal
+                    && is_duplicate_url_action(
+                        &action,
+                        last_opened_url.as_deref(),
+                        last_action_was_open_url,
+                    )
+                {
+                    let step_rec = TaskStepRecord {
+                        step_number: step_num,
+                        timestamp: Utc::now(),
+                        action_type: action_label,
+                        description: action_desc,
+                        narration: "Already opened this URL—advancing instead of duplicating."
+                            .to_string(),
+                        status: "skipped".to_string(),
+                        target_ocr_id: item_decision.target_ocr_id,
+                        target_x: None,
+                        target_y: None,
+                        verification_note: Some("Duplicate URL entry blocked".to_string()),
+                    };
+                    self.record_step(
+                        &app_handle,
+                        &task_id,
+                        step_num,
+                        item_decision.plan_step_index,
+                        &before_cap.active_window.app_name,
+                        step_rec,
+                    );
+                    last_action_was_open_url = false;
+                    push_recent_step(
+                        &mut recent_steps,
+                        "DUPLICATE URL BLOCKED: Already opened/entered this URL—wait or proceed to the next step (e.g. scroll or done)."
+                            .to_string(),
+                    );
+                    break;
+                }
+
+                let action_sig = format!(
+                    "{action_label}|{}|{action_desc}",
+                    item_decision.target_ocr_id.unwrap_or(0)
+                );
+                let mut repetition_warned = false;
+
+                if !is_terminal {
+                    let rep_level = if matches!(action, AgentAction::Wait { .. }) {
+                        if consecutive_waits >= 6 {
+                            RepetitionLevel::Abort
+                        } else if consecutive_waits >= 4 {
+                            RepetitionLevel::Warn
+                        } else {
+                            RepetitionLevel::None
+                        }
+                    } else {
+                        let stalled_level =
+                            detect_repetition_level(&stalled_action_signatures, &action_sig);
+                        if stalled_level == RepetitionLevel::None
+                            && !is_naturally_repeatable_action(&action)
+                            && detect_progressing_cycle_abort(&all_action_signatures, &action_sig)
+                        {
+                            RepetitionLevel::Abort
+                        } else {
+                            stalled_level
+                        }
+                    };
+
+                    match rep_level {
+                        RepetitionLevel::Abort => {
+                            let msg = if matches!(action, AgentAction::Wait { .. }) {
+                                "Stopped: waited repeatedly without the page or app changing."
+                                    .to_string()
+                            } else {
+                                "Stopped: repeated the same action without making progress."
+                                    .to_string()
+                            };
+                            let cue = PointerCuePayload {
+                                id: Uuid::new_v4().to_string(),
+                                message: msg.clone(),
+                                action_badge: "Loop Stopped".to_string(),
+                                target_x: metrics.logical_width * 0.5,
+                                target_y: 56.0,
+                                target_width: None,
+                                target_height: None,
+                                target_ocr_id: None,
+                                step_number: step_num,
+                                is_acting: false,
+                                show_pointer: false,
+                                dismiss_after_ms: 4200,
+                            };
+                            let _ = emit_pointer_cue(&app_handle, cue);
+                            let step_rec = TaskStepRecord {
+                                step_number: step_num,
+                                timestamp: Utc::now(),
+                                action_type: action_label,
+                                description: action_desc,
+                                narration: msg.clone(),
+                                status: "failed".to_string(),
+                                target_ocr_id: item_decision.target_ocr_id,
+                                target_x: None,
+                                target_y: None,
+                                verification_note: Some("Loop abort".to_string()),
+                            };
+                            self.record_step(
+                                &app_handle,
+                                &task_id,
+                                step_num,
+                                item_decision.plan_step_index,
+                                &before_cap.active_window.app_name,
+                                step_rec,
+                            );
+                            self.finalize_task(
+                                &app_handle,
+                                &task_id,
+                                TaskPhase::Failed,
+                                "failed",
+                                msg.clone(),
+                                Some(msg),
+                            );
+                            show_tray_popover(&app_handle, false);
+                            return;
+                        }
+                        RepetitionLevel::Warn => {
+                            repetition_warned = true;
+                            batch_repetition_warned = true;
+                            push_recent_step(
+                                &mut recent_steps,
+                                "LOOP WARNING: You repeated this action without changing the UI. Use open_url with app_name, paste_text with replace=true, or press_key cmd+l."
+                                    .to_string(),
+                            );
+                        }
+                        RepetitionLevel::None => {}
+                    }
+                }
+
+                let has_explicit_target = item_decision.target_ocr_id.is_some()
+                    || (item_decision.x_norm.is_some() && item_decision.y_norm.is_some())
+                    || (item_decision.from_x_norm.is_some() && item_decision.from_y_norm.is_some());
+                let show_pointer =
+                    matches!(action, AgentAction::Click { .. } | AgentAction::Drag { .. })
+                        || (matches!(action, AgentAction::Scroll { .. }) && has_explicit_target);
+
+                let (cue_x, cue_y) = if show_pointer {
+                    last_pointer_pos = Some((overlay_x, overlay_y));
+                    (overlay_x, overlay_y)
+                } else {
+                    match last_pointer_pos {
+                        Some((lx, ly)) => (
+                            lx.clamp(180.0, (metrics.logical_width - 180.0).max(180.0)),
+                            ly.clamp(44.0, (metrics.logical_height - 120.0).max(44.0)),
+                        ),
+                        None => (metrics.logical_width * 0.5, 56.0),
+                    }
+                };
+                last_cue_pos = (cue_x, cue_y);
+
+                let (target_width, target_height) = if show_pointer {
+                    match target_dims {
+                        Some((w, h)) => (Some(w), Some(h)),
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+
+                match &action {
+                    AgentAction::Done { summary } => {
                         let cue = PointerCuePayload {
                             id: Uuid::new_v4().to_string(),
-                            message: msg.clone(),
-                            action_badge: "Loop Stopped".to_string(),
-                            target_x: metrics.logical_width * 0.5,
-                            target_y: 56.0,
+                            message: summary.clone(),
+                            action_badge: "Done".to_string(),
+                            target_x: cue_x,
+                            target_y: cue_y,
                             target_width: None,
                             target_height: None,
                             target_ocr_id: None,
@@ -737,23 +853,72 @@ impl TaskEngine {
                             dismiss_after_ms: 4200,
                         };
                         let _ = emit_pointer_cue(&app_handle, cue);
+
                         let step_rec = TaskStepRecord {
                             step_number: step_num,
                             timestamp: Utc::now(),
                             action_type: action_label,
                             description: action_desc,
-                            narration: msg.clone(),
-                            status: "failed".to_string(),
-                            target_ocr_id: decision.target_ocr_id,
-                            target_x: None,
-                            target_y: None,
-                            verification_note: Some("Loop abort".to_string()),
+                            narration: item_decision.narration.clone(),
+                            status: "done".to_string(),
+                            target_ocr_id: item_decision.target_ocr_id,
+                            target_x: Some(cue_x),
+                            target_y: Some(cue_y),
+                            verification_note: Some("Task marked complete".to_string()),
                         };
                         self.record_step(
                             &app_handle,
                             &task_id,
                             step_num,
-                            decision.plan_step_index,
+                            item_decision.plan_step_index,
+                            &before_cap.active_window.app_name,
+                            step_rec,
+                        );
+                        self.finalize_task(
+                            &app_handle,
+                            &task_id,
+                            TaskPhase::Completed,
+                            "completed",
+                            summary.clone(),
+                            None,
+                        );
+                        show_tray_popover(&app_handle, false);
+                        return;
+                    }
+                    AgentAction::Fail { reason } => {
+                        let cue = PointerCuePayload {
+                            id: Uuid::new_v4().to_string(),
+                            message: reason.clone(),
+                            action_badge: "Blocked".to_string(),
+                            target_x: cue_x,
+                            target_y: cue_y,
+                            target_width: None,
+                            target_height: None,
+                            target_ocr_id: None,
+                            step_number: step_num,
+                            is_acting: false,
+                            show_pointer: false,
+                            dismiss_after_ms: 4200,
+                        };
+                        let _ = emit_pointer_cue(&app_handle, cue);
+
+                        let step_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: action_label,
+                            description: action_desc,
+                            narration: item_decision.narration.clone(),
+                            status: "failed".to_string(),
+                            target_ocr_id: item_decision.target_ocr_id,
+                            target_x: Some(cue_x),
+                            target_y: Some(cue_y),
+                            verification_note: Some(reason.clone()),
+                        };
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            item_decision.plan_step_index,
                             &before_cap.active_window.app_name,
                             step_rec,
                         );
@@ -762,373 +927,307 @@ impl TaskEngine {
                             &task_id,
                             TaskPhase::Failed,
                             "failed",
-                            msg.clone(),
-                            Some(msg),
+                            reason.clone(),
+                            Some(reason.clone()),
                         );
                         show_tray_popover(&app_handle, false);
                         return;
                     }
-                    RepetitionLevel::Warn => {
-                        repetition_warned = true;
-                        push_recent_step(
-                            &mut recent_steps,
-                            "LOOP WARNING: You repeated this action without changing the UI. Use open_url with app_name, paste_text with replace=true, or press_key cmd+l."
-                                .to_string(),
-                        );
+                    _ => {}
+                }
+
+                let cue = PointerCuePayload {
+                    id: Uuid::new_v4().to_string(),
+                    message: item_decision.narration.clone(),
+                    action_badge: action_badge_text(&action).to_string(),
+                    target_x: cue_x,
+                    target_y: cue_y,
+                    target_width,
+                    target_height,
+                    target_ocr_id: if show_pointer {
+                        item_decision.target_ocr_id
+                    } else {
+                        None
+                    },
+                    step_number: step_num,
+                    is_acting: show_pointer,
+                    show_pointer,
+                    dismiss_after_ms: 2800,
+                };
+                let _ = emit_pointer_cue(&app_handle, cue);
+
+                {
+                    let mut st = self.state.lock();
+                    if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                        st.phase = TaskPhase::Running;
+                        st.current_step = step_num;
+                        st.active_plan_index = item_decision.plan_step_index;
+                        st.active_app = before_cap.active_window.app_name.clone();
+                        st.last_narration = item_decision.narration.clone();
                     }
-                    RepetitionLevel::None => {}
                 }
-            }
+                let snap = self.snapshot();
+                update_tray_status_title(&app_handle, Some(&snap));
+                let _ = app_handle.emit("engine-snapshot", &snap);
 
-            let has_explicit_target = decision.target_ocr_id.is_some()
-                || (decision.x_norm.is_some() && decision.y_norm.is_some())
-                || (decision.from_x_norm.is_some() && decision.from_y_norm.is_some());
-            let show_pointer = matches!(action, AgentAction::Click { .. } | AgentAction::Drag { .. })
-                || (matches!(action, AgentAction::Scroll { .. }) && has_explicit_target);
+                if cycle_cfg.confirm_risky_actions {
+                    if let Some(risk_reason) = assess_action_risk(
+                        &action,
+                        &item_decision.narration,
+                        target_text.as_deref(),
+                        item_decision.requires_confirmation,
+                    ) {
+                        let conf_id = Uuid::new_v4().to_string();
+                        let (tx, rx) = oneshot::channel();
+                        *self.confirm_tx.lock() = Some((conf_id.clone(), tx));
 
-            let (cue_x, cue_y) = if show_pointer {
-                last_pointer_pos = Some((overlay_x, overlay_y));
-                (overlay_x, overlay_y)
-            } else {
-                match last_pointer_pos {
-                    Some((lx, ly)) => (
-                        lx.clamp(180.0, (metrics.logical_width - 180.0).max(180.0)),
-                        ly.clamp(44.0, (metrics.logical_height - 120.0).max(44.0)),
-                    ),
-                    None => (metrics.logical_width * 0.5, 56.0),
-                }
-            };
-
-            let (target_width, target_height) = if show_pointer {
-                match target_dims {
-                    Some((w, h)) => (Some(w), Some(h)),
-                    None => (None, None),
-                }
-            } else {
-                (None, None)
-            };
-
-            match &action {
-                AgentAction::Done { summary } => {
-                    let cue = PointerCuePayload {
-                        id: Uuid::new_v4().to_string(),
-                        message: summary.clone(),
-                        action_badge: "Done".to_string(),
-                        target_x: cue_x,
-                        target_y: cue_y,
-                        target_width: None,
-                        target_height: None,
-                        target_ocr_id: None,
-                        step_number: step_num,
-                        is_acting: false,
-                        show_pointer: false,
-                        dismiss_after_ms: 4200,
-                    };
-                    let _ = emit_pointer_cue(&app_handle, cue);
-
-                    let step_rec = TaskStepRecord {
-                        step_number: step_num,
-                        timestamp: Utc::now(),
-                        action_type: action_label,
-                        description: action_desc,
-                        narration: decision.narration.clone(),
-                        status: "done".to_string(),
-                        target_ocr_id: decision.target_ocr_id,
-                        target_x: Some(cue_x),
-                        target_y: Some(cue_y),
-                        verification_note: Some("Task marked complete".to_string()),
-                    };
-                    self.record_step(
-                        &app_handle,
-                        &task_id,
-                        step_num,
-                        decision.plan_step_index,
-                        &before_cap.active_window.app_name,
-                        step_rec,
-                    );
-                    self.finalize_task(
-                        &app_handle,
-                        &task_id,
-                        TaskPhase::Completed,
-                        "completed",
-                        summary.clone(),
-                        None,
-                    );
-                    show_tray_popover(&app_handle, false);
-                    return;
-                }
-                AgentAction::Fail { reason } => {
-                    let cue = PointerCuePayload {
-                        id: Uuid::new_v4().to_string(),
-                        message: reason.clone(),
-                        action_badge: "Blocked".to_string(),
-                        target_x: cue_x,
-                        target_y: cue_y,
-                        target_width: None,
-                        target_height: None,
-                        target_ocr_id: None,
-                        step_number: step_num,
-                        is_acting: false,
-                        show_pointer: false,
-                        dismiss_after_ms: 4200,
-                    };
-                    let _ = emit_pointer_cue(&app_handle, cue);
-
-                    let step_rec = TaskStepRecord {
-                        step_number: step_num,
-                        timestamp: Utc::now(),
-                        action_type: action_label,
-                        description: action_desc,
-                        narration: decision.narration.clone(),
-                        status: "failed".to_string(),
-                        target_ocr_id: decision.target_ocr_id,
-                        target_x: Some(cue_x),
-                        target_y: Some(cue_y),
-                        verification_note: Some(reason.clone()),
-                    };
-                    self.record_step(
-                        &app_handle,
-                        &task_id,
-                        step_num,
-                        decision.plan_step_index,
-                        &before_cap.active_window.app_name,
-                        step_rec,
-                    );
-                    self.finalize_task(
-                        &app_handle,
-                        &task_id,
-                        TaskPhase::Failed,
-                        "failed",
-                        reason.clone(),
-                        Some(reason.clone()),
-                    );
-                    show_tray_popover(&app_handle, false);
-                    return;
-                }
-                _ => {}
-            }
-
-            let cue = PointerCuePayload {
-                id: Uuid::new_v4().to_string(),
-                message: decision.narration.clone(),
-                action_badge: action_badge_text(&action).to_string(),
-                target_x: cue_x,
-                target_y: cue_y,
-                target_width,
-                target_height,
-                target_ocr_id: if show_pointer {
-                    decision.target_ocr_id
-                } else {
-                    None
-                },
-                step_number: step_num,
-                is_acting: show_pointer,
-                show_pointer,
-                dismiss_after_ms: 3600,
-            };
-            let _ = emit_pointer_cue(&app_handle, cue);
-
-            {
-                let mut st = self.state.lock();
-                if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                    st.phase = TaskPhase::Running;
-                    st.current_step = step_num;
-                    st.active_plan_index = decision.plan_step_index;
-                    st.active_app = before_cap.active_window.app_name.clone();
-                    st.last_narration = decision.narration.clone();
-                }
-            }
-            let snap = self.snapshot();
-            update_tray_status_title(&app_handle, Some(&snap));
-            let _ = app_handle.emit("engine-snapshot", &snap);
-
-            if cycle_cfg.confirm_risky_actions {
-                if let Some(risk_reason) = assess_action_risk(
-                    &action,
-                    &decision.narration,
-                    target_text.as_deref(),
-                    decision.requires_confirmation,
-                ) {
-                    let conf_id = Uuid::new_v4().to_string();
-                    let (tx, rx) = oneshot::channel();
-                    *self.confirm_tx.lock() = Some((conf_id.clone(), tx));
-
-                    {
-                        let mut st = self.state.lock();
-                        if st.task_id.as_deref() != Some(&task_id) || !st.phase.is_active() {
-                            return;
-                        }
-                        st.phase = TaskPhase::AwaitingConfirmation;
-                        st.pending_confirmation = Some(PendingConfirmation {
-                            id: conf_id,
-                            step_number: step_num,
-                            action_type: action_label.clone(),
-                            description: action_desc.clone(),
-                            narration: decision.narration.clone(),
-                            reason: risk_reason,
-                        });
-                    }
-                    let snap = self.snapshot();
-                    update_tray_status_title(&app_handle, Some(&snap));
-                    let _ = app_handle.emit("engine-snapshot", &snap);
-                    show_tray_popover(&app_handle, false);
-
-                    let approved = tokio::select! {
-                        _ = stop_rx.changed() => {
-                            if *stop_rx.borrow() {
+                        {
+                            let mut st = self.state.lock();
+                            if st.task_id.as_deref() != Some(&task_id) || !st.phase.is_active() {
                                 return;
                             }
-                            false
+                            st.phase = TaskPhase::AwaitingConfirmation;
+                            st.pending_confirmation = Some(PendingConfirmation {
+                                id: conf_id,
+                                step_number: step_num,
+                                action_type: action_label.clone(),
+                                description: action_desc.clone(),
+                                narration: item_decision.narration.clone(),
+                                reason: risk_reason,
+                            });
                         }
-                        res = rx => res.unwrap_or(false)
-                    };
-
-                    if *stop_rx.borrow() || !self.is_current_task(&task_id) {
-                        return;
-                    }
-
-                    if !approved {
-                        let step_rec = TaskStepRecord {
-                            step_number: step_num,
-                            timestamp: Utc::now(),
-                            action_type: action_label,
-                            description: action_desc.clone(),
-                            narration: decision.narration.clone(),
-                            status: "denied".to_string(),
-                            target_ocr_id: decision.target_ocr_id,
-                            target_x: Some(cue_x),
-                            target_y: Some(cue_y),
-                            verification_note: Some("Denied by user".to_string()),
-                        };
-                        self.record_step(
-                            &app_handle,
-                            &task_id,
-                            step_num,
-                            decision.plan_step_index,
-                            &before_cap.active_window.app_name,
-                            step_rec,
-                        );
-                        push_recent_step(
-                            &mut recent_steps,
-                            format!("Step {step_num} ({action_desc}) was denied by user"),
-                        );
-                        hide_tray_popover(&app_handle);
-                        continue;
-                    }
-
-                    hide_tray_popover(&app_handle);
-                    if sleep_interruptible(Duration::from_millis(250), &mut stop_rx).await {
-                        return;
-                    }
-                }
-            }
-
-            if sleep_interruptible(Duration::from_millis(280), &mut stop_rx).await {
-                return;
-            }
-            if !self.is_current_task(&task_id) {
-                return;
-            }
-
-            let action_for_exec = action.clone();
-            let exec_res =
-                tokio::task::spawn_blocking(move || execute_action(&action_for_exec, metrics)).await;
-            let (step_status, action_output_note, err_text) = match exec_res {
-                Ok(Ok(out)) => ("executed".to_string(), out.note, None),
-                Ok(Err(err)) => {
-                    let msg = err.to_string();
-                    if matches!(
-                        err,
-                        crate::automation::AutomationError::AccessibilityPermissionDenied
-                    ) {
-                        let step_rec = TaskStepRecord {
-                            step_number: step_num,
-                            timestamp: Utc::now(),
-                            action_type: action_label,
-                            description: action_desc,
-                            narration: decision.narration.clone(),
-                            status: "failed".to_string(),
-                            target_ocr_id: decision.target_ocr_id,
-                            target_x: Some(cue_x),
-                            target_y: Some(cue_y),
-                            verification_note: Some(msg.clone()),
-                        };
-                        self.record_step(
-                            &app_handle,
-                            &task_id,
-                            step_num,
-                            decision.plan_step_index,
-                            &before_cap.active_window.app_name,
-                            step_rec,
-                        );
-                        self.finalize_task(
-                            &app_handle,
-                            &task_id,
-                            TaskPhase::Failed,
-                            "failed",
-                            msg.clone(),
-                            Some(msg),
-                        );
+                        let snap = self.snapshot();
+                        update_tray_status_title(&app_handle, Some(&snap));
+                        let _ = app_handle.emit("engine-snapshot", &snap);
                         show_tray_popover(&app_handle, false);
-                        return;
-                    }
-                    ("failed".to_string(), None, Some(msg))
-                }
-                Err(err) => ("failed".to_string(), None, Some(err.to_string())),
-            };
 
-            if err_text.is_none() {
-                if let AgentAction::OpenUrl { url, .. } = &action {
-                    last_opened_url = Some(normalize_url_for_dedup(url));
-                    last_action_was_open_url = true;
+                        let approved = tokio::select! {
+                            _ = stop_rx.changed() => {
+                                if *stop_rx.borrow() {
+                                    return;
+                                }
+                                false
+                            }
+                            res = rx => res.unwrap_or(false)
+                        };
+
+                        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                            return;
+                        }
+
+                        if !approved {
+                            let step_rec = TaskStepRecord {
+                                step_number: step_num,
+                                timestamp: Utc::now(),
+                                action_type: action_label,
+                                description: action_desc.clone(),
+                                narration: item_decision.narration.clone(),
+                                status: "denied".to_string(),
+                                target_ocr_id: item_decision.target_ocr_id,
+                                target_x: Some(cue_x),
+                                target_y: Some(cue_y),
+                                verification_note: Some("Denied by user".to_string()),
+                            };
+                            self.record_step(
+                                &app_handle,
+                                &task_id,
+                                step_num,
+                                item_decision.plan_step_index,
+                                &before_cap.active_window.app_name,
+                                step_rec,
+                            );
+                            push_recent_step(
+                                &mut recent_steps,
+                                format!("Step {step_num} ({action_desc}) was denied by user"),
+                            );
+                            hide_tray_popover(&app_handle);
+                            break;
+                        }
+
+                        hide_tray_popover(&app_handle);
+                        if sleep_interruptible(Duration::from_millis(120), &mut stop_rx).await {
+                            return;
+                        }
+                    }
+                }
+
+                if show_pointer
+                    && sleep_interruptible(Duration::from_millis(50), &mut stop_rx).await
+                {
+                    return;
+                }
+                if !self.is_current_task(&task_id) {
+                    return;
+                }
+
+                let action_for_exec = action.clone();
+                let exec_res =
+                    tokio::task::spawn_blocking(move || execute_action(&action_for_exec, metrics))
+                        .await;
+                let (step_status, action_output_note, err_text) = match exec_res {
+                    Ok(Ok(out)) => ("executed".to_string(), out.note, None),
+                    Ok(Err(err)) => {
+                        let msg = err.to_string();
+                        if matches!(
+                            err,
+                            crate::automation::AutomationError::AccessibilityPermissionDenied
+                        ) {
+                            let step_rec = TaskStepRecord {
+                                step_number: step_num,
+                                timestamp: Utc::now(),
+                                action_type: action_label,
+                                description: action_desc,
+                                narration: item_decision.narration.clone(),
+                                status: "failed".to_string(),
+                                target_ocr_id: item_decision.target_ocr_id,
+                                target_x: Some(cue_x),
+                                target_y: Some(cue_y),
+                                verification_note: Some(msg.clone()),
+                            };
+                            self.record_step(
+                                &app_handle,
+                                &task_id,
+                                step_num,
+                                item_decision.plan_step_index,
+                                &before_cap.active_window.app_name,
+                                step_rec,
+                            );
+                            self.finalize_task(
+                                &app_handle,
+                                &task_id,
+                                TaskPhase::Failed,
+                                "failed",
+                                msg.clone(),
+                                Some(msg),
+                            );
+                            show_tray_popover(&app_handle, false);
+                            return;
+                        }
+                        ("failed".to_string(), None, Some(msg))
+                    }
+                    Err(err) => ("failed".to_string(), None, Some(err.to_string())),
+                };
+
+                if err_text.is_none() {
+                    if let AgentAction::OpenUrl { url, .. } = &action {
+                        last_opened_url = Some(normalize_url_for_dedup(url));
+                        last_action_was_open_url = true;
+                    } else {
+                        last_action_was_open_url = false;
+                    }
                 } else {
                     last_action_was_open_url = false;
                 }
-            } else {
-                last_action_was_open_url = false;
+
+                let step_rec = TaskStepRecord {
+                    step_number: step_num,
+                    timestamp: Utc::now(),
+                    action_type: action_label,
+                    description: action_desc.clone(),
+                    narration: item_decision.narration.clone(),
+                    status: step_status.clone(),
+                    target_ocr_id: item_decision.target_ocr_id,
+                    target_x: Some(cue_x),
+                    target_y: Some(cue_y),
+                    verification_note: err_text.clone().or_else(|| action_output_note.clone()),
+                };
+                self.record_step(
+                    &app_handle,
+                    &task_id,
+                    step_num,
+                    item_decision.plan_step_index,
+                    &before_cap.active_window.app_name,
+                    step_rec,
+                );
+                all_action_signatures.push(action_sig.clone());
+                turn_signatures.push(action_sig);
+                if matches!(action, AgentAction::Wait { .. }) {
+                    consecutive_waits += 1;
+                } else {
+                    consecutive_waits = 0;
+                }
+
+                executed_count += 1;
+                last_executed_action = Some(action.clone());
+                last_action_desc = action_desc.clone();
+                last_action_output_note = action_output_note.clone();
+                last_err_text = err_text.clone();
+
+                if err_text.is_some()
+                    || matches!(action, AgentAction::Wait { .. } | AgentAction::ReadClipboard)
+                {
+                    break;
+                }
+
+                if batch_idx + 1 < queue_len && step_num < max_steps {
+                    if adaptive_inter_batch_settle(
+                        &action,
+                        &before_cap.active_window,
+                        &mut stop_rx,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    if repetition_warned {
+                        break;
+                    }
+                }
             }
 
-            let step_rec = TaskStepRecord {
-                step_number: step_num,
-                timestamp: Utc::now(),
-                action_type: action_label,
-                description: action_desc.clone(),
-                narration: decision.narration.clone(),
-                status: step_status.clone(),
-                target_ocr_id: decision.target_ocr_id,
-                target_x: Some(cue_x),
-                target_y: Some(cue_y),
-                verification_note: err_text.clone().or_else(|| action_output_note.clone()),
-            };
-            self.record_step(
-                &app_handle,
-                &task_id,
-                step_num,
-                decision.plan_step_index,
-                &before_cap.active_window.app_name,
-                step_rec,
-            );
-            action_signatures.push(action_sig);
+            if executed_count == 0 {
+                cached_capture = Some(before_cap);
+                continue;
+            }
 
-            if matches!(action, AgentAction::Wait { .. }) {
+            let Some(last_action) = last_executed_action else {
+                cached_capture = Some(before_cap);
+                continue;
+            };
+
+            if executed_count == 1
+                && matches!(last_action, AgentAction::ReadClipboard)
+                && last_err_text.is_none()
+            {
+                let note = last_action_output_note
+                    .clone()
+                    .unwrap_or_else(|| "Clipboard read".to_string());
+                self.update_last_step_verification(
+                    &app_handle,
+                    &task_id,
+                    step_num,
+                    "verified",
+                    note.clone(),
+                );
+                push_recent_step(
+                    &mut recent_steps,
+                    format!("Step {step_num} ({last_action_desc}) -> ok: {note}"),
+                );
+                consecutive_stalls = 0;
+                cached_capture = Some(before_cap);
+                continue;
+            }
+
+            if matches!(last_action, AgentAction::Wait { .. }) {
                 cached_capture = None;
                 push_recent_step(
                     &mut recent_steps,
                     format!(
-                        "Step {step_num} ({action_desc}) in \"{}\" -> {step_status}",
+                        "Step {step_num} ({last_action_desc}) in \"{}\"",
                         before_cap.active_window.window_title
                     ),
                 );
-                if sleep_interruptible(Duration::from_millis(cycle_cfg.step_delay_ms), &mut stop_rx)
-                    .await
-                {
-                    return;
-                }
                 continue;
             }
 
-            let settle_ms = action_settle_delay_ms(&action, cycle_cfg.step_delay_ms);
-            if sleep_interruptible(Duration::from_millis(settle_ms), &mut stop_rx).await {
+            if adaptive_post_action_settle(
+                &last_action,
+                &before_cap.active_window,
+                cycle_cfg.step_delay_ms,
+                &mut stop_rx,
+            )
+            .await
+            {
                 return;
             }
             if !self.is_current_task(&task_id) {
@@ -1141,7 +1240,7 @@ impl TaskEngine {
                     push_recent_step(
                         &mut recent_steps,
                         format!(
-                            "Step {step_num} ({action_desc}) in \"{}\" -> {step_status}",
+                            "Step {step_num} ({last_action_desc}) in \"{}\"",
                             before_cap.active_window.window_title
                         ),
                     );
@@ -1153,131 +1252,54 @@ impl TaskEngine {
                 compute_frame_diff_ratio(&before_cap.full_res_rgba, &after_cap.full_res_rgba)
                     * 100.0;
 
-            {
-                let mut st = self.state.lock();
-                if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                    st.phase = TaskPhase::Verifying;
-                    st.active_app = after_cap.active_window.app_name.clone();
-                    st.last_narration = format!("Verifying step #{step_num}...");
-                }
-            }
-            let ver_snap = self.snapshot();
-            update_tray_status_title(&app_handle, Some(&ver_snap));
-            let _ = app_handle.emit("engine-snapshot", &ver_snap);
+            let local_ver = evaluate_local_verification(
+                &before_cap.active_window,
+                &after_cap.active_window,
+                visual_diff_pct,
+                last_action_output_note.as_deref(),
+                last_err_text.as_deref(),
+            );
 
-            let ver_res = self
-                .client
-                .verify_step_outcome(
-                    &cycle_cfg.ollama_base_url,
-                    &cycle_api_key,
-                    &cycle_cfg.vision_model,
-                    VerifyStepContext {
-                        goal: goal.clone(),
-                        step_number: step_num,
-                        action_description: action_desc.clone(),
-                        expected_narration: decision.narration.clone(),
-                        before_app: before_cap.active_window.app_name.clone(),
-                        after_app: after_cap.active_window.app_name.clone(),
-                        before_title: before_cap.active_window.window_title.clone(),
-                        after_title: after_cap.active_window.window_title.clone(),
-                        visual_diff_pct,
-                        action_output: action_output_note.clone(),
-                        visible_targets: after_cap.target_map.formatted_lines.clone(),
-                        after_base64_jpeg: after_cap.annotated_jpeg.clone(),
-                    },
-                )
-                .await;
+            self.update_last_step_verification(
+                &app_handle,
+                &task_id,
+                step_num,
+                local_ver.step_status,
+                local_ver.note.clone(),
+            );
 
-            if *stop_rx.borrow() || !self.is_current_task(&task_id) {
-                return;
-            }
-
-            let mut verification_failed = err_text.is_some();
-            let mut observation_summary = err_text
-                .clone()
-                .unwrap_or_else(|| format!("Visual diff {visual_diff_pct:.1}%"));
-            let mut recovery_hint: Option<String> = None;
-
-            match ver_res {
-                Ok(ver) => {
-                    observation_summary = ver.observation.clone();
-                    recovery_hint = ver.recovery_hint.clone();
-                    let note_text = match &action_output_note {
-                        Some(out_note) => format!("{} ({out_note})", ver.observation),
-                        None => ver.observation.clone(),
-                    };
-
-                    let final_step_status = if ver.status == "succeeded" || ver.status == "partial"
-                    {
-                        if err_text.is_some() {
-                            "failed"
-                        } else {
-                            "verified"
-                        }
-                    } else {
-                        verification_failed = true;
-                        "unverified_failed"
-                    };
-
-                    self.update_last_step_verification(
-                        &app_handle,
-                        &task_id,
-                        step_num,
-                        final_step_status,
-                        note_text,
-                    );
-
-                    if ver.goal_achieved && err_text.is_none() {
-                        let done_cue = PointerCuePayload {
-                            id: Uuid::new_v4().to_string(),
-                            message: ver.observation.clone(),
-                            action_badge: "Done".to_string(),
-                            target_x: cue_x,
-                            target_y: cue_y,
-                            target_width: None,
-                            target_height: None,
-                            target_ocr_id: None,
-                            step_number: step_num,
-                            is_acting: false,
-                            show_pointer: false,
-                            dismiss_after_ms: 4200,
-                        };
-                        let _ = emit_pointer_cue(&app_handle, done_cue);
-                        self.finalize_task(
-                            &app_handle,
-                            &task_id,
-                            TaskPhase::Completed,
-                            "completed",
-                            ver.observation,
-                            None,
-                        );
-                        show_tray_popover(&app_handle, false);
-                        return;
-                    }
-                }
-                Err(_) => {
-                    if let Some(out_note) = &action_output_note {
-                        observation_summary = out_note.clone();
-                    }
-                }
-            }
-
-            let out_suffix = match &action_output_note {
+            let out_suffix = match &last_action_output_note {
                 Some(note) => format!(" | {note}"),
                 None => String::new(),
             };
             push_recent_step(
                 &mut recent_steps,
                 format!(
-                    "Step {step_num} ({action_desc}) in \"{}\" -> {} (diff {visual_diff_pct:.1}%): {observation_summary}{out_suffix}",
+                    "Step {step_num} ({last_action_desc}) [{} -> {}] in \"{}\" -> {} ({}){out_suffix}",
+                    before_cap.active_window.app_name,
+                    after_cap.active_window.app_name,
                     after_cap.active_window.window_title,
-                    if verification_failed { "needs fix" } else { "ok" }
+                    if local_ver.step_stalled { "stalled" } else { "ok" },
+                    local_ver.note
                 ),
             );
 
-            if (verification_failed || repetition_warned) && recovery_count < MAX_RECOVERY_PLANS
+            if local_ver.step_stalled {
+                stalled_action_signatures.extend(turn_signatures);
+            } else {
+                stalled_action_signatures.clear();
+            }
+
+            consecutive_stalls = if local_ver.step_stalled || batch_repetition_warned {
+                consecutive_stalls + 1
+            } else {
+                0
+            };
+
+            if (consecutive_stalls >= 2 || batch_repetition_warned)
+                && recovery_count < MAX_RECOVERY_PLANS
             {
-                if matches!(action, AgentAction::OpenUrl { .. }) {
+                if matches!(last_action, AgentAction::OpenUrl { .. }) {
                     last_opened_url = None;
                 }
 
@@ -1286,7 +1308,7 @@ impl TaskEngine {
                     if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
                         st.phase = TaskPhase::Recovering;
                         st.last_narration =
-                            "Step didn't land as expected—building a recovery plan...".to_string();
+                            "Step stalled—building a quick recovery plan...".to_string();
                     }
                 }
                 let rec_snap = self.snapshot();
@@ -1297,15 +1319,15 @@ impl TaskEngine {
                     id: Uuid::new_v4().to_string(),
                     message: "Adapting with a recovery plan...".to_string(),
                     action_badge: "Recovering".to_string(),
-                    target_x: cue_x,
-                    target_y: cue_y,
+                    target_x: last_cue_pos.0,
+                    target_y: last_cue_pos.1,
                     target_width: None,
                     target_height: None,
                     target_ocr_id: None,
                     step_number: step_num,
                     is_acting: false,
                     show_pointer: false,
-                    dismiss_after_ms: 3000,
+                    dismiss_after_ms: 2400,
                 };
                 let _ = emit_pointer_cue(&app_handle, rec_cue);
 
@@ -1317,9 +1339,9 @@ impl TaskEngine {
                         &cycle_cfg.vision_model,
                         RecoveryContext {
                             goal: goal.clone(),
-                            failed_action: action_desc.clone(),
-                            observation: observation_summary.clone(),
-                            recovery_hint,
+                            failed_action: last_action_desc.clone(),
+                            observation: local_ver.note.clone(),
+                            recovery_hint: None,
                             active_app: after_cap.active_window.app_name.clone(),
                             window_title: after_cap.active_window.window_title.clone(),
                             recent_steps: recent_steps.clone(),
@@ -1330,6 +1352,7 @@ impl TaskEngine {
                     .await
                 {
                     recovery_count += 1;
+                    consecutive_stalls = 0;
                     plan_steps = rec_plan.recovery_steps.clone();
                     {
                         let mut st = self.state.lock();
@@ -1374,11 +1397,6 @@ impl TaskEngine {
                     if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
                         st.phase = TaskPhase::Running;
                     }
-                }
-            } else {
-                let mut st = self.state.lock();
-                if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                    st.phase = TaskPhase::Running;
                 }
             }
 
@@ -1488,15 +1506,24 @@ impl TaskEngine {
 }
 
 fn capture_and_ground_screen() -> Result<GroundedCapture, crate::capture::CaptureError> {
-    let frame = capture_primary_display_in_ram()?;
-    let target_map = build_unified_targets(
-        &frame.full_res_rgba,
-        frame.active_window.process_id,
-        frame.screen_metrics,
-    );
+    let frame = capture_raw_frame_in_ram()?;
+    let (mut rgb_image, ax_targets, ocr_targets) = std::thread::scope(|scope| {
+        let rgb_handle =
+            scope.spawn(|| downscale_rgba_to_rgb(&frame.full_res_rgba, MAX_DOWNSCALED_WIDTH));
+        let ax_handle =
+            scope.spawn(|| extract_ax_elements(frame.active_window.process_id, frame.screen_metrics));
+        let ocr_targets = extract_ocr_targets(&frame.full_res_rgba, frame.screen_metrics);
+        let rgb_image = rgb_handle
+            .join()
+            .unwrap_or_else(|_| downscale_rgba_to_rgb(&frame.full_res_rgba, MAX_DOWNSCALED_WIDTH));
+        let ax_targets = ax_handle.join().unwrap_or_default();
+        (rgb_image, ax_targets, ocr_targets)
+    });
+
+    let target_map = merge_targets(ax_targets, ocr_targets, frame.screen_metrics);
     let annotated_jpeg =
-        render_annotated_jpeg_base64(&frame.full_res_rgba, &target_map.annotation_boxes)
-            .unwrap_or(frame.base64_jpeg);
+        annotate_rgb_and_encode_jpeg_base64(&mut rgb_image, &target_map.annotation_boxes)?;
+
     Ok(GroundedCapture {
         full_res_rgba: frame.full_res_rgba,
         annotated_jpeg,
@@ -1504,6 +1531,68 @@ fn capture_and_ground_screen() -> Result<GroundedCapture, crate::capture::Captur
         screen_metrics: frame.screen_metrics,
         target_map,
     })
+}
+
+pub struct LocalVerificationResult {
+    pub step_status: &'static str,
+    pub step_stalled: bool,
+    pub note: String,
+}
+
+pub fn evaluate_local_verification(
+    before: &ActiveWindowMetadata,
+    after: &ActiveWindowMetadata,
+    visual_diff_pct: f64,
+    action_output: Option<&str>,
+    err_text: Option<&str>,
+) -> LocalVerificationResult {
+    if let Some(err) = err_text {
+        return LocalVerificationResult {
+            step_status: "failed",
+            step_stalled: true,
+            note: err.to_string(),
+        };
+    }
+
+    let app_changed = before.app_name != after.app_name;
+    let title_changed = before.window_title != after.window_title;
+    let ui_changed = app_changed
+        || title_changed
+        || visual_diff_pct >= 0.4
+        || action_output.is_some();
+
+    let note = if let Some(out) = action_output {
+        out.to_string()
+    } else if app_changed {
+        format!("App -> {} (diff {visual_diff_pct:.1}%)", after.app_name)
+    } else if title_changed {
+        format!("Window updated (diff {visual_diff_pct:.1}%)")
+    } else if ui_changed {
+        format!("UI updated (diff {visual_diff_pct:.1}%)")
+    } else {
+        format!("No visible UI change ({visual_diff_pct:.1}%)")
+    };
+
+    LocalVerificationResult {
+        step_status: if ui_changed {
+            "verified"
+        } else {
+            "unverified_failed"
+        },
+        step_stalled: !ui_changed,
+        note,
+    }
+}
+
+pub fn build_turn_action_queue(mut decision: PlannedActionDecision) -> Vec<PlannedActionDecision> {
+    let plan_idx = decision.plan_step_index;
+    let follow_ups = std::mem::take(&mut decision.follow_up_actions);
+    let mut queue = Vec::with_capacity(1 + follow_ups.len());
+    queue.push(decision);
+    for follow_up in follow_ups {
+        queue.push(follow_up.into_planned_decision(plan_idx));
+    }
+    queue
 }
 
 fn push_recent_step(recent_steps: &mut Vec<String>, entry: String) {
@@ -1541,20 +1630,111 @@ pub fn is_duplicate_url_action(
     }
 }
 
-fn action_settle_delay_ms(action: &AgentAction, base_delay_ms: u64) -> u64 {
+async fn wait_for_window_change_or_timeout(
+    before: &ActiveWindowMetadata,
+    target_app: Option<&str>,
+    max_wait_ms: u64,
+    paint_settle_ms: u64,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let initial_wait = 100.min(max_wait_ms);
+    if sleep_interruptible(Duration::from_millis(initial_wait), stop_rx).await {
+        return true;
+    }
+
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(max_wait_ms.saturating_sub(initial_wait));
+
+    loop {
+        let current = tokio::task::spawn_blocking(read_active_window_metadata).await;
+        if let Ok(win) = current {
+            let app_matched = target_app.is_some_and(|t| {
+                !t.trim().is_empty() && win.app_name.eq_ignore_ascii_case(t.trim())
+            });
+            let changed = win.app_name != before.app_name
+                || win.window_title != before.window_title
+                || app_matched;
+            if changed {
+                return sleep_interruptible(Duration::from_millis(paint_settle_ms), stop_rx).await;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        if sleep_interruptible(Duration::from_millis(50), stop_rx).await {
+            return true;
+        }
+    }
+}
+
+async fn adaptive_inter_batch_settle(
+    action: &AgentAction,
+    before_win: &ActiveWindowMetadata,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> bool {
     match action {
-        AgentAction::OpenUrl { .. }
-        | AgentAction::OpenApp { .. }
-        | AgentAction::FocusApp { .. }
-        | AgentAction::OpenPath { .. } => base_delay_ms.max(1700),
+        AgentAction::OpenApp { app_name } | AgentAction::FocusApp { app_name } => {
+            wait_for_window_change_or_timeout(before_win, Some(app_name), 900, 120, stop_rx).await
+        }
+        AgentAction::OpenUrl { app_name, .. } => {
+            wait_for_window_change_or_timeout(before_win, app_name.as_deref(), 900, 120, stop_rx)
+                .await
+        }
+        AgentAction::OpenPath { .. } => {
+            wait_for_window_change_or_timeout(before_win, None, 900, 120, stop_rx).await
+        }
+        _ => sleep_interruptible(Duration::from_millis(80), stop_rx).await,
+    }
+}
+
+async fn adaptive_post_action_settle(
+    action: &AgentAction,
+    before_win: &ActiveWindowMetadata,
+    base_delay_ms: u64,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    match action {
+        AgentAction::OpenApp { app_name } | AgentAction::FocusApp { app_name } => {
+            wait_for_window_change_or_timeout(
+                before_win,
+                Some(app_name),
+                base_delay_ms.max(1200),
+                150,
+                stop_rx,
+            )
+            .await
+        }
+        AgentAction::OpenUrl { app_name, .. } => {
+            wait_for_window_change_or_timeout(
+                before_win,
+                app_name.as_deref(),
+                base_delay_ms.max(1200),
+                150,
+                stop_rx,
+            )
+            .await
+        }
+        AgentAction::OpenPath { .. } => {
+            wait_for_window_change_or_timeout(
+                before_win,
+                None,
+                base_delay_ms.max(1200),
+                150,
+                stop_rx,
+            )
+            .await
+        }
         AgentAction::TypeText { submit: true, .. }
-        | AgentAction::PasteText { submit: true, .. } => base_delay_ms.max(1400),
+        | AgentAction::PasteText { submit: true, .. } => {
+            sleep_interruptible(Duration::from_millis(base_delay_ms.min(350)), stop_rx).await
+        }
         AgentAction::PressKey { key, .. }
             if matches!(key.trim().to_ascii_lowercase().as_str(), "enter" | "return") =>
         {
-            base_delay_ms.max(1400)
+            sleep_interruptible(Duration::from_millis(base_delay_ms.min(350)), stop_rx).await
         }
-        _ => base_delay_ms,
+        _ => sleep_interruptible(Duration::from_millis(base_delay_ms.min(220)), stop_rx).await,
     }
 }
 
@@ -1953,6 +2133,65 @@ pub fn detect_repetition_level(history: &[String], next_sig: &str) -> Repetition
     RepetitionLevel::None
 }
 
+pub fn is_naturally_repeatable_action(action: &AgentAction) -> bool {
+    match action {
+        AgentAction::Scroll { .. } | AgentAction::Wait { .. } | AgentAction::Drag { .. } => true,
+        AgentAction::PressKey { key, modifiers } if modifiers.is_empty() => matches!(
+            key.trim().to_ascii_lowercase().as_str(),
+            "up" | "down"
+                | "left"
+                | "right"
+                | "arrowup"
+                | "arrowdown"
+                | "arrowleft"
+                | "arrowright"
+                | "arrow_up"
+                | "arrow_down"
+                | "arrow_left"
+                | "arrow_right"
+                | "pageup"
+                | "page_up"
+                | "pgup"
+                | "pagedown"
+                | "page_down"
+                | "pgdn"
+                | "space"
+                | "spacebar"
+                | "tab"
+                | "backspace"
+                | "delete"
+                | "forward_delete"
+                | "del"
+        ),
+        _ => false,
+    }
+}
+
+pub fn detect_progressing_cycle_abort(history: &[String], next_sig: &str) -> bool {
+    let trailing_same = history.iter().rev().take_while(|s| s.as_str() == next_sig).count();
+    if trailing_same >= 6 {
+        return true;
+    }
+
+    let n = history.len();
+    if n >= 7 {
+        let a = &history[n - 7];
+        let b = &history[n - 6];
+        if a != b
+            && history[n - 5] == *a
+            && history[n - 4] == *b
+            && history[n - 3] == *a
+            && history[n - 2] == *b
+            && history[n - 1] == *a
+            && next_sig == b
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn action_badge_text(action: &AgentAction) -> &'static str {
     match action {
         AgentAction::Click { double: true, .. } => "Double-Click",
@@ -2020,6 +2259,8 @@ mod tests {
             wait_ms: None,
             requires_confirmation: false,
             summary: None,
+            plan_steps: Vec::new(),
+            follow_up_actions: Vec::new(),
         }
     }
 
@@ -2193,5 +2434,163 @@ mod tests {
             "click|23".to_string(),
         ];
         assert_eq!(detect_repetition_level(&cycle3, "type|0"), RepetitionLevel::Abort);
+    }
+
+    #[test]
+    fn builds_batched_action_queue_and_evaluates_local_verification() {
+        let mut primary = base_decision("open_app");
+        primary.app_name = Some("Notes".to_string());
+        primary.plan_step_index = 2;
+        primary.follow_up_actions = vec![
+            crate::classifier::FollowUpAction {
+                narration: "New note".to_string(),
+                action_type: "press_key".to_string(),
+                target_ocr_id: None,
+                x_norm: None,
+                y_norm: None,
+                from_x_norm: None,
+                from_y_norm: None,
+                to_x_norm: None,
+                to_y_norm: None,
+                text: None,
+                replace: false,
+                submit: false,
+                key: Some("n".to_string()),
+                modifiers: vec!["cmd".to_string()],
+                scroll_delta_y: None,
+                scroll_delta_x: None,
+                app_name: None,
+                url: None,
+                path: None,
+                wait_ms: None,
+                requires_confirmation: false,
+            },
+            crate::classifier::FollowUpAction {
+                narration: "Paste list".to_string(),
+                action_type: "paste_text".to_string(),
+                target_ocr_id: None,
+                x_norm: None,
+                y_norm: None,
+                from_x_norm: None,
+                from_y_norm: None,
+                to_x_norm: None,
+                to_y_norm: None,
+                text: Some("- Item 1".to_string()),
+                replace: false,
+                submit: false,
+                key: None,
+                modifiers: Vec::new(),
+                scroll_delta_y: None,
+                scroll_delta_x: None,
+                app_name: None,
+                url: None,
+                path: None,
+                wait_ms: None,
+                requires_confirmation: false,
+            },
+        ];
+
+        let queue = build_turn_action_queue(primary);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].action_type, "open_app");
+        assert_eq!(queue[1].action_type, "press_key");
+        assert_eq!(queue[1].plan_step_index, 2);
+        assert_eq!(queue[2].action_type, "paste_text");
+
+        let before = ActiveWindowMetadata {
+            app_name: "Finder".to_string(),
+            window_title: "Desktop".to_string(),
+            process_id: 1,
+            is_system_locked: false,
+        };
+        let same_after = before.clone();
+        let diff_app = ActiveWindowMetadata {
+            app_name: "Notes".to_string(),
+            window_title: "Notes".to_string(),
+            process_id: 2,
+            is_system_locked: false,
+        };
+
+        let stalled = evaluate_local_verification(&before, &same_after, 0.1, None, None);
+        assert!(stalled.step_stalled);
+        assert_eq!(stalled.step_status, "unverified_failed");
+
+        let app_switched = evaluate_local_verification(&before, &diff_app, 0.1, None, None);
+        assert!(!app_switched.step_stalled);
+        assert_eq!(app_switched.step_status, "verified");
+
+        let visual_changed = evaluate_local_verification(&before, &same_after, 2.5, None, None);
+        assert!(!visual_changed.step_stalled);
+        assert_eq!(visual_changed.step_status, "verified");
+
+        let errored = evaluate_local_verification(&before, &diff_app, 5.0, None, Some("boom"));
+        assert!(errored.step_stalled);
+        assert_eq!(errored.step_status, "failed");
+    }
+
+    #[test]
+    fn allows_progressing_repeatable_actions_and_aborts_excessive_toggles() {
+        assert!(is_naturally_repeatable_action(&AgentAction::Scroll {
+            x: 100.0,
+            y: 200.0,
+            delta_y: -5,
+            delta_x: 0,
+        }));
+        assert!(is_naturally_repeatable_action(&AgentAction::Wait { ms: 500 }));
+        assert!(is_naturally_repeatable_action(&AgentAction::PressKey {
+            key: "pagedown".to_string(),
+            modifiers: Vec::new(),
+        }));
+        assert!(is_naturally_repeatable_action(&AgentAction::PressKey {
+            key: "space".to_string(),
+            modifiers: Vec::new(),
+        }));
+        assert!(!is_naturally_repeatable_action(&AgentAction::PressKey {
+            key: "l".to_string(),
+            modifiers: vec!["cmd".to_string()],
+        }));
+        assert!(!is_naturally_repeatable_action(&AgentAction::Click {
+            x: 100.0,
+            y: 200.0,
+            button: MouseButtonKind::Left,
+            double: false,
+        }));
+        assert!(!is_naturally_repeatable_action(&AgentAction::OpenUrl {
+            url: "https://example.com".to_string(),
+            app_name: Some("Safari".to_string()),
+        }));
+
+        let five_repeats = vec![
+            "click|1".to_string(),
+            "click|1".to_string(),
+            "click|1".to_string(),
+            "click|1".to_string(),
+            "click|1".to_string(),
+        ];
+        assert!(!detect_progressing_cycle_abort(&five_repeats, "click|1"));
+
+        let mut six_repeats = five_repeats;
+        six_repeats.push("click|1".to_string());
+        assert!(detect_progressing_cycle_abort(&six_repeats, "click|1"));
+
+        let three_toggles = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        assert!(!detect_progressing_cycle_abort(&three_toggles, "b"));
+
+        let four_toggles = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        assert!(detect_progressing_cycle_abort(&four_toggles, "b"));
     }
 }

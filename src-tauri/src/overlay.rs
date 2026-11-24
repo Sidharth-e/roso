@@ -279,6 +279,18 @@ mod macos_panel {
         }
         (screen_frame.size.width, screen_frame.size.height)
     }
+
+    pub fn order_overlay_front(window: &WebviewWindow) {
+        if let Ok(raw_ptr) = window.ns_window() {
+            if !raw_ptr.is_null() {
+                unsafe {
+                    let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
+                    ns_panel.setIgnoresMouseEvents(true);
+                    ns_panel.orderFrontRegardless();
+                }
+            }
+        }
+    }
 }
 
 pub fn initialize_windows_and_tray<F, S>(
@@ -497,11 +509,31 @@ pub fn toggle_tray_popover(app_handle: &AppHandle, align_to_cursor: bool) {
     });
 }
 
+pub fn bring_overlay_to_front(app_handle: &AppHandle) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(overlay) = handle.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+            return;
+        };
+        let _ = overlay.set_ignore_cursor_events(true);
+
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::order_overlay_front(&overlay);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = overlay.show();
+        }
+    });
+}
+
 pub fn emit_pointer_cue(
     app_handle: &AppHandle,
     payload: PointerCuePayload,
 ) -> tauri::Result<()> {
-    configure_overlay_window(app_handle);
+    bring_overlay_to_front(app_handle);
     app_handle.emit("pointer-cue", payload)
 }
 

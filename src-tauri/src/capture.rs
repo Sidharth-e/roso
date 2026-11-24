@@ -2,14 +2,13 @@ use active_win_pos_rs::get_active_window;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::imageops::FilterType;
-use image::{DynamicImage, Rgb, RgbImage, RgbaImage};
+use image::{Rgb, RgbImage, RgbaImage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xcap::Monitor;
 
-const MAX_DOWNSCALED_WIDTH: u32 = 1280;
-const JPEG_QUALITY: u8 = 82;
+pub const MAX_DOWNSCALED_WIDTH: u32 = 1024;
+const JPEG_QUALITY: u8 = 72;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -52,6 +51,12 @@ pub struct AnnotationBox {
     pub w_norm: f64,
     pub h_norm: f64,
     pub is_interactive: bool,
+}
+
+pub struct UnencodedCaptureFrame {
+    pub full_res_rgba: RgbaImage,
+    pub active_window: ActiveWindowMetadata,
+    pub screen_metrics: ScreenMetrics,
 }
 
 pub struct RawCaptureFrame {
@@ -116,7 +121,7 @@ pub fn primary_screen_metrics() -> Result<ScreenMetrics, CaptureError> {
     extract_screen_metrics(&monitor, None)
 }
 
-pub fn capture_primary_display_in_ram() -> Result<RawCaptureFrame, CaptureError> {
+pub fn capture_raw_frame_in_ram() -> Result<UnencodedCaptureFrame, CaptureError> {
     if !has_screen_recording_permission() {
         return Err(CaptureError::PermissionDenied);
     }
@@ -128,18 +133,27 @@ pub fn capture_primary_display_in_ram() -> Result<RawCaptureFrame, CaptureError>
         .map_err(|err| CaptureError::ScreenCapture(err.to_string()))?;
     let screen_metrics = extract_screen_metrics(&monitor, Some(full_res_rgba.dimensions()))?;
 
-    let base64_jpeg = downscale_and_encode_jpeg_base64(&full_res_rgba)?;
-
-    Ok(RawCaptureFrame {
+    Ok(UnencodedCaptureFrame {
         full_res_rgba,
-        base64_jpeg,
         active_window,
         screen_metrics,
     })
 }
 
+pub fn capture_primary_display_in_ram() -> Result<RawCaptureFrame, CaptureError> {
+    let raw = capture_raw_frame_in_ram()?;
+    let base64_jpeg = downscale_and_encode_jpeg_base64(&raw.full_res_rgba)?;
+
+    Ok(RawCaptureFrame {
+        full_res_rgba: raw.full_res_rgba,
+        base64_jpeg,
+        active_window: raw.active_window,
+        screen_metrics: raw.screen_metrics,
+    })
+}
+
 pub fn downscale_and_encode_jpeg_base64(rgba: &RgbaImage) -> Result<String, CaptureError> {
-    let rgb_image = resize_to_rgb(rgba);
+    let rgb_image = downscale_rgba_to_rgb(rgba, MAX_DOWNSCALED_WIDTH);
     encode_rgb_jpeg_base64(&rgb_image)
 }
 
@@ -178,13 +192,20 @@ pub fn render_annotated_jpeg_base64(
     rgba: &RgbaImage,
     boxes: &[AnnotationBox],
 ) -> Result<String, CaptureError> {
-    let mut rgb_image = resize_to_rgb(rgba);
+    let mut rgb_image = downscale_rgba_to_rgb(rgba, MAX_DOWNSCALED_WIDTH);
+    annotate_rgb_and_encode_jpeg_base64(&mut rgb_image, boxes)
+}
+
+pub fn annotate_rgb_and_encode_jpeg_base64(
+    rgb_image: &mut RgbImage,
+    boxes: &[AnnotationBox],
+) -> Result<String, CaptureError> {
     let (w, h) = rgb_image.dimensions();
     if w < 16 || h < 16 {
-        return encode_rgb_jpeg_base64(&rgb_image);
+        return encode_rgb_jpeg_base64(rgb_image);
     }
 
-    draw_coordinate_grid(&mut rgb_image);
+    draw_coordinate_grid(rgb_image);
 
     for b in boxes {
         let bx = (b.x_norm.clamp(0.0, 1.0) * f64::from(w)).round() as i32;
@@ -202,7 +223,7 @@ pub fn render_annotated_jpeg_base64(
         } else {
             [217u8, 119u8, 6u8]
         };
-        draw_rect_outline(&mut rgb_image, x0, y0, x1 - x0, y1 - y0, color);
+        draw_rect_outline(rgb_image, x0, y0, x1 - x0, y1 - y0, color);
 
         let label = b.id.to_string();
         let pill_w = (label.len() as i32) * 6 + 4;
@@ -213,26 +234,134 @@ pub fn render_annotated_jpeg_base64(
         } else {
             y0.clamp(0, (h as i32 - pill_h).max(0))
         };
-        fill_rect(&mut rgb_image, pill_x, pill_y, pill_w, pill_h, [15, 23, 42]);
-        draw_bitmap_text(&mut rgb_image, pill_x + 2, pill_y + 2, &label, [248, 250, 252]);
+        fill_rect(rgb_image, pill_x, pill_y, pill_w, pill_h, [15, 23, 42]);
+        draw_bitmap_text(rgb_image, pill_x + 2, pill_y + 2, &label, [248, 250, 252]);
     }
 
-    encode_rgb_jpeg_base64(&rgb_image)
+    encode_rgb_jpeg_base64(rgb_image)
 }
 
-fn resize_to_rgb(rgba: &RgbaImage) -> RgbImage {
-    let (width, height) = rgba.dimensions();
-    let dynamic = DynamicImage::ImageRgba8(rgba.clone());
+pub fn downscale_rgba_to_rgb(rgba: &RgbaImage, max_width: u32) -> RgbImage {
+    let (src_w, src_h) = rgba.dimensions();
+    let src = rgba.as_raw();
+    if src_w == 0 || src_h == 0 {
+        return RgbImage::new(src_w, src_h);
+    }
 
-    let resized = if width > MAX_DOWNSCALED_WIDTH && width > 0 {
-        let ratio = f64::from(MAX_DOWNSCALED_WIDTH) / f64::from(width);
-        let target_height = ((f64::from(height) * ratio).round() as u32).max(1);
-        dynamic.resize_exact(MAX_DOWNSCALED_WIDTH, target_height, FilterType::Triangle)
-    } else {
-        dynamic
-    };
+    if src_w <= max_width || max_width == 0 {
+        let mut out = Vec::with_capacity((src_w as usize) * (src_h as usize) * 3);
+        for px in src.chunks_exact(4) {
+            out.push(px[0]);
+            out.push(px[1]);
+            out.push(px[2]);
+        }
+        return RgbImage::from_raw(src_w, src_h, out).unwrap_or_else(|| RgbImage::new(src_w, src_h));
+    }
 
-    resized.to_rgb8()
+    let dst_w = max_width;
+    let dst_h = ((f64::from(src_h) * (f64::from(dst_w) / f64::from(src_w))).round() as u32).max(1);
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 3];
+
+    let x_map: Vec<(usize, usize, u32, u32)> = (0..dst_w)
+        .map(|dx| {
+            let fx = (u64::from(dx) * u64::from(src_w - 1) * 256) / u64::from((dst_w - 1).max(1));
+            let x0 = (fx >> 8) as usize;
+            let x1 = (x0 + 1).min((src_w - 1) as usize);
+            let wx = (fx & 0xFF) as u32;
+            (x0 * 4, x1 * 4, 256 - wx, wx)
+        })
+        .collect();
+
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 3;
+
+    for dy in 0..dst_h {
+        let fy = (u64::from(dy) * u64::from(src_h - 1) * 256) / u64::from((dst_h - 1).max(1));
+        let y0 = (fy >> 8) as usize;
+        let y1 = (y0 + 1).min((src_h - 1) as usize);
+        let wy = (fy & 0xFF) as u32;
+        let inv_wy = 256 - wy;
+
+        let row0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
+        let row1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
+        let dst_row = &mut out[(dy as usize) * dst_stride..((dy as usize) + 1) * dst_stride];
+
+        for (dx, &(x0_off, x1_off, inv_wx, wx)) in x_map.iter().enumerate() {
+            let w00 = inv_wx * inv_wy;
+            let w10 = wx * inv_wy;
+            let w01 = inv_wx * wy;
+            let w11 = wx * wy;
+            let dst_off = dx * 3;
+
+            for c in 0..3 {
+                let p00 = u32::from(row0[x0_off + c]);
+                let p10 = u32::from(row0[x1_off + c]);
+                let p01 = u32::from(row1[x0_off + c]);
+                let p11 = u32::from(row1[x1_off + c]);
+                let val = (p00 * w00 + p10 * w10 + p01 * w01 + p11 * w11 + 32768) >> 16;
+                dst_row[dst_off + c] = val as u8;
+            }
+        }
+    }
+
+    RgbImage::from_raw(dst_w, dst_h, out).unwrap_or_else(|| RgbImage::new(dst_w, dst_h))
+}
+
+pub fn downscale_rgba_for_ocr(rgba: &RgbaImage, max_width: u32) -> Option<RgbaImage> {
+    let (src_w, src_h) = rgba.dimensions();
+    if src_w <= max_width || max_width == 0 || src_w == 0 || src_h == 0 {
+        return None;
+    }
+
+    let src = rgba.as_raw();
+    let dst_w = max_width;
+    let dst_h = ((f64::from(src_h) * (f64::from(dst_w) / f64::from(src_w))).round() as u32).max(1);
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+
+    let x_map: Vec<(usize, usize, u32, u32)> = (0..dst_w)
+        .map(|dx| {
+            let fx = (u64::from(dx) * u64::from(src_w - 1) * 256) / u64::from((dst_w - 1).max(1));
+            let x0 = (fx >> 8) as usize;
+            let x1 = (x0 + 1).min((src_w - 1) as usize);
+            let wx = (fx & 0xFF) as u32;
+            (x0 * 4, x1 * 4, 256 - wx, wx)
+        })
+        .collect();
+
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 4;
+
+    for dy in 0..dst_h {
+        let fy = (u64::from(dy) * u64::from(src_h - 1) * 256) / u64::from((dst_h - 1).max(1));
+        let y0 = (fy >> 8) as usize;
+        let y1 = (y0 + 1).min((src_h - 1) as usize);
+        let wy = (fy & 0xFF) as u32;
+        let inv_wy = 256 - wy;
+
+        let row0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
+        let row1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
+        let dst_row = &mut out[(dy as usize) * dst_stride..((dy as usize) + 1) * dst_stride];
+
+        for (dx, &(x0_off, x1_off, inv_wx, wx)) in x_map.iter().enumerate() {
+            let w00 = inv_wx * inv_wy;
+            let w10 = wx * inv_wy;
+            let w01 = inv_wx * wy;
+            let w11 = wx * wy;
+            let dst_off = dx * 4;
+
+            for c in 0..3 {
+                let p00 = u32::from(row0[x0_off + c]);
+                let p10 = u32::from(row0[x1_off + c]);
+                let p01 = u32::from(row1[x0_off + c]);
+                let p11 = u32::from(row1[x1_off + c]);
+                let val = (p00 * w00 + p10 * w10 + p01 * w01 + p11 * w11 + 32768) >> 16;
+                dst_row[dst_off + c] = val as u8;
+            }
+            dst_row[dst_off + 3] = 255;
+        }
+    }
+
+    RgbaImage::from_raw(dst_w, dst_h, out)
 }
 
 fn encode_rgb_jpeg_base64(rgb_image: &RgbImage) -> Result<String, CaptureError> {
@@ -459,7 +588,7 @@ mod tests {
     use image::Rgba;
 
     #[test]
-    fn downscales_wide_image_to_1280_and_encodes_raw_base64_without_prefix() {
+    fn downscales_wide_image_to_1024_and_encodes_raw_base64_without_prefix() {
         let img = RgbaImage::from_pixel(2560, 1440, Rgba([24, 48, 96, 255]));
         let encoded = downscale_and_encode_jpeg_base64(&img).expect("jpeg encode should succeed");
         assert!(!encoded.is_empty());
@@ -469,12 +598,12 @@ mod tests {
             .decode(&encoded)
             .expect("valid base64 output");
         let decoded_img = image::load_from_memory(&decoded_bytes).expect("valid jpeg bytes");
-        assert_eq!(decoded_img.width(), 1280);
-        assert_eq!(decoded_img.height(), 720);
+        assert_eq!(decoded_img.width(), 1024);
+        assert_eq!(decoded_img.height(), 576);
     }
 
     #[test]
-    fn preserves_dimensions_when_width_below_1280() {
+    fn preserves_dimensions_when_width_below_1024() {
         let img = RgbaImage::from_pixel(800, 600, Rgba([120, 130, 140, 255]));
         let encoded = downscale_and_encode_jpeg_base64(&img).expect("jpeg encode should succeed");
         let decoded_bytes = BASE64_STANDARD
@@ -509,8 +638,8 @@ mod tests {
         let encoded = render_annotated_jpeg_base64(&img, &boxes).expect("annotated jpeg");
         let bytes = BASE64_STANDARD.decode(&encoded).expect("valid base64");
         let decoded = image::load_from_memory(&bytes).expect("valid annotated jpeg");
-        assert_eq!(decoded.width(), 1280);
-        assert_eq!(decoded.height(), 800);
+        assert_eq!(decoded.width(), 1024);
+        assert_eq!(decoded.height(), 640);
     }
 
     #[cfg(target_os = "macos")]
