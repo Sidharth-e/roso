@@ -4,6 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub const OLLAMA_BASE_URL: &str = "https://ollama.com";
+pub const VISION_MODEL: &str = "deepseek-v4.1-flash:cloud";
+pub const MAX_STEPS: u32 = 20;
+pub const STEP_DELAY_MS: u64 = 250;
+pub const CONFIRM_RISKY_ACTIONS: bool = true;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("unable to resolve macOS Application Support directory")]
@@ -16,28 +22,11 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
-    pub ollama_base_url: String,
+    #[serde(default)]
     pub ollama_api_key: String,
-    pub vision_model: String,
-    pub max_steps: u32,
-    pub step_delay_ms: u64,
-    pub confirm_risky_actions: bool,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            ollama_base_url: "https://ollama.com".to_string(),
-            ollama_api_key: String::new(),
-            vision_model: "deepseek-v4.1-flash:cloud".to_string(),
-            max_steps: 20,
-            step_delay_ms: 250,
-            confirm_risky_actions: true,
-        }
-    }
 }
 
 impl AppConfig {
@@ -53,7 +42,6 @@ impl AppConfig {
     }
 
     pub fn sanitized(mut self) -> Result<Self, ConfigError> {
-        self.ollama_base_url = validate_base_url(&self.ollama_base_url)?;
         self.ollama_api_key = self
             .ollama_api_key
             .chars()
@@ -61,17 +49,6 @@ impl AppConfig {
             .collect::<String>()
             .trim()
             .to_string();
-        self.vision_model = validate_model_name(&self.vision_model, "vision_model")?;
-        if !(1..=50).contains(&self.max_steps) {
-            return Err(ConfigError::Validation(
-                "max_steps must be between 1 and 50".to_string(),
-            ));
-        }
-        if !(50..=5000).contains(&self.step_delay_ms) {
-            return Err(ConfigError::Validation(
-                "step_delay_ms must be between 50 and 5000".to_string(),
-            ));
-        }
         Ok(self)
     }
 }
@@ -131,13 +108,7 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     }
     let raw = fs::read_to_string(&path)?;
     match serde_json::from_str::<AppConfig>(&raw) {
-        Ok(mut parsed) => {
-            if parsed.vision_model == "qwen3-vl:235b-cloud" {
-                parsed.vision_model = "deepseek-v4.1-flash:cloud".to_string();
-                return save_config(&parsed);
-            }
-            parsed.sanitized()
-        }
+        Ok(parsed) => parsed.sanitized(),
         Err(_) => {
             let default_cfg = AppConfig::default();
             save_config(&default_cfg)?;
@@ -203,39 +174,6 @@ pub fn validate_goal_input(goal: &str) -> Result<String, ConfigError> {
     Ok(cleaned)
 }
 
-fn validate_base_url(url: &str) -> Result<String, ConfigError> {
-    let trimmed = url.trim().trim_end_matches('/').to_string();
-    let allowed = trimmed.starts_with("https://ollama.com")
-        || trimmed.starts_with("http://localhost:")
-        || trimmed == "http://localhost"
-        || trimmed.starts_with("http://127.0.0.1:")
-        || trimmed == "http://127.0.0.1";
-    if !allowed {
-        return Err(ConfigError::Validation(
-            "ollama_base_url must target https://ollama.com or localhost".to_string(),
-        ));
-    }
-    Ok(trimmed)
-}
-
-fn validate_model_name(name: &str, field: &str) -> Result<String, ConfigError> {
-    let trimmed = name.trim().to_string();
-    if trimmed.is_empty() || trimmed.len() > 120 {
-        return Err(ConfigError::Validation(format!(
-            "{field} must be between 1 and 120 characters"
-        )));
-    }
-    let valid_chars = trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'));
-    if !valid_chars {
-        return Err(ConfigError::Validation(format!(
-            "{field} contains invalid characters"
-        )));
-    }
-    Ok(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,14 +185,27 @@ mod tests {
         let too_long = "a".repeat(501);
         assert!(validate_goal_input(&too_long).is_err());
 
-        let mut cfg = AppConfig::default();
-        assert!(cfg.clone().sanitized().is_ok());
+        let cfg = AppConfig {
+            ollama_api_key: "  sk-test\n\t123  ".to_string(),
+        };
+        let sanitized = cfg.sanitized().unwrap();
+        assert_eq!(sanitized.ollama_api_key, "sk-test123");
 
-        cfg.max_steps = 0;
-        assert!(cfg.clone().sanitized().is_err());
+        let legacy_json = r#"{
+            "ollamaBaseUrl": "https://ollama.com",
+            "ollamaApiKey": "legacy-key",
+            "visionModel": "qwen3-vl:235b-cloud",
+            "maxSteps": 30,
+            "stepDelayMs": 500,
+            "confirmRiskyActions": false
+        }"#;
+        let parsed_legacy: AppConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed_legacy.ollama_api_key, "legacy-key");
 
-        cfg.max_steps = 20;
-        cfg.step_delay_ms = 20;
-        assert!(cfg.sanitized().is_err());
+        assert_eq!(OLLAMA_BASE_URL, "https://ollama.com");
+        assert_eq!(VISION_MODEL, "deepseek-v4.1-flash:cloud");
+        assert_eq!(MAX_STEPS, 20);
+        assert_eq!(STEP_DELAY_MS, 250);
+        assert!(CONFIRM_RISKY_ACTIONS);
     }
 }

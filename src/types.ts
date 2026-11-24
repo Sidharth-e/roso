@@ -60,12 +60,7 @@ export const EngineSnapshotSchema = z.object({
 export type EngineSnapshot = z.infer<typeof EngineSnapshotSchema>;
 
 export const AppConfigSchema = z.object({
-  ollamaBaseUrl: z.string().min(1),
   ollamaApiKey: z.string(),
-  visionModel: z.string().min(1),
-  maxSteps: z.number().int().min(1).max(50),
-  stepDelayMs: z.number().int().min(50).max(5000),
-  confirmRiskyActions: z.boolean(),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 

@@ -11,7 +11,8 @@ use crate::classifier::{
     AgentError, NextActionContext, OllamaAgentClient, PlannedActionDecision, RecoveryContext,
 };
 use crate::config::{
-    append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord,
+    append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord, CONFIRM_RISKY_ACTIONS,
+    MAX_STEPS, OLLAMA_BASE_URL, STEP_DELAY_MS, VISION_MODEL,
 };
 use crate::ocr::{extract_ax_elements, extract_ocr_targets, merge_targets, ScreenTargetMap};
 use crate::overlay::{
@@ -155,10 +156,9 @@ pub struct TaskEngine {
 
 impl TaskEngine {
     pub fn new(initial_config: AppConfig) -> Result<Arc<Self>, AgentError> {
-        let max_steps = initial_config.max_steps;
         Ok(Arc::new(Self {
             config: Mutex::new(initial_config),
-            state: Mutex::new(TaskRuntimeState::idle(max_steps)),
+            state: Mutex::new(TaskRuntimeState::idle(MAX_STEPS)),
             stop_tx: Mutex::new(None),
             pause_tx: Mutex::new(None),
             confirm_tx: Mutex::new(None),
@@ -171,12 +171,7 @@ impl TaskEngine {
     }
 
     pub fn update_config(&self, next: AppConfig) {
-        let next_max = next.max_steps;
         *self.config.lock() = next;
-        let mut st = self.state.lock();
-        if !st.phase.is_active() {
-            st.max_steps = next_max;
-        }
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
@@ -205,7 +200,6 @@ impl TaskEngine {
     pub fn start_task(self: &Arc<Self>, app_handle: AppHandle, goal: String) -> EngineSnapshot {
         self.stop_task(&app_handle, Some("Replaced by new task".to_string()));
 
-        let cfg = self.config();
         let task_id = Uuid::new_v4().to_string();
 
         {
@@ -217,7 +211,7 @@ impl TaskEngine {
             st.plan_steps = Vec::new();
             st.active_plan_index = 0;
             st.current_step = 0;
-            st.max_steps = cfg.max_steps;
+            st.max_steps = MAX_STEPS;
             st.recovery_count = 0;
             st.last_diagnosis = None;
             st.active_app = String::new();
@@ -401,14 +395,12 @@ impl TaskEngine {
             }
         });
 
-        let cfg = self.config();
-
         hide_tray_popover(&app_handle);
         if sleep_interruptible(Duration::from_millis(60), &mut stop_rx).await {
             return;
         }
 
-        let max_steps = cfg.max_steps;
+        let max_steps = MAX_STEPS;
         let mut plan_steps: Vec<String> = Vec::new();
         let mut recent_steps: Vec<String> = Vec::new();
         let mut stalled_action_signatures: Vec<String> = Vec::new();
@@ -443,8 +435,7 @@ impl TaskEngine {
                 return;
             }
 
-            let cycle_cfg = self.config();
-            let cycle_api_key = cycle_cfg.resolved_api_key();
+            let cycle_api_key = self.config().resolved_api_key();
 
             let before_cap = match cached_capture.take() {
                 Some(cap) => cap,
@@ -499,9 +490,9 @@ impl TaskEngine {
             let decision_res = self
                 .client
                 .decide_next_action(
-                    &cycle_cfg.ollama_base_url,
+                    OLLAMA_BASE_URL,
                     &cycle_api_key,
-                    &cycle_cfg.vision_model,
+                    VISION_MODEL,
                     NextActionContext {
                         goal: goal.clone(),
                         plan_steps: plan_steps.clone(),
@@ -970,7 +961,7 @@ impl TaskEngine {
                 update_tray_status_title(&app_handle, Some(&snap));
                 let _ = app_handle.emit("engine-snapshot", &snap);
 
-                if cycle_cfg.confirm_risky_actions {
+                if CONFIRM_RISKY_ACTIONS {
                     if let Some(risk_reason) = assess_action_risk(
                         &action,
                         &item_decision.narration,
@@ -1223,7 +1214,7 @@ impl TaskEngine {
             if adaptive_post_action_settle(
                 &last_action,
                 &before_cap.active_window,
-                cycle_cfg.step_delay_ms,
+                STEP_DELAY_MS,
                 &mut stop_rx,
             )
             .await
@@ -1334,9 +1325,9 @@ impl TaskEngine {
                 if let Ok(rec_plan) = self
                     .client
                     .create_recovery_plan(
-                        &cycle_cfg.ollama_base_url,
+                        OLLAMA_BASE_URL,
                         &cycle_api_key,
-                        &cycle_cfg.vision_model,
+                        VISION_MODEL,
                         RecoveryContext {
                             goal: goal.clone(),
                             failed_action: last_action_desc.clone(),

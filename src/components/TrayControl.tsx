@@ -13,7 +13,6 @@ import {
   Card,
   Input,
   StatusBadge,
-  Switch,
   TabBar,
   TextArea,
 } from "./UiPrimitives";
@@ -560,17 +559,6 @@ export function TrayControl() {
           <form onSubmit={handleSaveSettings} className="space-y-3">
             <Card className="space-y-2.5">
               <Input
-                id="ollama-base-url"
-                label="Ollama Endpoint"
-                value={configDraft.ollamaBaseUrl}
-                onChange={(e) =>
-                  setConfigDraft({
-                    ...configDraft,
-                    ollamaBaseUrl: e.target.value,
-                  })
-                }
-              />
-              <Input
                 id="ollama-api-key"
                 label="Ollama Cloud API Key"
                 type="password"
@@ -583,61 +571,6 @@ export function TrayControl() {
                   })
                 }
               />
-              <Input
-                id="vision-model-input"
-                label="Vision Agent Model (/api/chat)"
-                placeholder="deepseek-v4.1-flash:cloud"
-                value={configDraft.visionModel}
-                onChange={(e) =>
-                  setConfigDraft({
-                    ...configDraft,
-                    visionModel: e.target.value,
-                  })
-                }
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="max-steps-input"
-                  label="Max Steps (1–50)"
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={configDraft.maxSteps}
-                  onChange={(e) =>
-                    setConfigDraft({
-                      ...configDraft,
-                      maxSteps: Number(e.target.value) || 20,
-                    })
-                  }
-                />
-                <Input
-                  id="step-delay-input"
-                  label="Step Delay (ms)"
-                  type="number"
-                  min={50}
-                  max={5000}
-                  step={50}
-                  value={configDraft.stepDelayMs}
-                  onChange={(e) =>
-                    setConfigDraft({
-                      ...configDraft,
-                      stepDelayMs: Number(e.target.value) || 250,
-                    })
-                  }
-                />
-              </div>
-              <Switch
-                id="confirm-risky-switch"
-                checked={configDraft.confirmRiskyActions}
-                onChange={(checked) =>
-                  setConfigDraft({
-                    ...configDraft,
-                    confirmRiskyActions: checked,
-                  })
-                }
-                label="Confirm Risky Actions"
-                description="Ask before deleting, sending, submitting, or Cmd+Q"
-              />
               <Button
                 type="submit"
                 className="w-full"
@@ -645,7 +578,7 @@ export function TrayControl() {
               >
                 {mutations.saveConfig.isPending
                   ? "Saving..."
-                  : "Save Configuration"}
+                  : "Save API Key"}
               </Button>
               {mutations.saveConfig.isError ? (
                 <p className="text-[11px] text-error">
@@ -654,7 +587,7 @@ export function TrayControl() {
               ) : null}
               {mutations.saveConfig.isSuccess ? (
                 <p className="text-[11px] text-success">
-                  Configuration saved to TaskCompanion/config.json.
+                  API key saved to TaskCompanion/config.json.
                 </p>
               ) : null}
             </Card>
