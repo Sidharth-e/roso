@@ -143,6 +143,37 @@ pub fn downscale_and_encode_jpeg_base64(rgba: &RgbaImage) -> Result<String, Capt
     encode_rgb_jpeg_base64(&rgb_image)
 }
 
+pub fn compute_frame_diff_ratio(before: &RgbaImage, after: &RgbaImage) -> f64 {
+    if before.dimensions() != after.dimensions() {
+        return 1.0;
+    }
+    let (w, h) = before.dimensions();
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let cols = 64u32.min(w);
+    let rows = 36u32.min(h);
+    let mut changed: u64 = 0;
+    let total = u64::from(cols) * u64::from(rows);
+
+    for gy in 0..rows {
+        let py = ((u64::from(gy) * u64::from(h)) / u64::from(rows)) as u32;
+        for gx in 0..cols {
+            let px = ((u64::from(gx) * u64::from(w)) / u64::from(cols)) as u32;
+            let p1 = before.get_pixel(px, py);
+            let p2 = after.get_pixel(px, py);
+            let diff = (i32::from(p1[0]) - i32::from(p2[0])).abs()
+                + (i32::from(p1[1]) - i32::from(p2[1])).abs()
+                + (i32::from(p1[2]) - i32::from(p2[2])).abs();
+            if diff > 36 {
+                changed += 1;
+            }
+        }
+    }
+
+    changed as f64 / total as f64
+}
+
 pub fn render_annotated_jpeg_base64(
     rgba: &RgbaImage,
     boxes: &[AnnotationBox],
@@ -490,5 +521,14 @@ mod tests {
         assert!((m.logical_height - 900.0).abs() < 1e-6);
         assert_eq!(m.pixel_width, 2880);
         assert_eq!(m.pixel_height, 1800);
+    }
+
+    #[test]
+    fn computes_visual_diff_ratio_across_frames() {
+        let a = RgbaImage::from_pixel(320, 180, Rgba([20, 30, 40, 255]));
+        let b = RgbaImage::from_pixel(320, 180, Rgba([20, 30, 40, 255]));
+        let c = RgbaImage::from_pixel(320, 180, Rgba([220, 230, 240, 255]));
+        assert!((compute_frame_diff_ratio(&a, &b) - 0.0).abs() < 1e-6);
+        assert!(compute_frame_diff_ratio(&a, &c) > 0.99);
     }
 }

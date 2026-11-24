@@ -559,6 +559,8 @@ pub fn update_tray_status_title(app_handle: &AppHandle, snapshot: Option<&Engine
         Some(s) => match s.phase {
             TaskPhase::Planning => Some("Planning...".to_string()),
             TaskPhase::Running => Some(format!("Step {}/{}", s.current_step, s.max_steps)),
+            TaskPhase::Verifying => Some("Verifying...".to_string()),
+            TaskPhase::Recovering => Some("Recovering...".to_string()),
             TaskPhase::AwaitingConfirmation => Some("Approve?".to_string()),
             TaskPhase::Paused => Some("Paused".to_string()),
             _ => Some(String::new()),

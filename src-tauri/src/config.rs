@@ -88,6 +88,8 @@ pub struct TaskStepRecord {
     pub target_ocr_id: Option<u32>,
     pub target_x: Option<f64>,
     pub target_y: Option<f64>,
+    #[serde(default)]
+    pub verification_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

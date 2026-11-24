@@ -4,6 +4,8 @@ export const TaskPhaseSchema = z.enum([
   "idle",
   "planning",
   "running",
+  "verifying",
+  "recovering",
   "awaiting_confirmation",
   "paused",
   "completed",
@@ -22,6 +24,7 @@ export const TaskStepRecordSchema = z.object({
   targetOcrId: z.number().int().nullable(),
   targetX: z.number().nullable(),
   targetY: z.number().nullable(),
+  verificationNote: z.string().nullable().optional(),
 });
 export type TaskStepRecord = z.infer<typeof TaskStepRecordSchema>;
 
@@ -43,6 +46,8 @@ export const EngineSnapshotSchema = z.object({
   activePlanIndex: z.number().int().nonnegative(),
   currentStep: z.number().int().nonnegative(),
   maxSteps: z.number().int().positive(),
+  recoveryCount: z.number().int().nonnegative(),
+  lastDiagnosis: z.string().nullable(),
   activeApp: z.string(),
   lastNarration: z.string(),
   lastSummary: z.string().nullable(),

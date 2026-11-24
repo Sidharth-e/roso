@@ -1,6 +1,8 @@
 use crate::capture::ScreenMetrics;
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -15,6 +17,11 @@ pub enum AutomationError {
     EventCreationFailed,
     #[error("command execution failed: {0}")]
     CommandFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionExecutionOutput {
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,11 +40,27 @@ pub enum AgentAction {
         button: MouseButtonKind,
         double: bool,
     },
+    Drag {
+        from_x: f64,
+        from_y: f64,
+        to_x: f64,
+        to_y: f64,
+    },
     TypeText {
         text: String,
         #[serde(default)]
         replace: bool,
+        #[serde(default)]
+        submit: bool,
     },
+    PasteText {
+        text: String,
+        #[serde(default)]
+        replace: bool,
+        #[serde(default)]
+        submit: bool,
+    },
+    ReadClipboard,
     PressKey {
         key: String,
         modifiers: Vec<String>,
@@ -46,12 +69,22 @@ pub enum AgentAction {
         x: f64,
         y: f64,
         delta_y: i32,
+        #[serde(default)]
+        delta_x: i32,
     },
     OpenApp {
         app_name: String,
     },
+    FocusApp {
+        app_name: String,
+    },
     OpenUrl {
         url: String,
+        #[serde(default)]
+        app_name: Option<String>,
+    },
+    OpenPath {
+        path: String,
     },
     Wait {
         ms: u64,
@@ -81,11 +114,16 @@ pub fn action_type_label(action: &AgentAction) -> &'static str {
             ..
         } => "right_click",
         AgentAction::Click { .. } => "click",
+        AgentAction::Drag { .. } => "drag",
         AgentAction::TypeText { .. } => "type_text",
+        AgentAction::PasteText { .. } => "paste_text",
+        AgentAction::ReadClipboard => "read_clipboard",
         AgentAction::PressKey { .. } => "press_key",
         AgentAction::Scroll { .. } => "scroll",
         AgentAction::OpenApp { .. } => "open_app",
+        AgentAction::FocusApp { .. } => "focus_app",
         AgentAction::OpenUrl { .. } => "open_url",
+        AgentAction::OpenPath { .. } => "open_path",
         AgentAction::Wait { .. } => "wait",
         AgentAction::Done { .. } => "done",
         AgentAction::Fail { .. } => "fail",
@@ -107,15 +145,51 @@ pub fn describe_action(action: &AgentAction) -> String {
             };
             format!("{kind} ({}, {})", x.round() as i64, y.round() as i64)
         }
-        AgentAction::TypeText { text, replace } => {
+        AgentAction::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        } => format!(
+            "Drag ({}, {}) -> ({}, {})",
+            from_x.round() as i64,
+            from_y.round() as i64,
+            to_x.round() as i64,
+            to_y.round() as i64
+        ),
+        AgentAction::TypeText {
+            text,
+            replace,
+            submit,
+        } => {
             let verb = if *replace { "Replace with" } else { "Type" };
+            let suffix = if *submit { " + Enter" } else { "" };
             let preview: String = text.chars().take(28).collect();
             if text.chars().count() > 28 {
-                format!("{verb} \"{preview}...\"")
+                format!("{verb} \"{preview}...\"{suffix}")
             } else {
-                format!("{verb} \"{preview}\"")
+                format!("{verb} \"{preview}\"{suffix}")
             }
         }
+        AgentAction::PasteText {
+            text,
+            replace,
+            submit,
+        } => {
+            let verb = if *replace {
+                "Replace & paste"
+            } else {
+                "Paste"
+            };
+            let suffix = if *submit { " + Enter" } else { "" };
+            let preview: String = text.chars().take(28).collect();
+            if text.chars().count() > 28 {
+                format!("{verb} \"{preview}...\"{suffix}")
+            } else {
+                format!("{verb} \"{preview}\"{suffix}")
+            }
+        }
+        AgentAction::ReadClipboard => "Read clipboard".to_string(),
         AgentAction::PressKey { key, modifiers } => {
             if modifiers.is_empty() {
                 format!("Press {key}")
@@ -123,15 +197,28 @@ pub fn describe_action(action: &AgentAction) -> String {
                 format!("Press {}+{key}", modifiers.join("+"))
             }
         }
-        AgentAction::Scroll { delta_y, .. } => {
-            if *delta_y >= 0 {
+        AgentAction::Scroll {
+            delta_y, delta_x, ..
+        } => {
+            if *delta_x != 0 && *delta_y == 0 {
+                if *delta_x > 0 {
+                    format!("Scroll left ({delta_x})")
+                } else {
+                    format!("Scroll right ({})", delta_x.abs())
+                }
+            } else if *delta_y >= 0 {
                 format!("Scroll up ({delta_y})")
             } else {
                 format!("Scroll down ({})", delta_y.abs())
             }
         }
         AgentAction::OpenApp { app_name } => format!("Open {app_name}"),
-        AgentAction::OpenUrl { url } => format!("Open URL {url}"),
+        AgentAction::FocusApp { app_name } => format!("Focus {app_name}"),
+        AgentAction::OpenUrl { url, app_name } => match app_name {
+            Some(app) if !app.trim().is_empty() => format!("Open {url} in {app}"),
+            _ => format!("Open URL {url}"),
+        },
+        AgentAction::OpenPath { path } => format!("Open path {path}"),
         AgentAction::Wait { ms } => format!("Wait {ms}ms"),
         AgentAction::Done { summary } => format!("Done: {summary}"),
         AgentAction::Fail { reason } => format!("Failed: {reason}"),
@@ -161,6 +248,14 @@ pub fn assess_action_risk(
                         ));
                     }
                 }
+            }
+            None
+        }
+        AgentAction::TypeText { submit: true, .. } | AgentAction::PasteText { submit: true, .. } => {
+            if let Some(word) = find_sensitive_keyword(narration, target_text) {
+                return Some(format!(
+                    "Submitting input involving \"{word}\" requires confirmation."
+                ));
             }
             None
         }
@@ -269,6 +364,45 @@ pub fn validate_open_url(url: &str) -> Result<String, AutomationError> {
         ));
     }
     Ok(clean)
+}
+
+pub fn validate_open_path(raw: &str) -> Result<PathBuf, AutomationError> {
+    let clean = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if clean.is_empty() || clean.len() > 512 {
+        return Err(AutomationError::InvalidInput(
+            "path must be between 1 and 512 characters".to_string(),
+        ));
+    }
+    if clean.starts_with('-') {
+        return Err(AutomationError::InvalidInput(
+            "path must not start with '-'".to_string(),
+        ));
+    }
+    let resolved = if clean == "~" {
+        dirs::home_dir().ok_or_else(|| {
+            AutomationError::InvalidInput("unable to resolve home directory".to_string())
+        })?
+    } else if let Some(rest) = clean.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            AutomationError::InvalidInput("unable to resolve home directory".to_string())
+        })?;
+        home.join(rest)
+    } else {
+        PathBuf::from(&clean)
+    };
+
+    if !resolved.exists() {
+        return Err(AutomationError::InvalidInput(format!(
+            "path does not exist: {}",
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 pub fn map_key_to_keycode(key: &str) -> Option<u16> {
@@ -626,9 +760,53 @@ pub fn is_kill_switch_pressed() -> bool {
     }
 }
 
-pub fn execute_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<(), AutomationError> {
+fn write_clipboard_text(text: &str) -> Result<(), AutomationError> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| AutomationError::CommandFailed(e.to_string()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| AutomationError::CommandFailed(e.to_string()))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| AutomationError::CommandFailed(e.to_string()))?;
+    if !status.success() {
+        return Err(AutomationError::CommandFailed(
+            "pbcopy exited with non-zero status".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_clipboard_text() -> Result<String, AutomationError> {
+    let output = Command::new("pbpaste")
+        .output()
+        .map_err(|e| AutomationError::CommandFailed(e.to_string()))?;
+    if !output.status.success() {
+        return Err(AutomationError::CommandFailed(
+            "pbpaste exited with non-zero status".to_string(),
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(1000)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    Ok(cleaned)
+}
+
+pub fn execute_action(
+    action: &AgentAction,
+    metrics: ScreenMetrics,
+) -> Result<ActionExecutionOutput, AutomationError> {
     match action {
-        AgentAction::OpenApp { app_name } => {
+        AgentAction::OpenApp { app_name } | AgentAction::FocusApp { app_name } => {
             let clean = validate_app_name(app_name)?;
             let status = Command::new("open")
                 .arg("-a")
@@ -640,35 +818,77 @@ pub fn execute_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                     "failed to open application \"{clean}\""
                 )));
             }
-            Ok(())
+            Ok(ActionExecutionOutput { note: None })
         }
-        AgentAction::OpenUrl { url } => {
-            let clean = validate_open_url(url)?;
+        AgentAction::OpenUrl { url, app_name } => {
+            let clean_url = validate_open_url(url)?;
+            let status = if let Some(app) = app_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let clean_app = validate_app_name(app)?;
+                Command::new("open")
+                    .arg("-a")
+                    .arg(&clean_app)
+                    .arg(&clean_url)
+                    .status()
+                    .map_err(|e| AutomationError::CommandFailed(e.to_string()))?
+            } else {
+                Command::new("open")
+                    .arg(&clean_url)
+                    .status()
+                    .map_err(|e| AutomationError::CommandFailed(e.to_string()))?
+            };
+            if !status.success() {
+                return Err(AutomationError::CommandFailed(format!(
+                    "failed to open URL \"{clean_url}\""
+                )));
+            }
+            Ok(ActionExecutionOutput { note: None })
+        }
+        AgentAction::OpenPath { path } => {
+            let resolved = validate_open_path(path)?;
             let status = Command::new("open")
-                .arg(&clean)
+                .arg(&resolved)
                 .status()
                 .map_err(|e| AutomationError::CommandFailed(e.to_string()))?;
             if !status.success() {
                 return Err(AutomationError::CommandFailed(format!(
-                    "failed to open URL \"{clean}\""
+                    "failed to open path \"{}\"",
+                    resolved.display()
                 )));
             }
-            Ok(())
+            Ok(ActionExecutionOutput { note: None })
+        }
+        AgentAction::ReadClipboard => {
+            let text = read_clipboard_text()?;
+            let note = if text.is_empty() {
+                "Clipboard is empty".to_string()
+            } else {
+                format!("Clipboard: {text}")
+            };
+            Ok(ActionExecutionOutput { note: Some(note) })
         }
         AgentAction::Wait { ms } => {
             let clamped = (*ms).clamp(100, 5000);
             thread::sleep(Duration::from_millis(clamped));
-            Ok(())
+            Ok(ActionExecutionOutput { note: None })
         }
-        AgentAction::Done { .. } | AgentAction::Fail { .. } => Ok(()),
+        AgentAction::Done { .. } | AgentAction::Fail { .. } => {
+            Ok(ActionExecutionOutput { note: None })
+        }
         AgentAction::Click { .. }
+        | AgentAction::Drag { .. }
         | AgentAction::TypeText { .. }
+        | AgentAction::PasteText { .. }
         | AgentAction::PressKey { .. }
         | AgentAction::Scroll { .. } => {
             if !has_accessibility_permission() {
                 return Err(AutomationError::AccessibilityPermissionDenied);
             }
-            execute_hid_action(action, metrics)
+            execute_hid_action(action, metrics)?;
+            Ok(ActionExecutionOutput { note: None })
         }
     }
 }
@@ -745,30 +965,73 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             }
             Ok(())
         }
-        AgentAction::TypeText { text, replace } => {
+        AgentAction::Drag {
+            from_x,
+            from_y,
+            to_x,
+            to_y,
+        } => {
+            let (sx, sy) = clamp_point(*from_x, *from_y, metrics);
+            let (ex, ey) = clamp_point(*to_x, *to_y, metrics);
+            let start_pt = CGPoint::new(sx, sy);
+
+            let move_ev = CGEvent::new_mouse_event(
+                Some(&source),
+                CGEventType::MouseMoved,
+                start_pt,
+                CGMouseButton::Left,
+            )
+            .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
+            thread::sleep(Duration::from_millis(35));
+
+            let down = CGEvent::new_mouse_event(
+                Some(&source),
+                CGEventType::LeftMouseDown,
+                start_pt,
+                CGMouseButton::Left,
+            )
+            .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&down), CGEventFlags::empty());
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
+            thread::sleep(Duration::from_millis(25));
+
+            let steps = 12;
+            for step in 1..=steps {
+                let t = f64::from(step) / f64::from(steps);
+                let ix = sx + (ex - sx) * t;
+                let iy = sy + (ey - sy) * t;
+                let drag_ev = CGEvent::new_mouse_event(
+                    Some(&source),
+                    CGEventType::LeftMouseDragged,
+                    CGPoint::new(ix, iy),
+                    CGMouseButton::Left,
+                )
+                .ok_or(AutomationError::EventCreationFailed)?;
+                CGEvent::set_flags(Some(&drag_ev), CGEventFlags::empty());
+                CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&drag_ev));
+                thread::sleep(Duration::from_millis(14));
+            }
+
+            let up = CGEvent::new_mouse_event(
+                Some(&source),
+                CGEventType::LeftMouseUp,
+                CGPoint::new(ex, ey),
+                CGMouseButton::Left,
+            )
+            .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&up), CGEventFlags::empty());
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
+            Ok(())
+        }
+        AgentAction::TypeText {
+            text,
+            replace,
+            submit,
+        } => {
             if *replace {
-                post_key_chord(
-                    &source,
-                    ParsedKeyChord {
-                        keycode: 0x00,
-                        cmd: true,
-                        shift: false,
-                        alt: false,
-                        ctrl: false,
-                    },
-                )?;
-                thread::sleep(Duration::from_millis(40));
-                post_key_chord(
-                    &source,
-                    ParsedKeyChord {
-                        keycode: 0x33,
-                        cmd: false,
-                        shift: false,
-                        alt: false,
-                        ctrl: false,
-                    },
-                )?;
-                thread::sleep(Duration::from_millis(40));
+                select_all_and_delete(&source)?;
             }
 
             let filtered: String = text
@@ -816,13 +1079,75 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 }
                 thread::sleep(Duration::from_millis(10));
             }
+
+            if *submit {
+                thread::sleep(Duration::from_millis(30));
+                post_key_chord(
+                    &source,
+                    ParsedKeyChord {
+                        keycode: 0x24,
+                        cmd: false,
+                        shift: false,
+                        alt: false,
+                        ctrl: false,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+        AgentAction::PasteText {
+            text,
+            replace,
+            submit,
+        } => {
+            let filtered: String = text
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                .take(4000)
+                .collect();
+            write_clipboard_text(&filtered)?;
+            thread::sleep(Duration::from_millis(30));
+
+            if *replace {
+                select_all_and_delete(&source)?;
+            }
+
+            post_key_chord(
+                &source,
+                ParsedKeyChord {
+                    keycode: 0x09,
+                    cmd: true,
+                    shift: false,
+                    alt: false,
+                    ctrl: false,
+                },
+            )?;
+
+            if *submit {
+                thread::sleep(Duration::from_millis(50));
+                post_key_chord(
+                    &source,
+                    ParsedKeyChord {
+                        keycode: 0x24,
+                        cmd: false,
+                        shift: false,
+                        alt: false,
+                        ctrl: false,
+                    },
+                )?;
+            }
             Ok(())
         }
         AgentAction::PressKey { key, modifiers } => {
             let chord = parse_key_chord(key, modifiers)?;
             post_key_chord(&source, chord)
         }
-        AgentAction::Scroll { x, y, delta_y } => {
+        AgentAction::Scroll {
+            x,
+            y,
+            delta_y,
+            delta_x,
+        } => {
             let (cx, cy) = clamp_point(*x, *y, metrics);
             let point = CGPoint::new(cx, cy);
             let move_ev = CGEvent::new_mouse_event(
@@ -836,13 +1161,14 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
             thread::sleep(Duration::from_millis(20));
 
-            let clamped_delta = (*delta_y).clamp(-20, 20);
+            let clamped_y = (*delta_y).clamp(-20, 20);
+            let clamped_x = (*delta_x).clamp(-20, 20);
             let scroll = CGEvent::new_scroll_wheel_event2(
                 Some(&source),
                 CGScrollEventUnit::Line,
-                1,
-                clamped_delta,
-                0,
+                2,
+                clamped_y,
+                clamped_x,
                 0,
             )
             .ok_or(AutomationError::EventCreationFailed)?;
@@ -852,6 +1178,35 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
         }
         _ => Ok(()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn select_all_and_delete(
+    source: &objc2_core_graphics::CGEventSource,
+) -> Result<(), AutomationError> {
+    post_key_chord(
+        source,
+        ParsedKeyChord {
+            keycode: 0x00,
+            cmd: true,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        },
+    )?;
+    thread::sleep(Duration::from_millis(40));
+    post_key_chord(
+        source,
+        ParsedKeyChord {
+            keycode: 0x33,
+            cmd: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        },
+    )?;
+    thread::sleep(Duration::from_millis(40));
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1012,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_urls_and_app_names_strictly() {
+    fn validates_urls_paths_and_app_names_strictly() {
         assert!(validate_open_url("https://example.com/docs").is_ok());
         assert!(validate_open_url("http://localhost:3000").is_ok());
         assert!(validate_open_url("file:///etc/passwd").is_err());
@@ -1024,40 +1379,45 @@ mod tests {
         assert!(validate_app_name("-rf").is_err());
         assert!(validate_app_name("Notes; rm -rf /").is_err());
         assert!(validate_app_name("../Secrets").is_err());
+
+        assert!(validate_open_path("/tmp").is_ok());
+        assert!(validate_open_path("-rf").is_err());
+        assert!(validate_open_path("/nonexistent_path_xyz_12345").is_err());
     }
 
     #[test]
-    fn assesses_risky_actions_accurately() {
-        let safe_click = AgentAction::Click {
-            x: 300.0,
-            y: 200.0,
-            button: MouseButtonKind::Left,
-            double: false,
+    fn describes_and_assesses_expanded_toolbelt_actions() {
+        let drag = AgentAction::Drag {
+            from_x: 100.0,
+            from_y: 200.0,
+            to_x: 300.0,
+            to_y: 400.0,
         };
-        assert!(assess_action_risk(
-            &safe_click,
-            "Opening the New Note button",
-            Some("New Note"),
-            false
-        )
-        .is_none());
+        assert_eq!(action_type_label(&drag), "drag");
+        assert_eq!(describe_action(&drag), "Drag (100, 200) -> (300, 400)");
 
-        assert!(
-            assess_action_risk(&safe_click, "Clicking Delete Note", Some("Delete"), false)
-                .is_some()
+        let open_in_safari = AgentAction::OpenUrl {
+            url: "https://github.com/trending".to_string(),
+            app_name: Some("Safari".to_string()),
+        };
+        assert_eq!(
+            describe_action(&open_in_safari),
+            "Open https://github.com/trending in Safari"
         );
-        assert!(assess_action_risk(&safe_click, "Clicking Submit", None, true).is_some());
 
-        let cmd_q = AgentAction::PressKey {
-            key: "q".to_string(),
-            modifiers: vec!["cmd".to_string()],
+        let paste_submit = AgentAction::PasteText {
+            text: "Confirm payment".to_string(),
+            replace: true,
+            submit: true,
         };
-        assert!(assess_action_risk(&cmd_q, "Closing window", None, false).is_some());
+        assert_eq!(action_type_label(&paste_submit), "paste_text");
+        assert!(assess_action_risk(&paste_submit, "Send message", None, false).is_some());
 
-        let cmd_c = AgentAction::PressKey {
-            key: "c".to_string(),
-            modifiers: vec!["cmd".to_string()],
+        let safe_paste = AgentAction::PasteText {
+            text: "- Item 1\n- Item 2".to_string(),
+            replace: false,
+            submit: false,
         };
-        assert!(assess_action_risk(&cmd_c, "Copying selected text", None, false).is_none());
+        assert!(assess_action_risk(&safe_paste, "Pasting sprint checklist", None, false).is_none());
     }
 }

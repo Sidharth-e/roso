@@ -33,6 +33,10 @@ function phaseBadgeProps(phase: TaskPhase | undefined): {
       return { tone: "info", label: "Planning" };
     case "running":
       return { tone: "info", label: "Acting" };
+    case "verifying":
+      return { tone: "info", label: "Verifying" };
+    case "recovering":
+      return { tone: "warning", label: "Recovering" };
     case "awaiting_confirmation":
       return { tone: "warning", label: "Approve?" };
     case "paused":
@@ -61,6 +65,19 @@ function outcomeTone(
     return "warning";
   }
   return "neutral";
+}
+
+function stepStatusClass(status: string): string {
+  if (status === "verified" || status === "done") {
+    return "text-success";
+  }
+  if (status === "failed" || status === "unverified_failed") {
+    return "text-error";
+  }
+  if (status === "recovery" || status === "retrying") {
+    return "text-warning";
+  }
+  return "text-tertiary";
 }
 
 function StepMeterBar({ value, max }: { value: number; max: number }) {
@@ -120,6 +137,8 @@ export function TrayControl() {
   const isActive =
     phase === "planning" ||
     phase === "running" ||
+    phase === "verifying" ||
+    phase === "recovering" ||
     phase === "paused" ||
     phase === "awaiting_confirmation";
   const badge = phaseBadgeProps(snapshot?.phase);
@@ -429,6 +448,17 @@ export function TrayControl() {
                     </ol>
                   </Card>
                 ) : null}
+
+                {snapshot?.lastDiagnosis ? (
+                  <Card className="space-y-1 border-warning/40 bg-warning/10">
+                    <p className="text-[11px] font-semibold text-warning">
+                      Recovery #{snapshot.recoveryCount}
+                    </p>
+                    <p className="text-[11px] text-foreground/85">
+                      {snapshot.lastDiagnosis}
+                    </p>
+                  </Card>
+                ) : null}
               </div>
             )}
 
@@ -443,16 +473,18 @@ export function TrayControl() {
                   </span>
                 </div>
                 <div className="max-h-40 space-y-1.5 overflow-y-auto pr-0.5">
-                  {[...(snapshot?.steps ?? [])].reverse().map((step) => (
+                  {[...(snapshot?.steps ?? [])].reverse().map((step, idx) => (
                     <div
-                      key={`${step.stepNumber}-${step.timestamp}`}
+                      key={`${step.stepNumber}-${step.actionType}-${idx}-${step.timestamp}`}
                       className="rounded-lg border border-tertiary/20 bg-background/70 px-2.5 py-1.5"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
                           #{step.stepNumber} · {step.actionType}
                         </span>
-                        <span className="text-[10px] font-medium text-tertiary">
+                        <span
+                          className={`text-[10px] font-medium ${stepStatusClass(step.status)}`}
+                        >
                           {step.status}
                         </span>
                       </div>
@@ -462,6 +494,11 @@ export function TrayControl() {
                       <p className="text-[10px] text-tertiary">
                         {step.narration}
                       </p>
+                      {step.verificationNote ? (
+                        <p className="mt-0.5 text-[10px] text-foreground/75">
+                          Check: {step.verificationNote}
+                        </p>
+                      ) : null}
                     </div>
                   ))}
                 </div>
