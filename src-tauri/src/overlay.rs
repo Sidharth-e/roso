@@ -32,6 +32,7 @@ pub struct PointerCuePayload {
     pub target_ocr_id: Option<u32>,
     pub step_number: u32,
     pub is_acting: bool,
+    pub show_pointer: bool,
     pub dismiss_after_ms: u64,
 }
 
@@ -77,6 +78,15 @@ mod macos_panel {
             #[unsafe(method(canBecomeKeyWindow))]
             fn can_become_key_window(&self) -> bool {
                 self.ivars().focusable.get()
+            }
+
+            #[unsafe(method(constrainFrameRect:toScreen:))]
+            fn constrain_frame_rect(
+                &self,
+                frame_rect: NSRect,
+                _screen: Option<&NSScreen>,
+            ) -> NSRect {
+                frame_rect
             }
 
             #[unsafe(method(sendEvent:))]
@@ -533,6 +543,7 @@ pub fn trigger_mock_pointer_cue(
         target_ocr_id: Some(1),
         step_number: 1,
         is_acting: true,
+        show_pointer: true,
         dismiss_after_ms: 4200,
     };
 

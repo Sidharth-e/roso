@@ -87,6 +87,7 @@ export const PointerCuePayloadSchema = z.object({
   targetOcrId: z.number().int().nullable(),
   stepNumber: z.number().int().nonnegative(),
   isActing: z.boolean(),
+  showPointer: z.boolean(),
   dismissAfterMs: z.number().int().positive(),
 });
 export type PointerCuePayload = z.infer<typeof PointerCuePayloadSchema>;

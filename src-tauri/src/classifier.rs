@@ -1,5 +1,6 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -53,6 +54,8 @@ pub struct PlannedActionDecision {
     #[serde(default)]
     pub text: Option<String>,
     #[serde(default)]
+    pub replace: bool,
+    #[serde(default)]
     pub key: Option<String>,
     #[serde(default)]
     pub modifiers: Vec<String>,
@@ -75,6 +78,7 @@ struct OllamaChatRequest {
     model: String,
     messages: Vec<OllamaChatMessage>,
     stream: bool,
+    think: bool,
     format: serde_json::Value,
     options: OllamaChatOptions,
 }
@@ -87,7 +91,10 @@ struct OllamaChatOptions {
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaChatMessage {
     role: String,
+    #[serde(default)]
     content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
 }
@@ -131,7 +138,7 @@ impl OllamaAgentClient {
 
         let system_prompt = "You are a macOS task orchestrator companion. \
 Break the user's goal into 2 to 6 concise, concrete UI action steps tailored to their current screen. \
-Respond strictly as JSON with a \"steps\" array of short imperative strings.";
+Respond strictly as a single valid JSON object with a \"steps\" array of short imperative strings (no markdown fences).";
 
         let user_prompt = format!(
             "Goal: {goal}\nActive app: {active_app}\nVisible targets:\n{ocr_block}"
@@ -148,27 +155,60 @@ Respond strictly as JSON with a \"steps\" array of short imperative strings.";
             "required": ["steps"]
         });
 
-        let req = OllamaChatRequest {
-            model: effective_model,
-            messages: vec![
-                OllamaChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                    images: None,
-                },
-                OllamaChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                    images: Some(vec![base64_jpeg]),
-                },
-            ],
-            stream: false,
-            format: schema,
-            options: OllamaChatOptions { temperature: 0.2 },
-        };
+        let mut last_err: Option<AgentError> = None;
+        for attempt in 0..3 {
+            let format = if attempt == 0 {
+                schema.clone()
+            } else {
+                serde_json::json!("json")
+            };
+            let temperature = if attempt == 0 { 0.2 } else { 0.25 };
+            let req = OllamaChatRequest {
+                model: effective_model.clone(),
+                messages: vec![
+                    OllamaChatMessage {
+                        role: "system".to_string(),
+                        content: system_prompt.to_string(),
+                        thinking: None,
+                        images: None,
+                    },
+                    OllamaChatMessage {
+                        role: "user".to_string(),
+                        content: user_prompt.clone(),
+                        thinking: None,
+                        images: Some(vec![base64_jpeg.clone()]),
+                    },
+                ],
+                stream: false,
+                think: false,
+                format,
+                options: OllamaChatOptions { temperature },
+            };
 
-        let raw = self.post_chat_with_retry(base_url, api_key, &req).await?;
-        parse_task_plan_response(&raw)
+            match self.post_chat_once(base_url, api_key, &req).await {
+                Ok(raw) => match parse_task_plan_response(&raw) {
+                    Ok(plan) => return Ok(plan),
+                    Err(err) => {
+                        last_err = Some(err);
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            continue;
+                        }
+                    }
+                },
+                Err(err) => {
+                    let retryable = is_retryable_error(&err);
+                    last_err = Some(err);
+                    if retryable && attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(350)).await;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| AgentError::Http("unknown plan error".to_string())))
     }
 
     pub async fn decide_next_action(
@@ -210,19 +250,20 @@ Each line in Visible targets lists [N] (Role) \"Label\" @(x=..., y=...) in norma
 Inspect the screenshot, Visible targets, plan, and recent steps, then choose the SINGLE best next action.\n\
 Available action_type values:\n\
 - \"click\", \"double_click\", \"right_click\": STRONGLY prefer target_ocr_id matching an exact [N] ID from Visible targets or the image overlay. Only use x_norm and y_norm (reading directly from the 0.1-0.9 grid) if no numbered box covers the exact element. Never invent a target_ocr_id that is not in Visible targets.\n\
-- \"type_text\": set text (types into currently focused input).\n\
-- \"press_key\": set key (e.g. \"enter\", \"tab\", \"escape\", \"space\", \"a\"-\"z\", \"up\", \"down\") and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
+- \"type_text\": set text (types into currently focused input), and set replace=true whenever replacing existing or garbled text in an address bar, search box, or input field (automatically runs Cmd+A + Backspace before typing).\n\
+- \"press_key\": set key (e.g. \"enter\", \"tab\", \"escape\", \"space\", \"backspace\", \"forward_delete\", \"a\"-\"z\", \"up\", \"down\") and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
 - \"scroll\": set scroll_delta_y (negative scrolls down, positive scrolls up) and optional target_ocr_id or x_norm/y_norm.\n\
 - \"open_app\": set app_name directly (prefer this over Spotlight when launching an app).\n\
-- \"open_url\": set url directly (https:// or http://, prefer this over clicking browser bars when opening a known site).\n\
+- \"open_url\": set url directly (https:// or http://, prefer this over clicking browser bars when navigating to a URL).\n\
 - \"wait\": set wait_ms (100..5000) if waiting for a page or app to load.\n\
 - \"done\": set summary once the goal is visibly completed on screen.\n\
 - \"fail\": set summary explaining why the task cannot proceed.\n\
 Rules:\n\
 1. narration must be ONE friendly, concise line (max 16 words) telling the user what you are doing right now.\n\
 2. Set requires_confirmation=true before deleting, sending messages/emails, submitting forms, purchasing, or making irreversible changes.\n\
-3. Do not repeat an identical failed or ineffective step; adapt if the UI did not change.\n\
-4. Respond strictly as JSON matching the schema.";
+3. Never click an already-focused address bar expecting it to clear text—use open_url directly, or press_key cmd+l, or type_text with replace=true.\n\
+4. Do not repeat an identical failed or ineffective step; adapt if the UI did not change.\n\
+5. Respond strictly as ONE raw JSON object with keys narration, plan_step_index, action_type, requires_confirmation, and relevant action fields (no markdown fences).";
 
         let user_prompt = format!(
             "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible targets:\n{}",
@@ -252,6 +293,7 @@ Rules:\n\
                 "x_norm": { "type": ["number", "null"] },
                 "y_norm": { "type": ["number", "null"] },
                 "text": { "type": ["string", "null"] },
+                "replace": { "type": "boolean" },
                 "key": { "type": ["string", "null"] },
                 "modifiers": { "type": "array", "items": { "type": "string" } },
                 "scroll_delta_y": { "type": ["integer", "null"] },
@@ -264,91 +306,106 @@ Rules:\n\
             "required": ["narration", "plan_step_index", "action_type", "requires_confirmation"]
         });
 
-        let req = OllamaChatRequest {
-            model: effective_model,
-            messages: vec![
-                OllamaChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                    images: None,
-                },
-                OllamaChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                    images: Some(vec![ctx.base64_jpeg]),
-                },
-            ],
-            stream: false,
-            format: schema,
-            options: OllamaChatOptions { temperature: 0.15 },
-        };
-
-        let raw = self.post_chat_with_retry(base_url, api_key, &req).await?;
-        parse_action_decision_response(&raw)
-    }
-
-    async fn post_chat_with_retry(
-        &self,
-        base_url: &str,
-        api_key: &str,
-        req: &OllamaChatRequest,
-    ) -> Result<String, AgentError> {
-        let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
         let mut last_err: Option<AgentError> = None;
+        for attempt in 0..3 {
+            let format = if attempt == 0 {
+                schema.clone()
+            } else {
+                serde_json::json!("json")
+            };
+            let temperature = if attempt == 0 { 0.15 } else { 0.25 };
+            let req = OllamaChatRequest {
+                model: effective_model.clone(),
+                messages: vec![
+                    OllamaChatMessage {
+                        role: "system".to_string(),
+                        content: system_prompt.to_string(),
+                        thinking: None,
+                        images: None,
+                    },
+                    OllamaChatMessage {
+                        role: "user".to_string(),
+                        content: user_prompt.clone(),
+                        thinking: None,
+                        images: Some(vec![ctx.base64_jpeg.clone()]),
+                    },
+                ],
+                stream: false,
+                think: false,
+                format,
+                options: OllamaChatOptions { temperature },
+            };
 
-        for attempt in 0..2 {
-            let headers = build_headers(api_key)?;
-            match self
-                .http
-                .post(&endpoint)
-                .headers(headers)
-                .timeout(AGENT_REQUEST_TIMEOUT)
-                .json(req)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp
-                        .text()
-                        .await
-                        .map_err(|e| AgentError::Http(e.to_string()))?;
-                    if status.is_success() {
-                        return Ok(text);
-                    }
-                    let err = AgentError::UpstreamStatus {
-                        status: status.as_u16(),
-                        body: truncate_error_body(&text),
-                    };
-                    if status.is_server_error() && attempt == 0 {
+            match self.post_chat_once(base_url, api_key, &req).await {
+                Ok(raw) => match parse_action_decision_response(&raw) {
+                    Ok(decision) => return Ok(decision),
+                    Err(err) => {
                         last_err = Some(err);
-                        tokio::time::sleep(Duration::from_millis(350)).await;
-                        continue;
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            continue;
+                        }
                     }
-                    return Err(err);
-                }
+                },
                 Err(err) => {
-                    let mapped = AgentError::Http(err.to_string());
-                    if attempt == 0 {
-                        last_err = Some(mapped);
+                    let retryable = is_retryable_error(&err);
+                    last_err = Some(err);
+                    if retryable && attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(350)).await;
                         continue;
                     }
-                    return Err(mapped);
+                    break;
                 }
             }
         }
 
         Err(last_err.unwrap_or_else(|| AgentError::Http("unknown agent error".to_string())))
     }
+
+    async fn post_chat_once(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        req: &OllamaChatRequest,
+    ) -> Result<String, AgentError> {
+        let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
+        let headers = build_headers(api_key)?;
+        let resp = self
+            .http
+            .post(&endpoint)
+            .headers(headers)
+            .timeout(AGENT_REQUEST_TIMEOUT)
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| AgentError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AgentError::Http(e.to_string()))?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        Err(AgentError::UpstreamStatus {
+            status: status.as_u16(),
+            body: truncate_error_body(&text),
+        })
+    }
+}
+
+fn is_retryable_error(err: &AgentError) -> bool {
+    match err {
+        AgentError::Http(_) | AgentError::MalformedPayload(_) => true,
+        AgentError::UpstreamStatus { status, .. } => *status >= 500 || *status == 429,
+    }
 }
 
 pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> {
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
         .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
-    let content = extract_json_object(chat.message.content.trim());
-    let parsed: TaskPlan = serde_json::from_str(content)
-        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let parsed: TaskPlan = parse_json_from_message(&chat)?;
 
     let steps: Vec<String> = parsed
         .steps
@@ -370,9 +427,7 @@ pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> 
 pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDecision, AgentError> {
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
         .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
-    let content = extract_json_object(chat.message.content.trim());
-    let mut decision: PlannedActionDecision = serde_json::from_str(content)
-        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let mut decision: PlannedActionDecision = parse_json_from_message(&chat)?;
 
     decision.action_type = decision.action_type.trim().to_ascii_lowercase();
     let valid_action = matches!(
@@ -412,14 +467,119 @@ pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDec
     Ok(decision)
 }
 
-fn extract_json_object(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start <= end {
-            return &trimmed[start..=end];
+fn parse_json_from_message<T: DeserializeOwned>(
+    chat: &OllamaChatResponse,
+) -> Result<T, AgentError> {
+    let cleaned_content = strip_think_tags(chat.message.content.trim());
+    if !cleaned_content.is_empty() {
+        if let Ok(val) = serde_json::from_str::<T>(&cleaned_content) {
+            return Ok(val);
+        }
+        for candidate in extract_balanced_json_candidates(&cleaned_content)
+            .into_iter()
+            .rev()
+        {
+            if let Ok(val) = serde_json::from_str::<T>(candidate) {
+                return Ok(val);
+            }
         }
     }
-    trimmed
+
+    if let Some(thinking) = chat.message.thinking.as_deref() {
+        let trimmed_thinking = thinking.trim();
+        if !trimmed_thinking.is_empty() {
+            for candidate in extract_balanced_json_candidates(trimmed_thinking)
+                .into_iter()
+                .rev()
+            {
+                if let Ok(val) = serde_json::from_str::<T>(candidate) {
+                    return Ok(val);
+                }
+            }
+        }
+    }
+
+    let preview_source = if !cleaned_content.is_empty() {
+        cleaned_content
+    } else {
+        chat.message
+            .thinking
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+
+    let detail = if preview_source.is_empty() {
+        "empty assistant content".to_string()
+    } else {
+        format!("unparseable assistant output: {}", sanitize_line(&preview_source, 120))
+    };
+
+    Err(AgentError::MalformedPayload(detail))
+}
+
+fn strip_think_tags(raw: &str) -> String {
+    let mut result = raw.to_string();
+    loop {
+        let Some(start) = result.find("<think>") else {
+            break;
+        };
+        let Some(rel_end) = result[start..].find("</think>") else {
+            break;
+        };
+        let end = start + rel_end + "</think>".len();
+        result.replace_range(start..end, "");
+    }
+    result.trim().to_string()
+}
+
+fn extract_balanced_json_candidates(text: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start_idx: Option<usize> = None;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                if depth > 0 {
+                    in_string = true;
+                }
+            }
+            '{' => {
+                if depth == 0 {
+                    start_idx = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start_idx.take() {
+                            candidates.push(&text[s..=idx]);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidates
 }
 
 fn sanitize_line(raw: &str, max_chars: usize) -> String {
@@ -467,7 +627,7 @@ mod tests {
     #[test]
     fn parses_task_plan_and_sanitizes_steps() {
         let raw = r#"{
-            "model": "qwen3-vl:235b",
+            "model": "deepseek-v4.1-flash",
             "message": {
                 "role": "assistant",
                 "content": "{\"steps\":[\"Open Notes app\",\"Create a new note\",\"Type shopping list\",\"\",\"Step 4\",\"Step 5\",\"Step 6\",\"Step 7\"]}"
@@ -482,7 +642,7 @@ mod tests {
     #[test]
     fn parses_valid_action_decision_and_clamps_coordinates() {
         let raw = r#"{
-            "model": "qwen3-vl:235b",
+            "model": "deepseek-v4.1-flash",
             "message": {
                 "role": "assistant",
                 "content": "{\"thought\":\"Click compose button\",\"narration\":\"Opening a fresh note for you!\",\"plan_step_index\":1,\"action_type\":\"CLICK\",\"target_ocr_id\":4,\"x_norm\":1.4,\"y_norm\":-0.2,\"requires_confirmation\":false}"
@@ -495,6 +655,40 @@ mod tests {
         assert_eq!(decision.x_norm, Some(1.0));
         assert_eq!(decision.y_norm, Some(0.0));
         assert_eq!(decision.narration, "Opening a fresh note for you!");
+        assert!(!decision.replace);
+
+        let replace_raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"narration\":\"Replacing URL\",\"plan_step_index\":1,\"action_type\":\"type_text\",\"text\":\"https://github.com/trending\",\"replace\":true,\"requires_confirmation\":false}"
+            }
+        }"#;
+        let replace_dec = parse_action_decision_response(replace_raw).expect("replace decision");
+        assert!(replace_dec.replace);
+        assert_eq!(replace_dec.text.as_deref(), Some("https://github.com/trending"));
+    }
+
+    #[test]
+    fn recovers_json_from_thinking_field_and_strips_think_tags() {
+        let from_thinking = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "Let me inspect {note} first. Then here is the JSON: {\"narration\":\"Clicking search bar\",\"plan_step_index\":0,\"action_type\":\"click\",\"target_ocr_id\":2,\"requires_confirmation\":false}"
+            }
+        }"#;
+        let recovered = parse_action_decision_response(from_thinking).expect("recover from thinking");
+        assert_eq!(recovered.action_type, "click");
+        assert_eq!(recovered.target_ocr_id, Some(2));
+
+        let with_think_block = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "<think>Considering {braces} inside thinking</think>\n```json\n{\"steps\":[\"Open Safari\",\"Navigate to trending\"]}\n```"
+            }
+        }"#;
+        let plan = parse_task_plan_response(with_think_block).expect("strip think block");
+        assert_eq!(plan.steps, vec!["Open Safari", "Navigate to trending"]);
     }
 
     #[test]
@@ -510,9 +704,9 @@ mod tests {
             Err(AgentError::MalformedPayload(_))
         ));
 
-        let bad_json = r#"{"message":{"role":"assistant","content":"not json"}}"#;
+        let empty_content = r#"{"message":{"role":"assistant","content":""}}"#;
         assert!(matches!(
-            parse_task_plan_response(bad_json),
+            parse_action_decision_response(empty_content),
             Err(AgentError::MalformedPayload(_))
         ));
     }

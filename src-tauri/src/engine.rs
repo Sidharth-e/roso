@@ -448,6 +448,9 @@ impl TaskEngine {
 
         let max_steps = cfg.max_steps;
         let mut recent_steps: Vec<String> = Vec::new();
+        let mut action_signatures: Vec<String> = Vec::new();
+        let mut last_pointer_pos: Option<(f64, f64)> = None;
+        let mut consecutive_agent_errors: u32 = 0;
 
         for step_num in 1..=max_steps {
             if *stop_rx.borrow() || !self.is_current_task(&task_id) {
@@ -541,15 +544,49 @@ impl TaskEngine {
                 .await;
 
             let decision = match decision_res {
-                Ok(d) => d,
+                Ok(d) => {
+                    consecutive_agent_errors = 0;
+                    d
+                }
                 Err(err) => {
+                    consecutive_agent_errors += 1;
+                    let msg = err.to_string();
+                    if consecutive_agent_errors < 3 {
+                        let retry_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: "agent_retry".to_string(),
+                            description: "Retrying model response".to_string(),
+                            narration: "Re-checking the screen...".to_string(),
+                            status: "retrying".to_string(),
+                            target_ocr_id: None,
+                            target_x: None,
+                            target_y: None,
+                        };
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            0,
+                            &active_win.app_name,
+                            retry_rec,
+                        );
+                        recent_steps.push(format!("Step {step_num} model error (retrying): {msg}"));
+                        if recent_steps.len() > 8 {
+                            recent_steps.remove(0);
+                        }
+                        if sleep_interruptible(Duration::from_millis(750), &mut stop_rx).await {
+                            return;
+                        }
+                        continue;
+                    }
                     self.finalize_task(
                         &app_handle,
                         &task_id,
                         TaskPhase::Failed,
                         "failed",
-                        err.to_string(),
-                        Some(err.to_string()),
+                        msg.clone(),
+                        Some(msg),
                     );
                     show_tray_popover(&app_handle, false);
                     return;
@@ -595,9 +632,99 @@ impl TaskEngine {
 
             let action_label = action_type_label(&action).to_string();
             let action_desc = describe_action(&action);
-            let (target_width, target_height) = match target_dims {
-                Some((w, h)) => (Some(w), Some(h)),
-                None => (None, None),
+            let is_terminal = matches!(action, AgentAction::Done { .. } | AgentAction::Fail { .. });
+            let action_sig = format!(
+                "{action_label}|{}|{action_desc}",
+                decision.target_ocr_id.unwrap_or(0)
+            );
+
+            if !is_terminal {
+                match detect_repetition_level(&action_signatures, &action_sig) {
+                    RepetitionLevel::Abort => {
+                        let msg =
+                            "Stopped: repeated the same action without making progress.".to_string();
+                        let cue = PointerCuePayload {
+                            id: Uuid::new_v4().to_string(),
+                            message: msg.clone(),
+                            action_badge: "Loop Stopped".to_string(),
+                            target_x: metrics.logical_width * 0.5,
+                            target_y: 56.0,
+                            target_width: None,
+                            target_height: None,
+                            target_ocr_id: None,
+                            step_number: step_num,
+                            is_acting: false,
+                            show_pointer: false,
+                            dismiss_after_ms: 4200,
+                        };
+                        let _ = emit_pointer_cue(&app_handle, cue);
+                        let step_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: action_label,
+                            description: action_desc,
+                            narration: msg.clone(),
+                            status: "failed".to_string(),
+                            target_ocr_id: decision.target_ocr_id,
+                            target_x: None,
+                            target_y: None,
+                        };
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            decision.plan_step_index,
+                            &active_win.app_name,
+                            step_rec,
+                        );
+                        self.finalize_task(
+                            &app_handle,
+                            &task_id,
+                            TaskPhase::Failed,
+                            "failed",
+                            msg.clone(),
+                            Some(msg),
+                        );
+                        show_tray_popover(&app_handle, false);
+                        return;
+                    }
+                    RepetitionLevel::Warn => {
+                        recent_steps.push(
+                            "LOOP WARNING: You repeated this action without changing the UI. Use open_url, type_text with replace=true, or press_key cmd+l / cmd+a + backspace instead."
+                                .to_string(),
+                        );
+                        if recent_steps.len() > 10 {
+                            recent_steps.remove(0);
+                        }
+                    }
+                    RepetitionLevel::None => {}
+                }
+            }
+            let has_explicit_target = decision.target_ocr_id.is_some()
+                || (decision.x_norm.is_some() && decision.y_norm.is_some());
+            let show_pointer = matches!(action, AgentAction::Click { .. })
+                || (matches!(action, AgentAction::Scroll { .. }) && has_explicit_target);
+
+            let (cue_x, cue_y) = if show_pointer {
+                last_pointer_pos = Some((overlay_x, overlay_y));
+                (overlay_x, overlay_y)
+            } else {
+                match last_pointer_pos {
+                    Some((lx, ly)) => (
+                        lx.clamp(180.0, (metrics.logical_width - 180.0).max(180.0)),
+                        ly.clamp(44.0, (metrics.logical_height - 120.0).max(44.0)),
+                    ),
+                    None => (metrics.logical_width * 0.5, 56.0),
+                }
+            };
+
+            let (target_width, target_height) = if show_pointer {
+                match target_dims {
+                    Some((w, h)) => (Some(w), Some(h)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
             };
 
             match &action {
@@ -606,13 +733,14 @@ impl TaskEngine {
                         id: Uuid::new_v4().to_string(),
                         message: summary.clone(),
                         action_badge: "Done".to_string(),
-                        target_x: overlay_x,
-                        target_y: overlay_y,
-                        target_width,
-                        target_height,
-                        target_ocr_id: decision.target_ocr_id,
+                        target_x: cue_x,
+                        target_y: cue_y,
+                        target_width: None,
+                        target_height: None,
+                        target_ocr_id: None,
                         step_number: step_num,
                         is_acting: false,
+                        show_pointer: false,
                         dismiss_after_ms: 4200,
                     };
                     let _ = emit_pointer_cue(&app_handle, cue);
@@ -625,8 +753,8 @@ impl TaskEngine {
                         narration: decision.narration.clone(),
                         status: "done".to_string(),
                         target_ocr_id: decision.target_ocr_id,
-                        target_x: Some(overlay_x),
-                        target_y: Some(overlay_y),
+                        target_x: Some(cue_x),
+                        target_y: Some(cue_y),
                     };
                     self.record_step(
                         &app_handle,
@@ -652,13 +780,14 @@ impl TaskEngine {
                         id: Uuid::new_v4().to_string(),
                         message: reason.clone(),
                         action_badge: "Blocked".to_string(),
-                        target_x: overlay_x,
-                        target_y: overlay_y,
-                        target_width,
-                        target_height,
-                        target_ocr_id: decision.target_ocr_id,
+                        target_x: cue_x,
+                        target_y: cue_y,
+                        target_width: None,
+                        target_height: None,
+                        target_ocr_id: None,
                         step_number: step_num,
                         is_acting: false,
+                        show_pointer: false,
                         dismiss_after_ms: 4200,
                     };
                     let _ = emit_pointer_cue(&app_handle, cue);
@@ -671,8 +800,8 @@ impl TaskEngine {
                         narration: decision.narration.clone(),
                         status: "failed".to_string(),
                         target_ocr_id: decision.target_ocr_id,
-                        target_x: Some(overlay_x),
-                        target_y: Some(overlay_y),
+                        target_x: Some(cue_x),
+                        target_y: Some(cue_y),
                     };
                     self.record_step(
                         &app_handle,
@@ -700,13 +829,14 @@ impl TaskEngine {
                 id: Uuid::new_v4().to_string(),
                 message: decision.narration.clone(),
                 action_badge: action_badge_text(&action).to_string(),
-                target_x: overlay_x,
-                target_y: overlay_y,
+                target_x: cue_x,
+                target_y: cue_y,
                 target_width,
                 target_height,
-                target_ocr_id: decision.target_ocr_id,
+                target_ocr_id: if show_pointer { decision.target_ocr_id } else { None },
                 step_number: step_num,
-                is_acting: true,
+                is_acting: show_pointer,
+                show_pointer,
                 dismiss_after_ms: 3600,
             };
             let _ = emit_pointer_cue(&app_handle, cue);
@@ -878,12 +1008,20 @@ impl TaskEngine {
                 step_rec,
             );
 
+            action_signatures.push(action_sig);
+
             let recent_entry = match err_text {
-                Some(e) => format!("Step {step_num} ({action_desc}) failed: {e}"),
-                None => format!("Step {step_num} ({action_desc}) -> {step_status}"),
+                Some(e) => format!(
+                    "Step {step_num} ({action_desc}) in \"{}\": failed ({e})",
+                    active_win.window_title
+                ),
+                None => format!(
+                    "Step {step_num} ({action_desc}) in \"{}\" -> {step_status}",
+                    active_win.window_title
+                ),
             };
             recent_steps.push(recent_entry);
-            if recent_steps.len() > 8 {
+            if recent_steps.len() > 10 {
                 recent_steps.remove(0);
             }
 
@@ -1163,7 +1301,15 @@ pub fn resolve_action_from_decision(
                 .ok_or_else(|| "type_text missing text".to_string())?;
             let ((ox, oy), _, dims, target_text) =
                 resolve_target_optional(decision, target_map, metrics);
-            Ok((AgentAction::TypeText { text }, (ox, oy), dims, target_text))
+            Ok((
+                AgentAction::TypeText {
+                    text,
+                    replace: decision.replace,
+                },
+                (ox, oy),
+                dims,
+                target_text,
+            ))
         }
         "press_key" => {
             let key = decision
@@ -1252,6 +1398,41 @@ pub fn resolve_action_from_decision(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepetitionLevel {
+    None,
+    Warn,
+    Abort,
+}
+
+pub fn detect_repetition_level(history: &[String], next_sig: &str) -> RepetitionLevel {
+    let trailing_same = history.iter().rev().take_while(|s| s.as_str() == next_sig).count();
+    if trailing_same >= 3 {
+        return RepetitionLevel::Abort;
+    }
+    if trailing_same >= 1 {
+        return RepetitionLevel::Warn;
+    }
+
+    let n = history.len();
+    if n >= 5 {
+        let a = &history[n - 5];
+        let b = &history[n - 4];
+        if a != b && history[n - 3] == *a && history[n - 2] == *b && history[n - 1] == *a && next_sig == b {
+            return RepetitionLevel::Abort;
+        }
+    }
+    if n >= 3 {
+        let a = &history[n - 3];
+        let b = &history[n - 2];
+        if a != b && history[n - 1] == *a && next_sig == b {
+            return RepetitionLevel::Warn;
+        }
+    }
+
+    RepetitionLevel::None
+}
+
 fn action_badge_text(action: &AgentAction) -> &'static str {
     match action {
         AgentAction::Click { double: true, .. } => "Double-Click",
@@ -1304,6 +1485,7 @@ mod tests {
             app_name: None,
             url: None,
             wait_ms: None,
+            replace: false,
             requires_confirmation: false,
             summary: None,
         }
@@ -1418,5 +1600,40 @@ mod tests {
                 modifiers: vec!["cmd".to_string()],
             }
         );
+
+        let mut d_type = base_decision("type_text");
+        d_type.text = Some("https://github.com/trending".to_string());
+        d_type.replace = true;
+        let (act_type, _, _, _) =
+            resolve_action_from_decision(&d_type, &target_map, metrics).unwrap();
+        assert_eq!(
+            act_type,
+            AgentAction::TypeText {
+                text: "https://github.com/trending".to_string(),
+                replace: true,
+            }
+        );
+    }
+
+    #[test]
+    fn detects_direct_repeats_and_two_step_cycles() {
+        let h1 = vec!["a".to_string()];
+        assert_eq!(detect_repetition_level(&h1, "b"), RepetitionLevel::None);
+        assert_eq!(detect_repetition_level(&h1, "a"), RepetitionLevel::Warn);
+
+        let h3 = vec!["a".to_string(), "a".to_string(), "a".to_string()];
+        assert_eq!(detect_repetition_level(&h3, "a"), RepetitionLevel::Abort);
+
+        let cycle2 = vec!["click|23".to_string(), "type|0".to_string(), "click|23".to_string()];
+        assert_eq!(detect_repetition_level(&cycle2, "type|0"), RepetitionLevel::Warn);
+
+        let cycle3 = vec![
+            "click|23".to_string(),
+            "type|0".to_string(),
+            "click|23".to_string(),
+            "type|0".to_string(),
+            "click|23".to_string(),
+        ];
+        assert_eq!(detect_repetition_level(&cycle3, "type|0"), RepetitionLevel::Abort);
     }
 }

@@ -58,27 +58,31 @@ export function PointerOverlay() {
 
   const flipBubbleLeft =
     activeCue !== null &&
+    activeCue.showPointer &&
     typeof window !== "undefined" &&
     activeCue.targetX > window.innerWidth - 340;
 
   const flipBubbleUp =
     activeCue !== null &&
+    activeCue.showPointer &&
     typeof window !== "undefined" &&
     activeCue.targetY > window.innerHeight - 160;
 
-  const bubbleOffsetClass = [
-    flipBubbleLeft ? "-translate-x-full -ml-10" : "",
-    flipBubbleUp ? "-translate-y-full -mt-2" : "mt-3",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const bubbleOffsetClass = activeCue?.showPointer
+    ? [
+        flipBubbleLeft ? "-translate-x-full -ml-10" : "",
+        flipBubbleUp ? "-translate-y-full -mt-2" : "mt-3",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : "-translate-x-1/2 mt-2";
 
   const boxWidth =
-    activeCue !== null && activeCue.targetWidth !== null
+    activeCue !== null && activeCue.showPointer && activeCue.targetWidth !== null
       ? Math.max(16, activeCue.targetWidth)
       : null;
   const boxHeight =
-    activeCue !== null && activeCue.targetHeight !== null
+    activeCue !== null && activeCue.showPointer && activeCue.targetHeight !== null
       ? Math.max(16, activeCue.targetHeight)
       : null;
 
@@ -112,7 +116,7 @@ export function PointerOverlay() {
             ) : null}
 
             <motion.div
-              initial={{ x: -120, y: -120, opacity: 0, scale: 0.78 }}
+              initial={{ x: activeCue.targetX, y: activeCue.targetY - 24, opacity: 0, scale: 0.88 }}
               animate={{
                 x: activeCue.targetX,
                 y: activeCue.targetY,
@@ -120,48 +124,50 @@ export function PointerOverlay() {
                 scale: 1,
               }}
               exit={{
-                x: activeCue.targetX + 64,
-                y: -140,
+                x: activeCue.targetX,
+                y: activeCue.targetY - 24,
                 opacity: 0,
-                scale: 0.82,
+                scale: 0.88,
               }}
               transition={{
                 type: "spring",
-                stiffness: 220,
-                damping: 22,
-                mass: 0.85,
+                stiffness: 240,
+                damping: 24,
+                mass: 0.8,
               }}
               className="fixed left-0 top-0 pointer-events-none"
             >
               <div className="relative flex items-start gap-2.5">
-                <motion.div
-                  animate={{ scale: [1, 1.08, 1], rotate: [0, -5, 0] }}
-                  transition={{
-                    duration: 1.4,
-                    repeat: activeCue.isActing ? Infinity : 1,
-                    ease: "easeInOut",
-                  }}
-                  className="relative"
-                >
-                  {activeCue.isActing ? (
-                    <span className="absolute -left-3 -top-3 h-6 w-6 rounded-full bg-primary/35 animate-ping" />
-                  ) : null}
-                  <span className="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-primary ring-2 ring-background" />
-                  <svg
-                    width="28"
-                    height="28"
-                    viewBox="0 0 28 28"
-                    aria-hidden="true"
-                    className="drop-shadow-lg"
+                {activeCue.showPointer ? (
+                  <motion.div
+                    animate={{ scale: [1, 1.08, 1], rotate: [0, -5, 0] }}
+                    transition={{
+                      duration: 1.4,
+                      repeat: activeCue.isActing ? Infinity : 1,
+                      ease: "easeInOut",
+                    }}
+                    className="relative"
                   >
-                    <path
-                      d="M0 0L24 10.5L12.5 14L9 25.5L0 0Z"
-                      className="fill-primary stroke-background"
-                      strokeWidth="2"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                </motion.div>
+                    {activeCue.isActing ? (
+                      <span className="absolute -left-3 -top-3 h-6 w-6 rounded-full bg-primary/35 animate-ping" />
+                    ) : null}
+                    <span className="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-primary ring-2 ring-background" />
+                    <svg
+                      width="28"
+                      height="28"
+                      viewBox="0 0 28 28"
+                      aria-hidden="true"
+                      className="drop-shadow-lg"
+                    >
+                      <path
+                        d="M0 0L24 10.5L12.5 14L9 25.5L0 0Z"
+                        className="fill-primary stroke-background"
+                        strokeWidth="2"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </motion.div>
+                ) : null}
 
                 <motion.div
                   initial={{ opacity: 0, y: 10, scale: 0.94 }}
@@ -171,7 +177,7 @@ export function PointerOverlay() {
                     type: "spring",
                     stiffness: 280,
                     damping: 24,
-                    delay: 0.1,
+                    delay: 0.08,
                   }}
                   className={`speech-bubble ${bubbleOffsetClass}`}
                 >
@@ -179,7 +185,7 @@ export function PointerOverlay() {
                     <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
                       {activeCue.actionBadge} · Step #{activeCue.stepNumber}
                     </span>
-                    {activeCue.targetOcrId !== null ? (
+                    {activeCue.showPointer && activeCue.targetOcrId !== null ? (
                       <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
                         #{activeCue.targetOcrId}
                       </span>

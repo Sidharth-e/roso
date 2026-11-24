@@ -35,6 +35,8 @@ pub enum AgentAction {
     },
     TypeText {
         text: String,
+        #[serde(default)]
+        replace: bool,
     },
     PressKey {
         key: String,
@@ -60,6 +62,15 @@ pub enum AgentAction {
     Fail {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedKeyChord {
+    pub keycode: u16,
+    pub cmd: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
 }
 
 pub fn action_type_label(action: &AgentAction) -> &'static str {
@@ -96,12 +107,13 @@ pub fn describe_action(action: &AgentAction) -> String {
             };
             format!("{kind} ({}, {})", x.round() as i64, y.round() as i64)
         }
-        AgentAction::TypeText { text } => {
+        AgentAction::TypeText { text, replace } => {
+            let verb = if *replace { "Replace with" } else { "Type" };
             let preview: String = text.chars().take(28).collect();
             if text.chars().count() > 28 {
-                format!("Type \"{preview}...\"")
+                format!("{verb} \"{preview}...\"")
             } else {
-                format!("Type \"{preview}\"")
+                format!("{verb} \"{preview}\"")
             }
         }
         AgentAction::PressKey { key, modifiers } => {
@@ -138,25 +150,25 @@ pub fn assess_action_risk(
 
     match action {
         AgentAction::PressKey { key, modifiers } => {
-            let lower_key = key.trim().to_ascii_lowercase();
-            let has_cmd = modifiers
-                .iter()
-                .any(|m| matches!(m.trim().to_ascii_lowercase().as_str(), "cmd" | "command" | "meta"));
-
-            if has_cmd && matches!(lower_key.as_str(), "q" | "backspace" | "delete" | "enter" | "return") {
-                return Some(format!("Shortcut Cmd+{lower_key} requires confirmation."));
-            }
-
-            if matches!(lower_key.as_str(), "enter" | "return") {
-                if let Some(word) = find_sensitive_keyword(narration, target_text) {
-                    return Some(format!("Submitting action involving \"{word}\" requires confirmation."));
+            if let Ok(chord) = parse_key_chord(key, modifiers) {
+                if chord.cmd && matches!(chord.keycode, 0x0C | 0x33 | 0x75 | 0x24 | 0x4C) {
+                    return Some(format!("Shortcut Cmd+{key} requires confirmation."));
+                }
+                if matches!(chord.keycode, 0x24 | 0x4C) {
+                    if let Some(word) = find_sensitive_keyword(narration, target_text) {
+                        return Some(format!(
+                            "Submitting action involving \"{word}\" requires confirmation."
+                        ));
+                    }
                 }
             }
             None
         }
         AgentAction::Click { .. } => {
             if let Some(word) = find_sensitive_keyword(narration, target_text) {
-                return Some(format!("Clicking element involving \"{word}\" requires confirmation."));
+                return Some(format!(
+                    "Clicking element involving \"{word}\" requires confirmation."
+                ));
             }
             None
         }
@@ -284,32 +296,62 @@ pub fn map_key_to_keycode(key: &str) -> Option<u16> {
         "4" => Some(0x15),
         "6" => Some(0x16),
         "5" => Some(0x17),
-        "=" | "equal" => Some(0x18),
+        "=" | "equal" | "equals" => Some(0x18),
         "9" => Some(0x19),
         "7" => Some(0x1A),
-        "-" | "minus" => Some(0x1B),
+        "-" | "minus" | "hyphen" => Some(0x1B),
         "8" => Some(0x1C),
         "0" => Some(0x1D),
-        "]" => Some(0x1E),
+        "]" | "rightbracket" | "bracketright" => Some(0x1E),
         "o" => Some(0x1F),
         "u" => Some(0x20),
-        "[" => Some(0x21),
+        "[" | "leftbracket" | "bracketleft" => Some(0x21),
         "i" => Some(0x22),
         "p" => Some(0x23),
         "enter" | "return" => Some(0x24),
         "l" => Some(0x25),
         "j" => Some(0x26),
+        "'" | "quote" | "apostrophe" => Some(0x27),
         "k" => Some(0x28),
         ";" | "semicolon" => Some(0x29),
+        "\\" | "backslash" => Some(0x2A),
         "," | "comma" => Some(0x2B),
         "/" | "slash" => Some(0x2C),
         "n" => Some(0x2D),
         "m" => Some(0x2E),
-        "." | "period" => Some(0x2F),
+        "." | "period" | "dot" => Some(0x2F),
         "tab" => Some(0x30),
-        "space" => Some(0x31),
-        "backspace" | "delete" => Some(0x33),
+        "space" | "spacebar" => Some(0x31),
+        "`" | "grave" | "backtick" => Some(0x32),
+        "backspace" | "back_space" | "delete" | "del_back" => Some(0x33),
         "escape" | "esc" => Some(0x35),
+        "command" | "cmd" => Some(0x37),
+        "shift" => Some(0x38),
+        "capslock" | "caps_lock" => Some(0x39),
+        "option" | "alt" => Some(0x3A),
+        "control" | "ctrl" => Some(0x3B),
+        "f17" => Some(0x40),
+        "kp_decimal" => Some(0x41),
+        "kp_multiply" | "multiply" => Some(0x43),
+        "kp_plus" | "add" => Some(0x45),
+        "clear" | "kp_clear" => Some(0x47),
+        "kp_divide" | "divide" => Some(0x4B),
+        "kp_enter" | "numpadenter" => Some(0x4C),
+        "kp_minus" | "subtract" => Some(0x4E),
+        "f18" => Some(0x4F),
+        "f19" => Some(0x50),
+        "kp_equals" => Some(0x51),
+        "kp0" | "numpad0" => Some(0x52),
+        "kp1" | "numpad1" => Some(0x53),
+        "kp2" | "numpad2" => Some(0x54),
+        "kp3" | "numpad3" => Some(0x55),
+        "kp4" | "numpad4" => Some(0x56),
+        "kp5" | "numpad5" => Some(0x57),
+        "kp6" | "numpad6" => Some(0x58),
+        "kp7" | "numpad7" => Some(0x59),
+        "f20" => Some(0x5A),
+        "kp8" | "numpad8" => Some(0x5B),
+        "kp9" | "numpad9" => Some(0x5C),
         "f5" => Some(0x60),
         "f6" => Some(0x61),
         "f7" => Some(0x62),
@@ -317,20 +359,174 @@ pub fn map_key_to_keycode(key: &str) -> Option<u16> {
         "f8" => Some(0x64),
         "f9" => Some(0x65),
         "f11" => Some(0x67),
+        "f13" => Some(0x69),
+        "f16" => Some(0x6A),
+        "f14" => Some(0x6B),
         "f10" => Some(0x6D),
         "f12" => Some(0x6F),
+        "f15" => Some(0x71),
         "home" => Some(0x73),
-        "pageup" => Some(0x74),
-        "end" => Some(0x77),
+        "pageup" | "page_up" | "pgup" => Some(0x74),
+        "forwarddelete" | "forward_delete" | "del" => Some(0x75),
         "f4" => Some(0x76),
+        "end" => Some(0x77),
         "f2" => Some(0x78),
-        "pagedown" => Some(0x79),
+        "pagedown" | "page_down" | "pgdn" => Some(0x79),
         "f1" => Some(0x7A),
-        "left" => Some(0x7B),
-        "right" => Some(0x7C),
-        "down" => Some(0x7D),
-        "up" => Some(0x7E),
+        "left" | "arrowleft" | "arrow_left" => Some(0x7B),
+        "right" | "arrowright" | "arrow_right" => Some(0x7C),
+        "down" | "arrowdown" | "arrow_down" => Some(0x7D),
+        "up" | "arrowup" | "arrow_up" => Some(0x7E),
         _ => None,
+    }
+}
+
+pub fn map_char_to_keycode_and_shift(ch: char) -> Option<(u16, bool)> {
+    match ch {
+        'a'..='z' => {
+            let key = ch.to_string();
+            map_key_to_keycode(&key).map(|kc| (kc, false))
+        }
+        'A'..='Z' => {
+            let key = ch.to_ascii_lowercase().to_string();
+            map_key_to_keycode(&key).map(|kc| (kc, true))
+        }
+        '0'..='9' => {
+            let key = ch.to_string();
+            map_key_to_keycode(&key).map(|kc| (kc, false))
+        }
+        ')' => Some((0x1D, true)),
+        '!' => Some((0x12, true)),
+        '@' => Some((0x13, true)),
+        '#' => Some((0x14, true)),
+        '$' => Some((0x15, true)),
+        '%' => Some((0x17, true)),
+        '^' => Some((0x16, true)),
+        '&' => Some((0x1A, true)),
+        '*' => Some((0x1C, true)),
+        '(' => Some((0x19, true)),
+        ' ' => Some((0x31, false)),
+        '\n' => Some((0x24, false)),
+        '\t' => Some((0x30, false)),
+        '-' => Some((0x1B, false)),
+        '_' => Some((0x1B, true)),
+        '=' => Some((0x18, false)),
+        '+' => Some((0x18, true)),
+        '[' => Some((0x21, false)),
+        '{' => Some((0x21, true)),
+        ']' => Some((0x1E, false)),
+        '}' => Some((0x1E, true)),
+        '\\' => Some((0x2A, false)),
+        '|' => Some((0x2A, true)),
+        ';' => Some((0x29, false)),
+        ':' => Some((0x29, true)),
+        '\'' => Some((0x27, false)),
+        '"' => Some((0x27, true)),
+        ',' => Some((0x2B, false)),
+        '<' => Some((0x2B, true)),
+        '.' => Some((0x2F, false)),
+        '>' => Some((0x2F, true)),
+        '/' => Some((0x2C, false)),
+        '?' => Some((0x2C, true)),
+        '`' => Some((0x32, false)),
+        '~' => Some((0x32, true)),
+        _ => None,
+    }
+}
+
+pub fn parse_key_chord(key: &str, modifiers: &[String]) -> Result<ParsedKeyChord, AutomationError> {
+    let mut cmd = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut ctrl = false;
+
+    for m in modifiers {
+        apply_modifier_token(m, &mut cmd, &mut shift, &mut alt, &mut ctrl)?;
+    }
+
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err(AutomationError::InvalidInput("empty key".to_string()));
+    }
+
+    let base_key: &str = if trimmed == "+" {
+        "+"
+    } else if let Some(prefix) = trimmed.strip_suffix("++") {
+        for part in prefix.split('+').filter(|p| !p.trim().is_empty()) {
+            apply_modifier_token(part, &mut cmd, &mut shift, &mut alt, &mut ctrl)?;
+        }
+        "+"
+    } else if trimmed.contains('+') {
+        let parts: Vec<&str> = trimmed.split('+').collect();
+        if let Some((last, mod_parts)) = parts.split_last() {
+            for part in mod_parts {
+                if !part.trim().is_empty() {
+                    apply_modifier_token(part, &mut cmd, &mut shift, &mut alt, &mut ctrl)?;
+                }
+            }
+            last.trim()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    if let Some(keycode) = map_key_to_keycode(base_key) {
+        return Ok(ParsedKeyChord {
+            keycode,
+            cmd,
+            shift,
+            alt,
+            ctrl,
+        });
+    }
+
+    let mut chars = base_key.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if let Some((keycode, needs_shift)) = map_char_to_keycode_and_shift(ch) {
+            return Ok(ParsedKeyChord {
+                keycode,
+                cmd,
+                shift: shift || needs_shift,
+                alt,
+                ctrl,
+            });
+        }
+    }
+
+    Err(AutomationError::InvalidInput(format!(
+        "unsupported key \"{key}\""
+    )))
+}
+
+fn apply_modifier_token(
+    token: &str,
+    cmd: &mut bool,
+    shift: &mut bool,
+    alt: &mut bool,
+    ctrl: &mut bool,
+) -> Result<(), AutomationError> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "cmd" | "command" | "meta" | "super" | "⌘" => {
+            *cmd = true;
+            Ok(())
+        }
+        "shift" | "⇧" => {
+            *shift = true;
+            Ok(())
+        }
+        "alt" | "option" | "opt" | "⌥" => {
+            *alt = true;
+            Ok(())
+        }
+        "ctrl" | "control" | "⌃" => {
+            *ctrl = true;
+            Ok(())
+        }
+        other => Err(AutomationError::InvalidInput(format!(
+            "unsupported modifier \"{other}\""
+        ))),
     }
 }
 
@@ -485,7 +681,8 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
         CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit,
     };
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        .or_else(|| CGEventSource::new(CGEventSourceStateID::HIDSystemState))
         .ok_or(AutomationError::EventCreationFailed)?;
 
     match action {
@@ -517,13 +714,15 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 cg_btn,
             )
             .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
-            thread::sleep(Duration::from_millis(35));
+            thread::sleep(Duration::from_millis(40));
 
             let clicks = if *double { 2 } else { 1 };
             for click_state in 1..=clicks {
                 let down = CGEvent::new_mouse_event(Some(&source), down_type, point, cg_btn)
                     .ok_or(AutomationError::EventCreationFailed)?;
+                CGEvent::set_flags(Some(&down), CGEventFlags::empty());
                 CGEvent::set_integer_value_field(
                     Some(&down),
                     CGEventField::MouseEventClickState,
@@ -531,6 +730,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 );
                 let up = CGEvent::new_mouse_event(Some(&source), up_type, point, cg_btn)
                     .ok_or(AutomationError::EventCreationFailed)?;
+                CGEvent::set_flags(Some(&up), CGEventFlags::empty());
                 CGEvent::set_integer_value_field(
                     Some(&up),
                     CGEventField::MouseEventClickState,
@@ -545,7 +745,32 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
             }
             Ok(())
         }
-        AgentAction::TypeText { text } => {
+        AgentAction::TypeText { text, replace } => {
+            if *replace {
+                post_key_chord(
+                    &source,
+                    ParsedKeyChord {
+                        keycode: 0x00,
+                        cmd: true,
+                        shift: false,
+                        alt: false,
+                        ctrl: false,
+                    },
+                )?;
+                thread::sleep(Duration::from_millis(40));
+                post_key_chord(
+                    &source,
+                    ParsedKeyChord {
+                        keycode: 0x33,
+                        cmd: false,
+                        shift: false,
+                        alt: false,
+                        ctrl: false,
+                    },
+                )?;
+                thread::sleep(Duration::from_millis(40));
+            }
+
             let filtered: String = text
                 .chars()
                 .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -553,55 +778,49 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 .collect();
 
             for ch in filtered.chars() {
-                match ch {
-                    '\n' => post_virtual_key(&source, 0x24, CGEventFlags::empty())?,
-                    '\t' => post_virtual_key(&source, 0x30, CGEventFlags::empty())?,
-                    other => {
-                        let mut utf16 = [0u16; 2];
-                        let slice = other.encode_utf16(&mut utf16);
-                        let down = CGEvent::new_keyboard_event(Some(&source), 0, true)
-                            .ok_or(AutomationError::EventCreationFailed)?;
-                        let up = CGEvent::new_keyboard_event(Some(&source), 0, false)
-                            .ok_or(AutomationError::EventCreationFailed)?;
-                        unsafe {
-                            CGEvent::keyboard_set_unicode_string(
-                                Some(&down),
-                                slice.len() as _,
-                                slice.as_ptr(),
-                            );
-                            CGEvent::keyboard_set_unicode_string(
-                                Some(&up),
-                                slice.len() as _,
-                                slice.as_ptr(),
-                            );
-                        }
-                        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-                        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
+                if let Some((keycode, needs_shift)) = map_char_to_keycode_and_shift(ch) {
+                    post_key_chord(
+                        &source,
+                        ParsedKeyChord {
+                            keycode,
+                            cmd: false,
+                            shift: needs_shift,
+                            alt: false,
+                            ctrl: false,
+                        },
+                    )?;
+                } else {
+                    let mut utf16 = [0u16; 2];
+                    let slice = ch.encode_utf16(&mut utf16);
+                    let down = CGEvent::new_keyboard_event(Some(&source), 0, true)
+                        .ok_or(AutomationError::EventCreationFailed)?;
+                    let up = CGEvent::new_keyboard_event(Some(&source), 0, false)
+                        .ok_or(AutomationError::EventCreationFailed)?;
+                    CGEvent::set_flags(Some(&down), CGEventFlags::empty());
+                    CGEvent::set_flags(Some(&up), CGEventFlags::empty());
+                    unsafe {
+                        CGEvent::keyboard_set_unicode_string(
+                            Some(&down),
+                            slice.len() as _,
+                            slice.as_ptr(),
+                        );
+                        CGEvent::keyboard_set_unicode_string(
+                            Some(&up),
+                            slice.len() as _,
+                            slice.as_ptr(),
+                        );
                     }
+                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
+                    thread::sleep(Duration::from_millis(12));
+                    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
                 }
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(())
         }
         AgentAction::PressKey { key, modifiers } => {
-            let keycode = map_key_to_keycode(key).ok_or_else(|| {
-                AutomationError::InvalidInput(format!("unsupported key \"{key}\""))
-            })?;
-            let mut flags = CGEventFlags::empty();
-            for m in modifiers {
-                match m.trim().to_ascii_lowercase().as_str() {
-                    "cmd" | "command" | "meta" => flags |= CGEventFlags::MaskCommand,
-                    "shift" => flags |= CGEventFlags::MaskShift,
-                    "alt" | "option" => flags |= CGEventFlags::MaskAlternate,
-                    "ctrl" | "control" => flags |= CGEventFlags::MaskControl,
-                    other => {
-                        return Err(AutomationError::InvalidInput(format!(
-                            "unsupported modifier \"{other}\""
-                        )));
-                    }
-                }
-            }
-            post_virtual_key(&source, keycode, flags)
+            let chord = parse_key_chord(key, modifiers)?;
+            post_key_chord(&source, chord)
         }
         AgentAction::Scroll { x, y, delta_y } => {
             let (cx, cy) = clamp_point(*x, *y, metrics);
@@ -613,6 +832,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 CGMouseButton::Left,
             )
             .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&move_ev), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&move_ev));
             thread::sleep(Duration::from_millis(20));
 
@@ -626,6 +846,7 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
                 0,
             )
             .ok_or(AutomationError::EventCreationFailed)?;
+            CGEvent::set_flags(Some(&scroll), CGEventFlags::empty());
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&scroll));
             Ok(())
         }
@@ -634,24 +855,55 @@ fn execute_hid_action(action: &AgentAction, metrics: ScreenMetrics) -> Result<()
 }
 
 #[cfg(target_os = "macos")]
-fn post_virtual_key(
+fn post_key_chord(
     source: &objc2_core_graphics::CGEventSource,
-    keycode: u16,
-    flags: objc2_core_graphics::CGEventFlags,
+    chord: ParsedKeyChord,
 ) -> Result<(), AutomationError> {
-    use objc2_core_graphics::{CGEvent, CGEventTapLocation};
+    use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
 
-    let down = CGEvent::new_keyboard_event(Some(source), keycode, true)
-        .ok_or(AutomationError::EventCreationFailed)?;
-    let up = CGEvent::new_keyboard_event(Some(source), keycode, false)
-        .ok_or(AutomationError::EventCreationFailed)?;
-    if !flags.is_empty() {
-        CGEvent::set_flags(Some(&down), flags);
-        CGEvent::set_flags(Some(&up), flags);
+    let mut mod_keys: Vec<(u16, CGEventFlags)> = Vec::with_capacity(4);
+    if chord.cmd {
+        mod_keys.push((0x37, CGEventFlags::MaskCommand));
     }
+    if chord.ctrl {
+        mod_keys.push((0x3B, CGEventFlags::MaskControl));
+    }
+    if chord.alt {
+        mod_keys.push((0x3A, CGEventFlags::MaskAlternate));
+    }
+    if chord.shift {
+        mod_keys.push((0x38, CGEventFlags::MaskShift));
+    }
+
+    let mut active_flags = CGEventFlags::empty();
+    for (mk, flag) in &mod_keys {
+        active_flags |= *flag;
+        let m_down = CGEvent::new_keyboard_event(Some(source), *mk, true)
+            .ok_or(AutomationError::EventCreationFailed)?;
+        CGEvent::set_flags(Some(&m_down), active_flags);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&m_down));
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let down = CGEvent::new_keyboard_event(Some(source), chord.keycode, true)
+        .ok_or(AutomationError::EventCreationFailed)?;
+    let up = CGEvent::new_keyboard_event(Some(source), chord.keycode, false)
+        .ok_or(AutomationError::EventCreationFailed)?;
+    CGEvent::set_flags(Some(&down), active_flags);
+    CGEvent::set_flags(Some(&up), active_flags);
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
-    thread::sleep(Duration::from_millis(15));
+    thread::sleep(Duration::from_millis(18));
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
+
+    for (mk, flag) in mod_keys.iter().rev() {
+        thread::sleep(Duration::from_millis(10));
+        active_flags.remove(*flag);
+        let m_up = CGEvent::new_keyboard_event(Some(source), *mk, false)
+            .ok_or(AutomationError::EventCreationFailed)?;
+        CGEvent::set_flags(Some(&m_up), active_flags);
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&m_up));
+    }
+
     Ok(())
 }
 
@@ -684,7 +936,71 @@ mod tests {
         assert_eq!(map_key_to_keycode("space"), Some(0x31));
         assert_eq!(map_key_to_keycode("esc"), Some(0x35));
         assert_eq!(map_key_to_keycode("left"), Some(0x7B));
+        assert_eq!(map_key_to_keycode("arrow_down"), Some(0x7D));
+        assert_eq!(map_key_to_keycode("forward_delete"), Some(0x75));
+        assert_eq!(map_key_to_keycode("clear"), Some(0x47));
+        assert_eq!(map_key_to_keycode("f15"), Some(0x71));
         assert_eq!(map_key_to_keycode("unknown_key"), None);
+    }
+
+    #[test]
+    fn maps_ascii_characters_to_virtual_keycodes_and_shift() {
+        assert_eq!(map_char_to_keycode_and_shift('h'), Some((0x04, false)));
+        assert_eq!(map_char_to_keycode_and_shift('H'), Some((0x04, true)));
+        assert_eq!(map_char_to_keycode_and_shift(':'), Some((0x29, true)));
+        assert_eq!(map_char_to_keycode_and_shift('/'), Some((0x2C, false)));
+        assert_eq!(map_char_to_keycode_and_shift('.'), Some((0x2F, false)));
+        assert_eq!(map_char_to_keycode_and_shift('-'), Some((0x1B, false)));
+        assert_eq!(map_char_to_keycode_and_shift('é'), None);
+        for ch in "https://github.com/trending".chars() {
+            assert!(map_char_to_keycode_and_shift(ch).is_some());
+        }
+    }
+
+    #[test]
+    fn parses_inline_and_modifier_key_chords() {
+        assert_eq!(
+            parse_key_chord("cmd+a", &[]).unwrap(),
+            ParsedKeyChord {
+                keycode: 0x00,
+                cmd: true,
+                shift: false,
+                alt: false,
+                ctrl: false,
+            }
+        );
+        assert_eq!(
+            parse_key_chord("Command+Shift+T", &[]).unwrap(),
+            ParsedKeyChord {
+                keycode: 0x11,
+                cmd: true,
+                shift: true,
+                alt: false,
+                ctrl: false,
+            }
+        );
+        assert_eq!(
+            parse_key_chord("+", &[]).unwrap(),
+            ParsedKeyChord {
+                keycode: 0x18,
+                cmd: false,
+                shift: true,
+                alt: false,
+                ctrl: false,
+            }
+        );
+        assert_eq!(
+            parse_key_chord("cmd++", &[]).unwrap(),
+            ParsedKeyChord {
+                keycode: 0x18,
+                cmd: true,
+                shift: true,
+                alt: false,
+                ctrl: false,
+            }
+        );
+        assert!(parse_key_chord("bad_key", &[]).is_err());
+        assert!(parse_key_chord("a", &["unknown_mod".to_string()]).is_err());
     }
 
     #[test]
@@ -718,9 +1034,18 @@ mod tests {
             button: MouseButtonKind::Left,
             double: false,
         };
-        assert!(assess_action_risk(&safe_click, "Opening the New Note button", Some("New Note"), false).is_none());
+        assert!(assess_action_risk(
+            &safe_click,
+            "Opening the New Note button",
+            Some("New Note"),
+            false
+        )
+        .is_none());
 
-        assert!(assess_action_risk(&safe_click, "Clicking Delete Note", Some("Delete"), false).is_some());
+        assert!(
+            assess_action_risk(&safe_click, "Clicking Delete Note", Some("Delete"), false)
+                .is_some()
+        );
         assert!(assess_action_risk(&safe_click, "Clicking Submit", None, true).is_some());
 
         let cmd_q = AgentAction::PressKey {
