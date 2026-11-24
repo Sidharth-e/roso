@@ -82,6 +82,8 @@ export const PointerCuePayloadSchema = z.object({
   actionBadge: z.string(),
   targetX: z.number(),
   targetY: z.number(),
+  targetWidth: z.number().nullable(),
+  targetHeight: z.number().nullable(),
   targetOcrId: z.number().int().nullable(),
   stepNumber: z.number().int().nonnegative(),
   isActing: z.boolean(),

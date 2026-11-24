@@ -27,6 +27,8 @@ pub struct PointerCuePayload {
     pub action_badge: String,
     pub target_x: f64,
     pub target_y: f64,
+    pub target_width: Option<f64>,
+    pub target_height: Option<f64>,
     pub target_ocr_id: Option<u32>,
     pub step_number: u32,
     pub is_acting: bool,
@@ -235,12 +237,26 @@ mod macos_panel {
         }
     }
 
-    pub fn sync_overlay_to_active_screen(window: &WebviewWindow) -> (f64, f64) {
+    pub fn primary_screen_frame(mtm: MainThreadMarker) -> NSRect {
+        let screens = NSScreen::screens(mtm);
+        if let Some(first) = screens.firstObject() {
+            return first.frame();
+        }
+        if let Some(main) = NSScreen::mainScreen(mtm) {
+            return main.frame();
+        }
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            objc2_foundation::NSSize::new(1440.0, 900.0),
+        )
+    }
+
+    pub fn sync_overlay_to_primary_screen(window: &WebviewWindow) -> (f64, f64) {
         promote_to_panel(window, false, 2, true);
         let Some(mtm) = MainThreadMarker::new() else {
             return (1440.0, 900.0);
         };
-        let (screen_frame, _) = active_screen_frame(mtm);
+        let screen_frame = primary_screen_frame(mtm);
         if let Ok(raw_ptr) = window.ns_window() {
             if !raw_ptr.is_null() {
                 unsafe {
@@ -384,7 +400,7 @@ pub fn configure_overlay_window(app_handle: &AppHandle) {
 
         #[cfg(target_os = "macos")]
         {
-            let _ = macos_panel::sync_overlay_to_active_screen(&overlay);
+            let _ = macos_panel::sync_overlay_to_primary_screen(&overlay);
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -512,6 +528,8 @@ pub fn trigger_mock_pointer_cue(
         action_badge: "Preview".to_string(),
         target_x: (screen_w * 0.56).clamp(120.0, screen_w - 160.0),
         target_y: (screen_h * 0.36).clamp(100.0, screen_h - 140.0),
+        target_width: Some(140.0),
+        target_height: Some(36.0),
         target_ocr_id: Some(1),
         step_number: 1,
         is_acting: true,

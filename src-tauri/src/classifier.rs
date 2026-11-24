@@ -124,7 +124,7 @@ impl OllamaAgentClient {
     ) -> Result<TaskPlan, AgentError> {
         let effective_model = normalize_model_for_endpoint(base_url, model);
         let ocr_block = if ocr_lines.is_empty() {
-            "(no visible OCR lines)".to_string()
+            "(no visible targets)".to_string()
         } else {
             ocr_lines.join("\n")
         };
@@ -134,7 +134,7 @@ Break the user's goal into 2 to 6 concise, concrete UI action steps tailored to 
 Respond strictly as JSON with a \"steps\" array of short imperative strings.";
 
         let user_prompt = format!(
-            "Goal: {goal}\nActive app: {active_app}\nVisible OCR lines:\n{ocr_block}"
+            "Goal: {goal}\nActive app: {active_app}\nVisible targets:\n{ocr_block}"
         );
 
         let schema = serde_json::json!({
@@ -198,15 +198,18 @@ Respond strictly as JSON with a \"steps\" array of short imperative strings.";
         };
 
         let ocr_block = if ctx.ocr_lines.is_empty() {
-            "(no visible OCR lines)".to_string()
+            "(no visible targets)".to_string()
         } else {
             ctx.ocr_lines.join("\n")
         };
 
         let system_prompt = "You are a precise, warm, playful macOS computer-use companion (like Bluey). \
-Look at the screenshot, OCR lines, plan, and recent steps, then choose the SINGLE best next action to advance the user's goal.\n\
+The screenshot has Set-of-Mark numbered boxes ([1], [2], ...) and a subtle 0.1-0.9 normalized coordinate grid overlaid on it. \
+Blue boxes are clickable macOS Accessibility UI elements (buttons, inputs, links, tabs); amber boxes are OCR text regions. \
+Each line in Visible targets lists [N] (Role) \"Label\" @(x=..., y=...) in normalized [0.0, 1.0] top-left coordinates. \
+Inspect the screenshot, Visible targets, plan, and recent steps, then choose the SINGLE best next action.\n\
 Available action_type values:\n\
-- \"click\", \"double_click\", \"right_click\": specify target_ocr_id matching [N] from OCR lines whenever text matches your target; otherwise provide normalized x_norm and y_norm in [0.0, 1.0] from top-left.\n\
+- \"click\", \"double_click\", \"right_click\": STRONGLY prefer target_ocr_id matching an exact [N] ID from Visible targets or the image overlay. Only use x_norm and y_norm (reading directly from the 0.1-0.9 grid) if no numbered box covers the exact element. Never invent a target_ocr_id that is not in Visible targets.\n\
 - \"type_text\": set text (types into currently focused input).\n\
 - \"press_key\": set key (e.g. \"enter\", \"tab\", \"escape\", \"space\", \"a\"-\"z\", \"up\", \"down\") and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
 - \"scroll\": set scroll_delta_y (negative scrolls down, positive scrolls up) and optional target_ocr_id or x_norm/y_norm.\n\
@@ -222,7 +225,7 @@ Rules:\n\
 4. Respond strictly as JSON matching the schema.";
 
         let user_prompt = format!(
-            "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible OCR lines:\n{}",
+            "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible targets:\n{}",
             ctx.goal,
             ctx.step_number,
             ctx.max_steps,

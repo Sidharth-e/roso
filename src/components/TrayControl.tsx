@@ -549,7 +549,7 @@ export function TrayControl() {
               <Input
                 id="vision-model-input"
                 label="Vision Agent Model (/api/chat)"
-                placeholder="qwen3-vl:235b-cloud or gemma3:12b"
+                placeholder="deepseek-v4.1-flash:cloud"
                 value={configDraft.visionModel}
                 onChange={(e) =>
                   setConfigDraft({

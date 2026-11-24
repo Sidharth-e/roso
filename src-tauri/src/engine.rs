@@ -3,7 +3,8 @@ use crate::automation::{
     has_accessibility_permission, is_kill_switch_pressed, AgentAction, MouseButtonKind,
 };
 use crate::capture::{
-    capture_primary_display_in_ram, has_screen_recording_permission, ScreenMetrics,
+    capture_primary_display_in_ram, has_screen_recording_permission, render_annotated_jpeg_base64,
+    ScreenMetrics,
 };
 use crate::classifier::{
     AgentError, NextActionContext, OllamaAgentClient, PlannedActionDecision,
@@ -11,7 +12,7 @@ use crate::classifier::{
 use crate::config::{
     append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord,
 };
-use crate::ocr::{extract_ocr_from_rgba, vision_bbox_to_screen_rect, OcrExtractionResult};
+use crate::ocr::{build_unified_targets, ScreenTargetMap};
 use crate::overlay::{
     emit_pointer_cue, hide_tray_popover, show_tray_popover, update_tray_status_title,
     PointerCuePayload,
@@ -374,19 +375,9 @@ impl TaskEngine {
         let cfg = self.config();
         let api_key = cfg.resolved_api_key();
 
-        let initial_capture = tokio::task::spawn_blocking(|| {
-            let frame = capture_primary_display_in_ram()?;
-            let ocr = extract_ocr_from_rgba(&frame.full_res_rgba).unwrap_or_default();
-            Ok::<_, crate::capture::CaptureError>((
-                frame.base64_jpeg,
-                frame.active_window,
-                frame.screen_metrics,
-                ocr,
-            ))
-        })
-        .await;
+        let initial_capture = tokio::task::spawn_blocking(capture_and_ground_screen).await;
 
-        let (init_jpeg, init_win, _, init_ocr) = match initial_capture {
+        let (init_jpeg, init_win, _, init_targets) = match initial_capture {
             Ok(Ok(tuple)) => tuple,
             Ok(Err(err)) => {
                 self.finalize_task(
@@ -424,7 +415,7 @@ impl TaskEngine {
                 &cfg.vision_model,
                 &goal,
                 &init_win.app_name,
-                &init_ocr.formatted_lines,
+                &init_targets.formatted_lines,
                 init_jpeg,
             )
             .await
@@ -481,19 +472,9 @@ impl TaskEngine {
             let cycle_cfg = self.config();
             let cycle_api_key = cycle_cfg.resolved_api_key();
 
-            let capture_res = tokio::task::spawn_blocking(|| {
-                let frame = capture_primary_display_in_ram()?;
-                let ocr = extract_ocr_from_rgba(&frame.full_res_rgba).unwrap_or_default();
-                Ok::<_, crate::capture::CaptureError>((
-                    frame.base64_jpeg,
-                    frame.active_window,
-                    frame.screen_metrics,
-                    ocr,
-                ))
-            })
-            .await;
+            let capture_res = tokio::task::spawn_blocking(capture_and_ground_screen).await;
 
-            let (base64_jpeg, active_win, metrics, ocr) = match capture_res {
+            let (annotated_jpeg, active_win, metrics, target_map) = match capture_res {
                 Ok(Ok(tuple)) => tuple,
                 Ok(Err(err)) => {
                     self.finalize_task(
@@ -552,9 +533,9 @@ impl TaskEngine {
                         window_title: active_win.window_title.clone(),
                         screen_width: metrics.logical_width.round() as u32,
                         screen_height: metrics.logical_height.round() as u32,
-                        ocr_lines: ocr.formatted_lines.clone(),
+                        ocr_lines: target_map.formatted_lines.clone(),
                         recent_steps: recent_steps.clone(),
-                        base64_jpeg,
+                        base64_jpeg: annotated_jpeg,
                     },
                 )
                 .await;
@@ -579,23 +560,32 @@ impl TaskEngine {
                 return;
             }
 
-            let (action, (overlay_x, overlay_y), target_text) =
-                match resolve_action_from_decision(&decision, &ocr, metrics) {
+            let (action, (overlay_x, overlay_y), target_dims, target_text) =
+                match resolve_action_from_decision(&decision, &target_map, metrics) {
                     Ok(v) => v,
                     Err(reason) => {
                         let step_rec = TaskStepRecord {
                             step_number: step_num,
                             timestamp: Utc::now(),
                             action_type: decision.action_type.clone(),
-                            description: format!("Invalid parameters: {reason}"),
+                            description: format!("Invalid target: {reason}"),
                             narration: decision.narration.clone(),
                             status: "skipped".to_string(),
                             target_ocr_id: decision.target_ocr_id,
                             target_x: None,
                             target_y: None,
                         };
-                        self.record_step(&app_handle, &task_id, step_num, decision.plan_step_index, &active_win.app_name, step_rec);
-                        recent_steps.push(format!("Step {step_num} skipped: {reason}"));
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            decision.plan_step_index,
+                            &active_win.app_name,
+                            step_rec,
+                        );
+                        recent_steps.push(format!(
+                            "Step {step_num} skipped: {reason}. Pick an exact [N] ID from Visible targets or valid x_norm/y_norm."
+                        ));
                         if recent_steps.len() > 8 {
                             recent_steps.remove(0);
                         }
@@ -605,6 +595,10 @@ impl TaskEngine {
 
             let action_label = action_type_label(&action).to_string();
             let action_desc = describe_action(&action);
+            let (target_width, target_height) = match target_dims {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (None, None),
+            };
 
             match &action {
                 AgentAction::Done { summary } => {
@@ -614,6 +608,8 @@ impl TaskEngine {
                         action_badge: "Done".to_string(),
                         target_x: overlay_x,
                         target_y: overlay_y,
+                        target_width,
+                        target_height,
                         target_ocr_id: decision.target_ocr_id,
                         step_number: step_num,
                         is_acting: false,
@@ -658,6 +654,8 @@ impl TaskEngine {
                         action_badge: "Blocked".to_string(),
                         target_x: overlay_x,
                         target_y: overlay_y,
+                        target_width,
+                        target_height,
                         target_ocr_id: decision.target_ocr_id,
                         step_number: step_num,
                         is_acting: false,
@@ -704,6 +702,8 @@ impl TaskEngine {
                 action_badge: action_badge_text(&action).to_string(),
                 target_x: overlay_x,
                 target_y: overlay_y,
+                target_width,
+                target_height,
                 target_ocr_id: decision.target_ocr_id,
                 step_number: step_num,
                 is_acting: true,
@@ -789,7 +789,8 @@ impl TaskEngine {
                             &active_win.app_name,
                             step_rec,
                         );
-                        recent_steps.push(format!("Step {step_num} ({action_desc}) was denied by user"));
+                        recent_steps
+                            .push(format!("Step {step_num} ({action_desc}) was denied by user"));
                         if recent_steps.len() > 8 {
                             recent_steps.remove(0);
                         }
@@ -812,12 +813,16 @@ impl TaskEngine {
             }
 
             let action_for_exec = action.clone();
-            let exec_res = tokio::task::spawn_blocking(move || execute_action(&action_for_exec, metrics)).await;
+            let exec_res =
+                tokio::task::spawn_blocking(move || execute_action(&action_for_exec, metrics)).await;
             let (step_status, err_text) = match exec_res {
                 Ok(Ok(())) => ("executed".to_string(), None),
                 Ok(Err(err)) => {
                     let msg = err.to_string();
-                    if matches!(err, crate::automation::AutomationError::AccessibilityPermissionDenied) {
+                    if matches!(
+                        err,
+                        crate::automation::AutomationError::AccessibilityPermissionDenied
+                    ) {
                         let step_rec = TaskStepRecord {
                             step_number: step_num,
                             timestamp: Utc::now(),
@@ -882,7 +887,9 @@ impl TaskEngine {
                 recent_steps.remove(0);
             }
 
-            if sleep_interruptible(Duration::from_millis(cycle_cfg.step_delay_ms), &mut stop_rx).await {
+            if sleep_interruptible(Duration::from_millis(cycle_cfg.step_delay_ms), &mut stop_rx)
+                .await
+            {
                 return;
             }
         }
@@ -961,6 +968,32 @@ impl TaskEngine {
     }
 }
 
+fn capture_and_ground_screen() -> Result<
+    (
+        String,
+        crate::capture::ActiveWindowMetadata,
+        ScreenMetrics,
+        ScreenTargetMap,
+    ),
+    crate::capture::CaptureError,
+> {
+    let frame = capture_primary_display_in_ram()?;
+    let target_map = build_unified_targets(
+        &frame.full_res_rgba,
+        frame.active_window.process_id,
+        frame.screen_metrics,
+    );
+    let annotated_jpeg =
+        render_annotated_jpeg_base64(&frame.full_res_rgba, &target_map.annotation_boxes)
+            .unwrap_or(frame.base64_jpeg);
+    Ok((
+        annotated_jpeg,
+        frame.active_window,
+        frame.screen_metrics,
+        target_map,
+    ))
+}
+
 fn take_history_record_locked(
     st: &mut TaskRuntimeState,
     outcome: &str,
@@ -993,87 +1026,144 @@ async fn sleep_interruptible(duration: Duration, stop_rx: &mut watch::Receiver<b
     }
 }
 
-fn find_ocr_text(formatted_lines: &[String], id: u32) -> Option<String> {
-    let prefix = format!("[{id}] ");
-    formatted_lines
-        .iter()
-        .find_map(|line| line.strip_prefix(&prefix).map(|rest| rest.trim().to_string()))
-}
+type ResolvedTarget = ((f64, f64), (f64, f64), Option<(f64, f64)>, Option<String>);
 
-fn resolve_target_point(
+fn resolve_target_strict(
     decision: &PlannedActionDecision,
-    ocr: &OcrExtractionResult,
+    target_map: &ScreenTargetMap,
     metrics: ScreenMetrics,
-) -> ((f64, f64), (f64, f64), Option<String>) {
-    if let Some(ocr_id) = decision.target_ocr_id {
-        if let Some(&bbox) = ocr.bbox_by_id.get(&ocr_id) {
-            let rect = vision_bbox_to_screen_rect(
-                bbox,
-                metrics.logical_width,
-                metrics.logical_height,
-            );
-            let target_text = find_ocr_text(&ocr.formatted_lines, ocr_id);
-            return (
-                (rect.center_x, rect.center_y),
-                (metrics.origin_x + rect.center_x, metrics.origin_y + rect.center_y),
-                target_text,
-            );
+) -> Result<ResolvedTarget, String> {
+    if let Some(id) = decision.target_ocr_id {
+        if let Some(target) = target_map.targets_by_id.get(&id) {
+            return Ok((
+                (target.center_x, target.center_y),
+                (
+                    metrics.origin_x + target.center_x,
+                    metrics.origin_y + target.center_y,
+                ),
+                Some((target.width, target.height)),
+                Some(target.label.clone()),
+            ));
         }
+        if let (Some(xn), Some(yn)) = (decision.x_norm, decision.y_norm) {
+            let ox = xn.clamp(0.0, 1.0) * metrics.logical_width;
+            let oy = yn.clamp(0.0, 1.0) * metrics.logical_height;
+            return Ok((
+                (ox, oy),
+                (metrics.origin_x + ox, metrics.origin_y + oy),
+                None,
+                None,
+            ));
+        }
+        return Err(format!("target_ocr_id #{id} not found in visible targets"));
     }
 
     if let (Some(xn), Some(yn)) = (decision.x_norm, decision.y_norm) {
         let ox = xn.clamp(0.0, 1.0) * metrics.logical_width;
         let oy = yn.clamp(0.0, 1.0) * metrics.logical_height;
-        return (
+        return Ok((
             (ox, oy),
             (metrics.origin_x + ox, metrics.origin_y + oy),
             None,
-        );
+            None,
+        ));
     }
 
+    Err("click action missing valid target_ocr_id or x_norm/y_norm".to_string())
+}
+
+fn resolve_target_optional(
+    decision: &PlannedActionDecision,
+    target_map: &ScreenTargetMap,
+    metrics: ScreenMetrics,
+) -> ResolvedTarget {
+    if let Ok(found) = resolve_target_strict(decision, target_map, metrics) {
+        return found;
+    }
     let cx = metrics.logical_width * 0.5;
-    let cy = metrics.logical_height * 0.4;
+    let cy = metrics.logical_height * 0.45;
     (
         (cx, cy),
         (metrics.origin_x + cx, metrics.origin_y + cy),
+        None,
         None,
     )
 }
 
 pub fn resolve_action_from_decision(
     decision: &PlannedActionDecision,
-    ocr: &OcrExtractionResult,
+    target_map: &ScreenTargetMap,
     metrics: ScreenMetrics,
-) -> Result<(AgentAction, (f64, f64), Option<String>), String> {
-    let ((overlay_x, overlay_y), (abs_x, abs_y), target_text) =
-        resolve_target_point(decision, ocr, metrics);
-
-    let action = match decision.action_type.as_str() {
-        "click" => AgentAction::Click {
-            x: abs_x,
-            y: abs_y,
-            button: MouseButtonKind::Left,
-            double: false,
-        },
-        "double_click" => AgentAction::Click {
-            x: abs_x,
-            y: abs_y,
-            button: MouseButtonKind::Left,
-            double: true,
-        },
-        "right_click" => AgentAction::Click {
-            x: abs_x,
-            y: abs_y,
-            button: MouseButtonKind::Right,
-            double: false,
-        },
+) -> Result<(AgentAction, (f64, f64), Option<(f64, f64)>, Option<String>), String> {
+    match decision.action_type.as_str() {
+        "click" => {
+            let ((ox, oy), (ax, ay), dims, text) =
+                resolve_target_strict(decision, target_map, metrics)?;
+            Ok((
+                AgentAction::Click {
+                    x: ax,
+                    y: ay,
+                    button: MouseButtonKind::Left,
+                    double: false,
+                },
+                (ox, oy),
+                dims,
+                text,
+            ))
+        }
+        "double_click" => {
+            let ((ox, oy), (ax, ay), dims, text) =
+                resolve_target_strict(decision, target_map, metrics)?;
+            Ok((
+                AgentAction::Click {
+                    x: ax,
+                    y: ay,
+                    button: MouseButtonKind::Left,
+                    double: true,
+                },
+                (ox, oy),
+                dims,
+                text,
+            ))
+        }
+        "right_click" => {
+            let ((ox, oy), (ax, ay), dims, text) =
+                resolve_target_strict(decision, target_map, metrics)?;
+            Ok((
+                AgentAction::Click {
+                    x: ax,
+                    y: ay,
+                    button: MouseButtonKind::Right,
+                    double: false,
+                },
+                (ox, oy),
+                dims,
+                text,
+            ))
+        }
+        "scroll" => {
+            let ((ox, oy), (ax, ay), dims, text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((
+                AgentAction::Scroll {
+                    x: ax,
+                    y: ay,
+                    delta_y: decision.scroll_delta_y.unwrap_or(-5),
+                },
+                (ox, oy),
+                dims,
+                text,
+            ))
+        }
         "type_text" => {
             let text = decision
                 .text
                 .clone()
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| "type_text missing text".to_string())?;
-            AgentAction::TypeText { text }
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((AgentAction::TypeText { text }, (ox, oy), dims, target_text))
         }
         "press_key" => {
             let key = decision
@@ -1082,16 +1172,18 @@ pub fn resolve_action_from_decision(
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
                 .ok_or_else(|| "press_key missing key".to_string())?;
-            AgentAction::PressKey {
-                key,
-                modifiers: decision.modifiers.clone(),
-            }
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((
+                AgentAction::PressKey {
+                    key,
+                    modifiers: decision.modifiers.clone(),
+                },
+                (ox, oy),
+                dims,
+                target_text,
+            ))
         }
-        "scroll" => AgentAction::Scroll {
-            x: abs_x,
-            y: abs_y,
-            delta_y: decision.scroll_delta_y.unwrap_or(-5),
-        },
         "open_app" => {
             let app_name = decision
                 .app_name
@@ -1099,7 +1191,9 @@ pub fn resolve_action_from_decision(
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty())
                 .ok_or_else(|| "open_app missing app_name".to_string())?;
-            AgentAction::OpenApp { app_name }
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((AgentAction::OpenApp { app_name }, (ox, oy), dims, target_text))
         }
         "open_url" => {
             let url = decision
@@ -1108,27 +1202,54 @@ pub fn resolve_action_from_decision(
                 .map(|u| u.trim().to_string())
                 .filter(|u| !u.is_empty())
                 .ok_or_else(|| "open_url missing url".to_string())?;
-            AgentAction::OpenUrl { url }
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((AgentAction::OpenUrl { url }, (ox, oy), dims, target_text))
         }
-        "wait" => AgentAction::Wait {
-            ms: decision.wait_ms.unwrap_or(1000).clamp(100, 5000),
-        },
-        "done" => AgentAction::Done {
-            summary: decision
-                .summary
-                .clone()
-                .unwrap_or_else(|| decision.narration.clone()),
-        },
-        "fail" => AgentAction::Fail {
-            reason: decision
-                .summary
-                .clone()
-                .unwrap_or_else(|| decision.narration.clone()),
-        },
-        other => return Err(format!("unsupported action_type \"{other}\"")),
-    };
-
-    Ok((action, (overlay_x, overlay_y), target_text))
+        "wait" => {
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((
+                AgentAction::Wait {
+                    ms: decision.wait_ms.unwrap_or(1000).clamp(100, 5000),
+                },
+                (ox, oy),
+                dims,
+                target_text,
+            ))
+        }
+        "done" => {
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((
+                AgentAction::Done {
+                    summary: decision
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| decision.narration.clone()),
+                },
+                (ox, oy),
+                dims,
+                target_text,
+            ))
+        }
+        "fail" => {
+            let ((ox, oy), _, dims, target_text) =
+                resolve_target_optional(decision, target_map, metrics);
+            Ok((
+                AgentAction::Fail {
+                    reason: decision
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| decision.narration.clone()),
+                },
+                (ox, oy),
+                dims,
+                target_text,
+            ))
+        }
+        other => Err(format!("unsupported action_type \"{other}\"")),
+    }
 }
 
 fn action_badge_text(action: &AgentAction) -> &'static str {
@@ -1153,8 +1274,7 @@ fn action_badge_text(action: &AgentAction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ocr::NormalizedBoundingBox;
-    use std::collections::HashMap;
+    use crate::ocr::{merge_targets, RawTarget};
 
     fn sample_metrics() -> ScreenMetrics {
         ScreenMetrics {
@@ -1190,29 +1310,31 @@ mod tests {
     }
 
     #[test]
-    fn resolves_click_from_ocr_id_and_falls_back_to_normalized_coords() {
-        let mut bbox_by_id = HashMap::new();
-        bbox_by_id.insert(
-            3,
-            NormalizedBoundingBox {
-                x: 0.20,
-                y: 0.50,
-                width: 0.10,
-                height: 0.10,
-            },
-        );
-        let ocr = OcrExtractionResult {
-            formatted_lines: vec!["[3] Compose".to_string()],
-            bbox_by_id,
-        };
+    fn resolves_click_from_target_id_with_dimensions_and_explicit_norm() {
         let metrics = sample_metrics();
+        let target_map = merge_targets(
+            vec![RawTarget {
+                role: "Button".to_string(),
+                label: "Compose".to_string(),
+                is_interactive: true,
+                x: 200.0,
+                y: 340.0,
+                width: 100.0,
+                height: 40.0,
+                center_x: 250.0,
+                center_y: 360.0,
+            }],
+            Vec::new(),
+            metrics,
+        );
 
         let mut d_ocr = base_decision("click");
-        d_ocr.target_ocr_id = Some(3);
-        let (action, (ox, oy), text) =
-            resolve_action_from_decision(&d_ocr, &ocr, metrics).expect("ocr resolve");
+        d_ocr.target_ocr_id = Some(1);
+        let (action, (ox, oy), dims, text) =
+            resolve_action_from_decision(&d_ocr, &target_map, metrics).expect("target resolve");
         assert!((ox - 250.0).abs() < 1e-6);
         assert!((oy - 360.0).abs() < 1e-6);
+        assert_eq!(dims, Some((100.0, 40.0)));
         assert_eq!(text.as_deref(), Some("Compose"));
         assert_eq!(
             action,
@@ -1227,10 +1349,11 @@ mod tests {
         let mut d_norm = base_decision("right_click");
         d_norm.x_norm = Some(0.4);
         d_norm.y_norm = Some(0.25);
-        let (action2, (ox2, oy2), text2) =
-            resolve_action_from_decision(&d_norm, &ocr, metrics).expect("norm resolve");
+        let (action2, (ox2, oy2), dims2, text2) =
+            resolve_action_from_decision(&d_norm, &target_map, metrics).expect("norm resolve");
         assert!((ox2 - 400.0).abs() < 1e-6);
         assert!((oy2 - 200.0).abs() < 1e-6);
+        assert!(dims2.is_none());
         assert!(text2.is_none());
         assert_eq!(
             action2,
@@ -1244,13 +1367,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_click_with_missing_or_invalid_target_instead_of_clicking_center() {
+        let metrics = sample_metrics();
+        let empty_map = ScreenTargetMap::default();
+
+        let d_missing = base_decision("click");
+        assert!(resolve_action_from_decision(&d_missing, &empty_map, metrics).is_err());
+
+        let mut d_bad_id = base_decision("click");
+        d_bad_id.target_ocr_id = Some(99);
+        assert!(resolve_action_from_decision(&d_bad_id, &empty_map, metrics).is_err());
+    }
+
+    #[test]
     fn resolves_open_app_open_url_and_press_key() {
-        let ocr = OcrExtractionResult::default();
+        let target_map = ScreenTargetMap::default();
         let metrics = sample_metrics();
 
         let mut d_app = base_decision("open_app");
         d_app.app_name = Some("Notes".to_string());
-        let (act_app, _, _) = resolve_action_from_decision(&d_app, &ocr, metrics).unwrap();
+        let (act_app, _, _, _) =
+            resolve_action_from_decision(&d_app, &target_map, metrics).unwrap();
         assert_eq!(
             act_app,
             AgentAction::OpenApp {
@@ -1260,7 +1397,8 @@ mod tests {
 
         let mut d_url = base_decision("open_url");
         d_url.url = Some("https://github.com".to_string());
-        let (act_url, _, _) = resolve_action_from_decision(&d_url, &ocr, metrics).unwrap();
+        let (act_url, _, _, _) =
+            resolve_action_from_decision(&d_url, &target_map, metrics).unwrap();
         assert_eq!(
             act_url,
             AgentAction::OpenUrl {
@@ -1271,7 +1409,8 @@ mod tests {
         let mut d_key = base_decision("press_key");
         d_key.key = Some("enter".to_string());
         d_key.modifiers = vec!["cmd".to_string()];
-        let (act_key, _, _) = resolve_action_from_decision(&d_key, &ocr, metrics).unwrap();
+        let (act_key, _, _, _) =
+            resolve_action_from_decision(&d_key, &target_map, metrics).unwrap();
         assert_eq!(
             act_key,
             AgentAction::PressKey {

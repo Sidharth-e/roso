@@ -73,90 +73,125 @@ export function PointerOverlay() {
     .filter(Boolean)
     .join(" ");
 
+  const boxWidth =
+    activeCue !== null && activeCue.targetWidth !== null
+      ? Math.max(16, activeCue.targetWidth)
+      : null;
+  const boxHeight =
+    activeCue !== null && activeCue.targetHeight !== null
+      ? Math.max(16, activeCue.targetHeight)
+      : null;
+
   return (
     <main aria-live="polite" className="overlay-canvas">
       <AnimatePresence mode="wait">
         {activeCue ? (
-          <motion.div
-            key={activeCue.id}
-            initial={{ x: -120, y: -120, opacity: 0, scale: 0.78 }}
-            animate={{
-              x: activeCue.targetX,
-              y: activeCue.targetY,
-              opacity: 1,
-              scale: 1,
-            }}
-            exit={{
-              x: activeCue.targetX + 64,
-              y: -140,
-              opacity: 0,
-              scale: 0.82,
-            }}
-            transition={{
-              type: "spring",
-              stiffness: 220,
-              damping: 22,
-              mass: 0.85,
-            }}
-            className="fixed left-0 top-0 pointer-events-none"
-          >
-            <div className="relative flex items-start gap-2.5">
+          <div key={activeCue.id} className="fixed inset-0 pointer-events-none">
+            {boxWidth !== null && boxHeight !== null ? (
               <motion.div
-                animate={{ scale: [1, 1.08, 1], rotate: [0, -6, 0] }}
-                transition={{
-                  duration: 1.4,
-                  repeat: activeCue.isActing ? Infinity : 1,
-                  ease: "easeInOut",
+                initial={{
+                  x: activeCue.targetX - boxWidth * 0.5,
+                  y: activeCue.targetY - boxHeight * 0.5,
+                  width: boxWidth,
+                  height: boxHeight,
+                  opacity: 0,
+                  scale: 0.92,
                 }}
-                className="relative"
-              >
-                {activeCue.isActing ? (
-                  <span className="absolute -left-2 -top-2 h-8 w-8 rounded-full bg-primary/30 animate-ping" />
-                ) : null}
-                <svg
-                  width="34"
-                  height="34"
-                  viewBox="0 0 36 36"
-                  aria-hidden="true"
-                  className="drop-shadow-lg"
-                >
-                  <path
-                    d="M5 4L30 15.5L18.2 19.4L14.3 31.2L5 4Z"
-                    className="fill-primary stroke-background"
-                    strokeWidth="2.4"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </motion.div>
+                animate={{
+                  x: activeCue.targetX - boxWidth * 0.5,
+                  y: activeCue.targetY - boxHeight * 0.5,
+                  width: boxWidth,
+                  height: boxHeight,
+                  opacity: 1,
+                  scale: 1,
+                }}
+                exit={{ opacity: 0, scale: 0.94 }}
+                transition={{ duration: 0.2 }}
+                className="fixed left-0 top-0 rounded-md border-2 border-primary bg-primary/10 shadow-sm pointer-events-none"
+              />
+            ) : null}
 
-              <motion.div
-                initial={{ opacity: 0, y: 10, scale: 0.94 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: -6, scale: 0.94 }}
-                transition={{
-                  type: "spring",
-                  stiffness: 280,
-                  damping: 24,
-                  delay: 0.1,
-                }}
-                className={`speech-bubble ${bubbleOffsetClass}`}
-              >
-                <div className="mb-1 flex items-center justify-between gap-2">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
-                    {activeCue.actionBadge} · Step #{activeCue.stepNumber}
-                  </span>
-                  {activeCue.targetOcrId !== null ? (
-                    <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                      OCR #{activeCue.targetOcrId}
-                    </span>
+            <motion.div
+              initial={{ x: -120, y: -120, opacity: 0, scale: 0.78 }}
+              animate={{
+                x: activeCue.targetX,
+                y: activeCue.targetY,
+                opacity: 1,
+                scale: 1,
+              }}
+              exit={{
+                x: activeCue.targetX + 64,
+                y: -140,
+                opacity: 0,
+                scale: 0.82,
+              }}
+              transition={{
+                type: "spring",
+                stiffness: 220,
+                damping: 22,
+                mass: 0.85,
+              }}
+              className="fixed left-0 top-0 pointer-events-none"
+            >
+              <div className="relative flex items-start gap-2.5">
+                <motion.div
+                  animate={{ scale: [1, 1.08, 1], rotate: [0, -5, 0] }}
+                  transition={{
+                    duration: 1.4,
+                    repeat: activeCue.isActing ? Infinity : 1,
+                    ease: "easeInOut",
+                  }}
+                  className="relative"
+                >
+                  {activeCue.isActing ? (
+                    <span className="absolute -left-3 -top-3 h-6 w-6 rounded-full bg-primary/35 animate-ping" />
                   ) : null}
-                </div>
-                <p className="text-xs font-medium text-foreground">
-                  {activeCue.message}
-                </p>
-              </motion.div>
-            </div>
-          </motion.div>
+                  <span className="absolute -left-1 -top-1 h-2 w-2 rounded-full bg-primary ring-2 ring-background" />
+                  <svg
+                    width="28"
+                    height="28"
+                    viewBox="0 0 28 28"
+                    aria-hidden="true"
+                    className="drop-shadow-lg"
+                  >
+                    <path
+                      d="M0 0L24 10.5L12.5 14L9 25.5L0 0Z"
+                      className="fill-primary stroke-background"
+                      strokeWidth="2"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </motion.div>
+
+                <motion.div
+                  initial={{ opacity: 0, y: 10, scale: 0.94 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -6, scale: 0.94 }}
+                  transition={{
+                    type: "spring",
+                    stiffness: 280,
+                    damping: 24,
+                    delay: 0.1,
+                  }}
+                  className={`speech-bubble ${bubbleOffsetClass}`}
+                >
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
+                      {activeCue.actionBadge} · Step #{activeCue.stepNumber}
+                    </span>
+                    {activeCue.targetOcrId !== null ? (
+                      <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                        #{activeCue.targetOcrId}
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="text-xs font-medium text-foreground">
+                    {activeCue.message}
+                  </p>
+                </motion.div>
+              </div>
+            </motion.div>
+          </div>
         ) : null}
       </AnimatePresence>
     </main>

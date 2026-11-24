@@ -32,7 +32,7 @@ impl Default for AppConfig {
         Self {
             ollama_base_url: "https://ollama.com".to_string(),
             ollama_api_key: String::new(),
-            vision_model: "qwen3-vl:235b-cloud".to_string(),
+            vision_model: "deepseek-v4.1-flash:cloud".to_string(),
             max_steps: 20,
             step_delay_ms: 900,
             confirm_risky_actions: true,
@@ -129,7 +129,13 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     }
     let raw = fs::read_to_string(&path)?;
     match serde_json::from_str::<AppConfig>(&raw) {
-        Ok(parsed) => parsed.sanitized(),
+        Ok(mut parsed) => {
+            if parsed.vision_model == "qwen3-vl:235b-cloud" {
+                parsed.vision_model = "deepseek-v4.1-flash:cloud".to_string();
+                return save_config(&parsed);
+            }
+            parsed.sanitized()
+        }
         Err(_) => {
             let default_cfg = AppConfig::default();
             save_config(&default_cfg)?;
