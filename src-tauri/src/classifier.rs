@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -18,13 +18,68 @@ pub enum AgentError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClassification {
+    pub category: String,
+    pub complexity: String,
+    pub recommended_role: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub reasoning: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub needs_dedicated_planner: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub initial_plan_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawTaskClassification {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    category: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    complexity: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    recommended_role: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    reasoning: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    needs_dedicated_planner: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    initial_plan_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassifyTaskContext {
+    pub goal: String,
+    pub active_app: String,
+    pub window_title: String,
+    pub ocr_lines: Vec<String>,
+    pub base64_jpeg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskPlan {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub thinking: String,
     pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatePlanContext {
+    pub goal: String,
+    pub category: String,
+    pub complexity: String,
+    pub judge_reasoning: String,
+    pub active_app: String,
+    pub window_title: String,
+    pub ocr_lines: Vec<String>,
+    pub base64_jpeg: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct NextActionContext {
     pub goal: String,
+    pub task_category: String,
+    pub actor_role: String,
     pub plan_steps: Vec<String>,
     pub step_number: u32,
     pub max_steps: u32,
@@ -180,6 +235,8 @@ pub struct PlannedActionDecision {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StepVerification {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub thinking: String,
     pub status: String,
     pub observation: String,
     #[serde(default)]
@@ -188,7 +245,6 @@ pub struct StepVerification {
     pub recovery_hint: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct VerifyStepContext {
     pub goal: String,
@@ -207,6 +263,8 @@ pub struct VerifyStepContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryPlan {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub thinking: String,
     pub diagnosis: String,
     pub recovery_steps: Vec<String>,
 }
@@ -274,35 +332,60 @@ impl OllamaAgentClient {
         Ok(Self { http })
     }
 
-    #[allow(dead_code)]
-    pub async fn create_task_plan(
+    pub async fn classify_task(
         &self,
         base_url: &str,
         api_key: &str,
         model: &str,
-        goal: &str,
-        active_app: &str,
-        ocr_lines: &[String],
-        base64_jpeg: String,
-    ) -> Result<TaskPlan, AgentError> {
-        let ocr_block = format_lines_block(ocr_lines, "(no visible targets)");
-        let system_prompt = "You are a macOS task orchestrator companion. \
-Break the user's goal into 2 to 6 concise, concrete UI action steps tailored to their current screen. \
-Respond strictly as a single valid JSON object with a \"steps\" array of short imperative strings (no markdown fences).";
+        ctx: ClassifyTaskContext,
+    ) -> Result<TaskClassification, AgentError> {
+        let ocr_block = format_lines_block(&ctx.ocr_lines, "(no visible targets)");
+        let system_prompt = "You are a Judge & Task Classification model for a macOS computer-use orchestrator. \
+Inspect the user goal, active application, and current screenshot to classify the task and route it to the best specialist AI model.\n\
+Output strictly ONE raw JSON object with keys:\n\
+- \"category\": one of \"general_ui\", \"browser_research\", \"coding\", \"writing\", \"system_admin\"\n\
+- \"complexity\": one of \"simple\", \"moderate\", \"complex\"\n\
+- \"recommended_role\": one of \"vision_actor\" (clicking/navigation/browsing/UI tasks), \"coding_actor\" (IDE/terminal/code/git tasks), \"writing_actor\" (notes/emails/documents/writing tasks)\n\
+- \"reasoning\": 1-2 concise sentences explaining your classification and model choice\n\
+- \"needs_dedicated_planner\": boolean (true for moderate/complex multi-step workflows, false for quick 1-2 step actions)\n\
+- \"initial_plan_steps\": array of 2-5 short imperative step strings\n\
+Do not include markdown fences.";
 
         let user_prompt = format!(
-            "Goal: {goal}\nActive app: {active_app}\nVisible targets:\n{ocr_block}"
+            "Goal: {}\nActive app: {}\nWindow title: \"{}\"\nVisible targets:\n{}",
+            ctx.goal, ctx.active_app, ctx.window_title, ocr_block
         );
 
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "steps": {
+                "category": {
+                    "type": "string",
+                    "enum": ["general_ui", "browser_research", "coding", "writing", "system_admin"]
+                },
+                "complexity": {
+                    "type": "string",
+                    "enum": ["simple", "moderate", "complex"]
+                },
+                "recommended_role": {
+                    "type": "string",
+                    "enum": ["vision_actor", "coding_actor", "writing_actor"]
+                },
+                "reasoning": { "type": "string" },
+                "needs_dedicated_planner": { "type": "boolean" },
+                "initial_plan_steps": {
                     "type": "array",
                     "items": { "type": "string" }
                 }
             },
-            "required": ["steps"]
+            "required": [
+                "category",
+                "complexity",
+                "recommended_role",
+                "reasoning",
+                "needs_dedicated_planner",
+                "initial_plan_steps"
+            ]
         });
 
         self.request_structured_json(
@@ -311,10 +394,63 @@ Respond strictly as a single valid JSON object with a \"steps\" array of short i
             model,
             system_prompt,
             user_prompt,
-            Some(vec![base64_jpeg]),
+            Some(vec![ctx.base64_jpeg]),
+            schema,
+            0.1,
+            640,
+            parse_task_classification_response,
+        )
+        .await
+    }
+
+    pub async fn create_task_plan(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        ctx: CreatePlanContext,
+    ) -> Result<TaskPlan, AgentError> {
+        let ocr_block = format_lines_block(&ctx.ocr_lines, "(no visible targets)");
+        let system_prompt = "You are a macOS task planner model. \
+Think through the current screen and break the user's goal into 2 to 6 concise, concrete UI action steps tailored to their screen. \
+Respond strictly as a single valid JSON object with:\n\
+- \"thinking\": 1-2 concise sentences of planning rationale\n\
+- \"steps\": array of short imperative strings\n\
+No markdown fences.";
+
+        let user_prompt = format!(
+            "Goal: {}\nTask category: {} (complexity: {})\nJudge note: {}\nActive app: {}\nWindow title: \"{}\"\nVisible targets:\n{}",
+            ctx.goal,
+            ctx.category,
+            ctx.complexity,
+            ctx.judge_reasoning,
+            ctx.active_app,
+            ctx.window_title,
+            ocr_block
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thinking": { "type": "string" },
+                "steps": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["thinking", "steps"]
+        });
+
+        self.request_structured_json(
+            base_url,
+            api_key,
+            model,
+            system_prompt,
+            user_prompt,
+            Some(vec![ctx.base64_jpeg]),
             schema,
             0.2,
-            512,
+            640,
             parse_task_plan_response,
         )
         .await
@@ -357,17 +493,20 @@ Available action_type values:\n\
 - \"wait\": set wait_ms (100..5000).\n\
 - \"done\" / \"fail\": set summary.\n\
 Rules:\n\
-1. Always include required keys: narration, plan_step_index, action_type, requires_confirmation, plus only the fields needed for that action_type (omit unused fields).\n\
-2. When Plan is (no plan), include plan_steps (2-5 short imperative steps).\n\
-3. Optionally include follow_up_actions (0-3 steps) ONLY for deterministic sequences that do not need a fresh screenshot (e.g. click input -> paste_text with submit=true; open_app -> press_key cmd+n -> paste_text; open_url -> scroll). Never put done or fail in follow_up_actions.\n\
-4. Use ONE open_url with app_name to open a site; never re-type the same URL afterward.\n\
-5. narration: max 14 friendly words. Set requires_confirmation=true before deleting, sending, submitting forms, or purchasing.\n\
-6. Respond strictly as ONE raw JSON object (no markdown fences).\n\
-Example: {\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_type\":\"open_app\",\"app_name\":\"Calculator\",\"requires_confirmation\":false,\"plan_steps\":[\"Open Calculator\",\"Type 42*18\",\"Check result\"],\"follow_up_actions\":[{\"narration\":\"Compute 42*18\",\"action_type\":\"type_text\",\"text\":\"42*18\",\"submit\":true,\"requires_confirmation\":false}]}";
+1. Always include required keys: thought, narration, plan_step_index, action_type, requires_confirmation, plus only the fields needed for that action_type (omit unused fields).\n\
+2. thought: 1-2 concise sentences explaining what you observe on screen and why this action is best.\n\
+3. When Plan is (no plan), include plan_steps (2-5 short imperative steps).\n\
+4. Optionally include follow_up_actions (0-3 steps) ONLY for deterministic sequences that do not need a fresh screenshot (e.g. click input -> paste_text with submit=true; open_app -> press_key cmd+n -> paste_text; open_url -> scroll). Never put done or fail in follow_up_actions.\n\
+5. Use ONE open_url with app_name to open a site; never re-type the same URL afterward.\n\
+6. narration: max 14 friendly words. Set requires_confirmation=true before deleting, sending, submitting forms, or purchasing.\n\
+7. Respond strictly as ONE raw JSON object (no markdown fences).\n\
+Example: {\"thought\":\"Calculator is not focused yet, so opening it and entering the expression completes the goal.\",\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_type\":\"open_app\",\"app_name\":\"Calculator\",\"requires_confirmation\":false,\"plan_steps\":[\"Open Calculator\",\"Type 42*18\",\"Check result\"],\"follow_up_actions\":[{\"narration\":\"Compute 42*18\",\"action_type\":\"type_text\",\"text\":\"42*18\",\"submit\":true,\"requires_confirmation\":false}]}";
 
         let user_prompt = format!(
-            "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible targets:\n{}",
+            "Goal: {}\nTask category: {} | Assigned role: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible targets:\n{}",
             ctx.goal,
+            ctx.task_category,
+            ctx.actor_role,
             ctx.step_number,
             ctx.max_steps,
             ctx.active_app,
@@ -422,6 +561,7 @@ Example: {\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_ty
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
+                "thought": { "type": "string" },
                 "narration": { "type": "string" },
                 "plan_step_index": { "type": "integer" },
                 "action_type": {
@@ -474,7 +614,7 @@ Example: {\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_ty
                     "items": follow_up_item_schema
                 }
             },
-            "required": ["narration", "plan_step_index", "action_type", "requires_confirmation"]
+            "required": ["thought", "narration", "plan_step_index", "action_type", "requires_confirmation"]
         });
 
         self.request_structured_json(
@@ -492,7 +632,6 @@ Example: {\"narration\":\"Opening Calculator\",\"plan_step_index\":0,\"action_ty
         .await
     }
 
-    #[allow(dead_code)]
     pub async fn verify_step_outcome(
         &self,
         base_url: &str,
@@ -511,7 +650,7 @@ Return status:\n\
 - \"failed\": nothing useful happened or the wrong thing happened (e.g. 404 page, garbled URL, modal error, focus missed).\n\
 - \"needs_recovery\": stuck in a bad state requiring a different approach.\n\
 Set goal_achieved=true ONLY if the user's overall goal is already completely satisfied on this screen.\n\
-Respond strictly as ONE raw JSON object with keys status, observation, goal_achieved, and recovery_hint.";
+Respond strictly as ONE raw JSON object with keys thinking, status, observation, goal_achieved, and recovery_hint.";
 
         let user_prompt = format!(
             "Goal: {}\nStep #{} Action: {}\nExpected effect: {}\nApp: {} -> {}\nWindow title: \"{}\" -> \"{}\"\nVisual screen change: {:.1}%\nTool output: {}\nVisible targets AFTER action:\n{}",
@@ -531,6 +670,7 @@ Respond strictly as ONE raw JSON object with keys status, observation, goal_achi
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
+                "thinking": { "type": "string" },
                 "status": {
                     "type": "string",
                     "enum": ["succeeded", "partial", "failed", "needs_recovery"]
@@ -571,7 +711,7 @@ Respond strictly as ONE raw JSON object with keys status, observation, goal_achi
         let system_prompt = "You are a self-healing macOS task recovery planner. \
 A previous step failed or stalled. Diagnose why it failed from the current screenshot and propose 2 to 5 concrete alternative recovery_steps using better tools \
 (for example: use open_url with app_name instead of typing in an address bar, use paste_text with replace=true to fix garbled text, use press_key cmd+l, or use focus_app).\n\
-Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps.";
+Respond strictly as ONE raw JSON object with keys thinking, diagnosis, and recovery_steps.";
 
         let user_prompt = format!(
             "Goal: {}\nFailed action: {}\nVerification observation: {}\nRecovery hint: {}\nActive app: {}\nWindow title: \"{}\"\nRecent steps:\n{}\nVisible targets:\n{}",
@@ -588,6 +728,7 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
+                "thinking": { "type": "string" },
                 "diagnosis": { "type": "string" },
                 "recovery_steps": {
                     "type": "array",
@@ -629,7 +770,9 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
     where
         F: Fn(&str) -> Result<T, AgentError>,
     {
-        let effective_model = normalize_model_for_endpoint(base_url, model);
+        let primary_model = normalize_model_for_endpoint(base_url, model);
+        let alt_model = alternate_cloud_model_name(base_url, &primary_model);
+        let mut active_model = primary_model.clone();
         let mut last_err: Option<AgentError> = None;
 
         for attempt in 0..3 {
@@ -644,7 +787,7 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
                 (base_temp + 0.1).min(0.35)
             };
             let req = OllamaChatRequest {
-                model: effective_model.clone(),
+                model: active_model.clone(),
                 messages: vec![
                     OllamaChatMessage {
                         role: "system".to_string(),
@@ -681,7 +824,20 @@ Respond strictly as ONE raw JSON object with keys diagnosis and recovery_steps."
                     }
                 },
                 Err(err) => {
-                    let retryable = is_retryable_error(&err);
+                    let is_format_or_model_mismatch = attempt == 0
+                        && matches!(
+                            err,
+                            AgentError::UpstreamStatus {
+                                status: 400 | 404,
+                                ..
+                            }
+                        );
+                    if is_format_or_model_mismatch {
+                        if let Some(ref alt) = alt_model {
+                            active_model = alt.clone();
+                        }
+                    }
+                    let retryable = is_retryable_error(&err) || is_format_or_model_mismatch;
                     last_err = Some(err);
                     if retryable && attempt < 2 {
                         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -743,10 +899,90 @@ fn is_retryable_error(err: &AgentError) -> bool {
     }
 }
 
+fn extract_thinking_fallback(chat: &OllamaChatResponse, max_chars: usize) -> String {
+    chat.message
+        .thinking
+        .as_deref()
+        .map(|s| sanitize_line(s, max_chars))
+        .unwrap_or_default()
+}
+
+fn normalize_task_category(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "browser_research" | "browser" | "research" | "web" => "browser_research".to_string(),
+        "coding" | "code" | "dev" | "developer" | "terminal" => "coding".to_string(),
+        "writing" | "notes" | "document" | "email" | "text" => "writing".to_string(),
+        "system_admin" | "system" | "settings" | "files" => "system_admin".to_string(),
+        _ => "general_ui".to_string(),
+    }
+}
+
+fn normalize_complexity(raw: &str, step_count: usize) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "simple" => "simple".to_string(),
+        "moderate" | "medium" => "moderate".to_string(),
+        "complex" | "hard" => "complex".to_string(),
+        _ if step_count <= 2 => "simple".to_string(),
+        _ => "moderate".to_string(),
+    }
+}
+
+fn normalize_recommended_role(raw: &str, category: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "coding_actor" | "coding" | "coder" => "coding_actor".to_string(),
+        "writing_actor" | "writing" | "writer" => "writing_actor".to_string(),
+        "vision_actor" | "vision" | "ui" | "browser" => "vision_actor".to_string(),
+        _ => match category {
+            "coding" => "coding_actor".to_string(),
+            "writing" => "writing_actor".to_string(),
+            _ => "vision_actor".to_string(),
+        },
+    }
+}
+
+pub fn parse_task_classification_response(raw_json: &str) -> Result<TaskClassification, AgentError> {
+    let chat: OllamaChatResponse = serde_json::from_str(raw_json)
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let parsed: RawTaskClassification = parse_json_from_message(&chat)?;
+
+    let category = normalize_task_category(&parsed.category);
+    let recommended_role = normalize_recommended_role(&parsed.recommended_role, &category);
+    let initial_plan_steps: Vec<String> = parsed
+        .initial_plan_steps
+        .into_iter()
+        .map(|s| sanitize_line(&s, 140))
+        .filter(|s| !s.is_empty())
+        .take(5)
+        .collect();
+    let complexity = normalize_complexity(&parsed.complexity, initial_plan_steps.len());
+
+    let mut reasoning = sanitize_line(&parsed.reasoning, 320);
+    if reasoning.is_empty() {
+        reasoning = extract_thinking_fallback(&chat, 320);
+    }
+    if reasoning.is_empty() {
+        reasoning = format!("Classified as {category} ({complexity}); routed to {recommended_role}.");
+    }
+
+    Ok(TaskClassification {
+        category,
+        complexity,
+        recommended_role,
+        reasoning,
+        needs_dedicated_planner: parsed.needs_dedicated_planner,
+        initial_plan_steps,
+    })
+}
+
 pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> {
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
         .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
     let parsed: TaskPlan = parse_json_from_message(&chat)?;
+
+    let mut thinking = sanitize_line(&parsed.thinking, 320);
+    if thinking.is_empty() {
+        thinking = extract_thinking_fallback(&chat, 320);
+    }
 
     let steps: Vec<String> = parsed
         .steps
@@ -762,7 +998,7 @@ pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> 
         ));
     }
 
-    Ok(TaskPlan { steps })
+    Ok(TaskPlan { thinking, steps })
 }
 
 fn is_supported_follow_up_action(action_type: &str) -> bool {
@@ -804,7 +1040,10 @@ pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDec
     if decision.narration.is_empty() {
         decision.narration = format!("Performing {}", decision.action_type);
     }
-    decision.thought = sanitize_line(&decision.thought, 240);
+    decision.thought = sanitize_line(&decision.thought, 320);
+    if decision.thought.is_empty() {
+        decision.thought = extract_thinking_fallback(&chat, 320);
+    }
     decision.target_ocr_id = decision.target_ocr_id.filter(|id| *id >= 1);
     decision.x_norm = decision.x_norm.map(|v| v.clamp(0.0, 1.0));
     decision.y_norm = decision.y_norm.map(|v| v.clamp(0.0, 1.0));
@@ -856,6 +1095,10 @@ pub fn parse_step_verification_response(raw_json: &str) -> Result<StepVerificati
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
         .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
     let mut ver: StepVerification = parse_json_from_message(&chat)?;
+    ver.thinking = sanitize_line(&ver.thinking, 320);
+    if ver.thinking.is_empty() {
+        ver.thinking = extract_thinking_fallback(&chat, 320);
+    }
     ver.status = ver.status.trim().to_ascii_lowercase();
     if !matches!(
         ver.status.as_str(),
@@ -881,6 +1124,10 @@ pub fn parse_recovery_plan_response(raw_json: &str) -> Result<RecoveryPlan, Agen
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
         .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
     let mut plan: RecoveryPlan = parse_json_from_message(&chat)?;
+    plan.thinking = sanitize_line(&plan.thinking, 320);
+    if plan.thinking.is_empty() {
+        plan.thinking = extract_thinking_fallback(&chat, 320);
+    }
     plan.diagnosis = sanitize_line(&plan.diagnosis, 220);
     if plan.diagnosis.is_empty() {
         plan.diagnosis = "Previous approach stalled; trying alternative steps.".to_string();
@@ -1031,6 +1278,19 @@ fn normalize_model_for_endpoint(base_url: &str, model: &str) -> String {
     } else {
         model.to_string()
     }
+}
+
+pub fn alternate_cloud_model_name(base_url: &str, model: &str) -> Option<String> {
+    if !base_url.starts_with("https://ollama.com") {
+        return None;
+    }
+    let normalized = model.trim_end_matches(":cloud");
+    if let Some(stripped) = normalized.strip_suffix("-cloud") {
+        if !stripped.is_empty() {
+            return Some(stripped.to_string());
+        }
+    }
+    None
 }
 
 fn build_headers(api_key: &str) -> Result<HeaderMap, AgentError> {
@@ -1215,5 +1475,71 @@ mod tests {
         assert!(!dec.requires_confirmation);
         assert!(dec.plan_steps.is_empty());
         assert!(dec.follow_up_actions.is_empty());
+    }
+
+    #[test]
+    fn parses_task_classification_and_normalizes_categories() {
+        let raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"category\":\"CODING\",\"complexity\":\"complex\",\"recommended_role\":\"coder\",\"reasoning\":\"Goal involves editing code in an IDE.\",\"needs_dedicated_planner\":true,\"initial_plan_steps\":[\"Focus VS Code\",\"Open target file\",\"Edit handler\"]}"
+            }
+        }"#;
+        let cls = parse_task_classification_response(raw).expect("valid classification");
+        assert_eq!(cls.category, "coding");
+        assert_eq!(cls.complexity, "complex");
+        assert_eq!(cls.recommended_role, "coding_actor");
+        assert_eq!(cls.reasoning, "Goal involves editing code in an IDE.");
+        assert!(cls.needs_dedicated_planner);
+        assert_eq!(cls.initial_plan_steps.len(), 3);
+
+        let fallback_role_raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"category\":\"notes\",\"complexity\":\"unknown\",\"recommended_role\":\"unknown\",\"reasoning\":\"\",\"needs_dedicated_planner\":false,\"initial_plan_steps\":[\"Open Notes\",\"Write list\"]}",
+                "thinking": "User wants to write a checklist in Notes."
+            }
+        }"#;
+        let cls2 = parse_task_classification_response(fallback_role_raw).expect("fallback classification");
+        assert_eq!(cls2.category, "writing");
+        assert_eq!(cls2.complexity, "simple");
+        assert_eq!(cls2.recommended_role, "writing_actor");
+        assert_eq!(cls2.reasoning, "User wants to write a checklist in Notes.");
+    }
+
+    #[test]
+    fn extracts_thinking_fallbacks_and_alternate_cloud_names() {
+        let plan_raw = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"thinking\":\"Check Safari first, then navigate cleanly.\",\"steps\":[\"Open Safari\",\"Load page\"]}"
+            }
+        }"#;
+        let plan = parse_task_plan_response(plan_raw).expect("plan with thinking");
+        assert_eq!(plan.thinking, "Check Safari first, then navigate cleanly.");
+        assert_eq!(plan.steps, vec!["Open Safari", "Load page"]);
+
+        let action_from_thinking = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"narration\":\"Clicking button\",\"plan_step_index\":0,\"action_type\":\"click\",\"target_ocr_id\":3,\"requires_confirmation\":false}",
+                "thinking": "Button #3 matches the target label on screen."
+            }
+        }"#;
+        let dec = parse_action_decision_response(action_from_thinking).expect("thought fallback");
+        assert_eq!(dec.thought, "Button #3 matches the target label on screen.");
+
+        assert_eq!(
+            alternate_cloud_model_name("https://ollama.com", "qwen3-vl:235b-cloud"),
+            Some("qwen3-vl:235b".to_string())
+        );
+        assert_eq!(
+            alternate_cloud_model_name("https://ollama.com", "deepseek-v4.1-flash:cloud"),
+            None
+        );
+        assert_eq!(
+            alternate_cloud_model_name("http://localhost:11434", "qwen3-vl:235b-cloud"),
+            None
+        );
     }
 }

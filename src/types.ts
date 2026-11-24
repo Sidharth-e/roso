@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const TaskPhaseSchema = z.enum([
   "idle",
+  "classifying",
   "planning",
   "running",
   "verifying",
@@ -14,6 +15,31 @@ export const TaskPhaseSchema = z.enum([
 ]);
 export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
 
+export const TaskClassificationSchema = z.object({
+  category: z.string(),
+  complexity: z.string(),
+  recommendedRole: z.string(),
+  reasoning: z.string(),
+  needsDedicatedPlanner: z.boolean(),
+  initialPlanSteps: z.array(z.string()),
+});
+export type TaskClassification = z.infer<typeof TaskClassificationSchema>;
+
+export const OrchestrationTraceEntrySchema = z.object({
+  id: z.string(),
+  timestamp: z.string(),
+  stage: z.string(),
+  role: z.string(),
+  model: z.string(),
+  title: z.string(),
+  content: z.string(),
+  stepNumber: z.number().int().nonnegative().nullable(),
+  status: z.string(),
+});
+export type OrchestrationTraceEntry = z.infer<
+  typeof OrchestrationTraceEntrySchema
+>;
+
 export const TaskStepRecordSchema = z.object({
   stepNumber: z.number().int().nonnegative(),
   timestamp: z.string(),
@@ -25,6 +51,8 @@ export const TaskStepRecordSchema = z.object({
   targetX: z.number().nullable(),
   targetY: z.number().nullable(),
   verificationNote: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  thought: z.string().nullable().optional(),
 });
 export type TaskStepRecord = z.infer<typeof TaskStepRecordSchema>;
 
@@ -42,6 +70,10 @@ export const EngineSnapshotSchema = z.object({
   phase: TaskPhaseSchema,
   taskId: z.string().nullable(),
   goal: z.string(),
+  classification: TaskClassificationSchema.nullable(),
+  activeRole: z.string(),
+  activeModel: z.string(),
+  currentThought: z.string(),
   planSteps: z.array(z.string()),
   activePlanIndex: z.number().int().nonnegative(),
   currentStep: z.number().int().nonnegative(),
@@ -56,11 +88,36 @@ export const EngineSnapshotSchema = z.object({
   screenPermissionGranted: z.boolean(),
   accessibilityPermissionGranted: z.boolean(),
   steps: z.array(TaskStepRecordSchema),
+  traces: z.array(OrchestrationTraceEntrySchema),
 });
 export type EngineSnapshot = z.infer<typeof EngineSnapshotSchema>;
 
+export const ModelRoutingConfigSchema = z.object({
+  judgeModel: z.string(),
+  plannerModel: z.string(),
+  visionActorModel: z.string(),
+  codingActorModel: z.string(),
+  writingActorModel: z.string(),
+  recoveryModel: z.string(),
+  enableJudgeVerification: z.boolean(),
+  autoOpenPanel: z.boolean(),
+});
+export type ModelRoutingConfig = z.infer<typeof ModelRoutingConfigSchema>;
+
+export const DEFAULT_MODEL_ROUTING: ModelRoutingConfig = {
+  judgeModel: "gemma4:31b-cloud",
+  plannerModel: "kimi-k3.1-pro:cloud",
+  visionActorModel: "deepseek-v4.1-flash:cloud",
+  codingActorModel: "qwen3-vl:235b-cloud",
+  writingActorModel: "kimi-k3.1-pro:cloud",
+  recoveryModel: "qwen3-vl:235b-cloud",
+  enableJudgeVerification: true,
+  autoOpenPanel: true,
+};
+
 export const AppConfigSchema = z.object({
   ollamaApiKey: z.string(),
+  models: ModelRoutingConfigSchema,
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
@@ -73,6 +130,8 @@ export const TaskHistoryRecordSchema = z.object({
   summary: z.string(),
   stepCount: z.number().int().nonnegative(),
   steps: z.array(TaskStepRecordSchema),
+  category: z.string().nullable().optional(),
+  selectedModel: z.string().nullable().optional(),
 });
 export type TaskHistoryRecord = z.infer<typeof TaskHistoryRecordSchema>;
 
@@ -92,5 +151,6 @@ export const PointerCuePayloadSchema = z.object({
 });
 export type PointerCuePayload = z.infer<typeof PointerCuePayloadSchema>;
 
-export type TrayTab = "task" | "history" | "settings";
+export type TrayTab = "task" | "live" | "history" | "settings";
+export type PanelFilter = "all" | "plan" | "think" | "steps";
 export type ThemeMode = "light" | "dark";

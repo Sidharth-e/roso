@@ -5,16 +5,29 @@ import {
   useEngineSnapshotQuery,
   useTaskHistoryQuery,
   useTaskMutations,
+  useThemeEventSync,
 } from "../api";
 import { useTaskUiStore } from "../store";
-import type { AppConfig, TaskPhase } from "../types";
+import {
+  DEFAULT_MODEL_ROUTING,
+  type AppConfig,
+  type ModelRoutingConfig,
+} from "../types";
+import { OrchestrationInspector } from "./OrchestrationPanel";
 import {
   Button,
   Card,
   Input,
+  ModelChip,
   StatusBadge,
+  StepMeterBar,
+  Switch,
   TabBar,
   TextArea,
+  categoryDisplayName,
+  outcomeTone,
+  phaseBadgeProps,
+  stepStatusClass,
 } from "./UiPrimitives";
 
 const EXAMPLE_GOALS: ReadonlyArray<string> = [
@@ -23,88 +36,14 @@ const EXAMPLE_GOALS: ReadonlyArray<string> = [
   "Open Calculator and compute 42 * 18",
 ];
 
-function phaseBadgeProps(phase: TaskPhase | undefined): {
-  tone: "success" | "warning" | "error" | "neutral" | "info";
-  label: string;
-} {
-  switch (phase) {
-    case "planning":
-      return { tone: "info", label: "Planning" };
-    case "running":
-      return { tone: "info", label: "Acting" };
-    case "verifying":
-      return { tone: "info", label: "Verifying" };
-    case "recovering":
-      return { tone: "warning", label: "Recovering" };
-    case "awaiting_confirmation":
-      return { tone: "warning", label: "Approve?" };
-    case "paused":
-      return { tone: "neutral", label: "Paused" };
-    case "completed":
-      return { tone: "success", label: "Done" };
-    case "failed":
-      return { tone: "error", label: "Failed" };
-    case "stopped":
-      return { tone: "warning", label: "Stopped" };
-    default:
-      return { tone: "neutral", label: "Ready" };
-  }
-}
-
-function outcomeTone(
-  outcome: string
-): "success" | "warning" | "error" | "neutral" | "info" {
-  if (outcome === "completed") {
-    return "success";
-  }
-  if (outcome === "failed") {
-    return "error";
-  }
-  if (outcome === "stopped" || outcome === "max_steps") {
-    return "warning";
-  }
-  return "neutral";
-}
-
-function stepStatusClass(status: string): string {
-  if (status === "verified" || status === "done") {
-    return "text-success";
-  }
-  if (status === "failed" || status === "unverified_failed") {
-    return "text-error";
-  }
-  if (status === "recovery" || status === "retrying") {
-    return "text-warning";
-  }
-  return "text-tertiary";
-}
-
-function StepMeterBar({ value, max }: { value: number; max: number }) {
-  const pct = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
-
-  return (
-    <svg
-      viewBox="0 0 100 6"
-      preserveAspectRatio="none"
-      role="progressbar"
-      aria-label="Task step progress"
-      aria-valuenow={Math.round(pct)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      className="h-1.5 w-full overflow-hidden rounded-full bg-background/80"
-    >
-      <rect x={0} y={0} width={pct} height={6} className="fill-primary" />
-    </svg>
-  );
-}
-
 export function TrayControl() {
   useEngineEventSync();
+  useThemeEventSync();
 
   const activeTab = useTaskUiStore((s) => s.activeTab);
   const setActiveTab = useTaskUiStore((s) => s.setActiveTab);
   const theme = useTaskUiStore((s) => s.theme);
-  const toggleTheme = useTaskUiStore((s) => s.toggleTheme);
+  const setTheme = useTaskUiStore((s) => s.setTheme);
   const draftGoal = useTaskUiStore((s) => s.draftGoal);
   const setDraftGoal = useTaskUiStore((s) => s.setDraftGoal);
 
@@ -134,6 +73,7 @@ export function TrayControl() {
   const snapshot = snapshotQuery.data;
   const phase = snapshot?.phase ?? "idle";
   const isActive =
+    phase === "classifying" ||
     phase === "planning" ||
     phase === "running" ||
     phase === "verifying" ||
@@ -141,6 +81,12 @@ export function TrayControl() {
     phase === "paused" ||
     phase === "awaiting_confirmation";
   const badge = phaseBadgeProps(snapshot?.phase);
+
+  function handleToggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    mutations.broadcastTheme.mutate(next);
+  }
 
   function handleRunTask(event: FormEvent) {
     event.preventDefault();
@@ -156,7 +102,25 @@ export function TrayControl() {
     if (!configDraft) {
       return;
     }
-    mutations.saveConfig.mutate(configDraft);
+    mutations.saveConfig.mutate(configDraft, {
+      onSuccess: (saved) => setConfigDraft(saved),
+    });
+  }
+
+  function updateModelField<K extends keyof ModelRoutingConfig>(
+    key: K,
+    value: ModelRoutingConfig[K]
+  ) {
+    if (!configDraft) {
+      return;
+    }
+    setConfigDraft({
+      ...configDraft,
+      models: {
+        ...configDraft.models,
+        [key]: value,
+      },
+    });
   }
 
   return (
@@ -171,7 +135,7 @@ export function TrayControl() {
               Task Companion
             </h1>
             <p className="text-[11px] text-tertiary">
-              Ollama Computer-Use Agent
+              Multi-Model Ollama Orchestrator
             </p>
           </div>
         </div>
@@ -179,7 +143,15 @@ export function TrayControl() {
           <StatusBadge tone={badge.tone} label={badge.label} />
           <button
             type="button"
-            onClick={toggleTheme}
+            onClick={() => mutations.togglePanel.mutate()}
+            aria-label="Toggle live orchestration HUD panel"
+            className="rounded-lg border border-primary/35 bg-primary/10 px-2 py-1 text-[11px] font-semibold text-primary hover:bg-primary/20 focus:outline-none focus:ring-2 focus:ring-primary/40"
+          >
+            HUD
+          </button>
+          <button
+            type="button"
+            onClick={handleToggleTheme}
             aria-label="Toggle color theme"
             className="rounded-lg border border-tertiary/30 bg-secondary px-2 py-1 text-[11px] font-semibold text-foreground hover:bg-secondary/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
@@ -340,6 +312,22 @@ export function TrayControl() {
                     max={snapshot?.maxSteps ?? 20}
                   />
 
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {snapshot?.classification ? (
+                      <StatusBadge
+                        tone="info"
+                        label={categoryDisplayName(snapshot.classification.category)}
+                      />
+                    ) : null}
+                    {snapshot?.activeModel ? (
+                      <ModelChip
+                        role={snapshot.activeRole}
+                        model={snapshot.activeModel}
+                        active={isActive}
+                      />
+                    ) : null}
+                  </div>
+
                   <p className="rounded-lg bg-background/80 px-2.5 py-2 text-xs text-foreground">
                     {snapshot?.lastNarration}
                   </p>
@@ -361,7 +349,7 @@ export function TrayControl() {
                       </Button>
                     ) : (
                       <Button variant="secondary" disabled>
-                        {phase === "planning" ? "Planning..." : "Waiting..."}
+                        {badge.label}...
                       </Button>
                     )}
                     <Button
@@ -517,6 +505,23 @@ export function TrayControl() {
           </>
         ) : null}
 
+        {activeTab === "live" ? (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">
+                Synced Live Inspector
+              </span>
+              <Button
+                variant="secondary"
+                onClick={() => mutations.showPanel.mutate()}
+              >
+                Pop Out Floating HUD
+              </Button>
+            </div>
+            <OrchestrationInspector snapshot={snapshot} />
+          </div>
+        ) : null}
+
         {activeTab === "history" ? (
           <div className="space-y-2">
             {(historyQuery.data ?? []).length === 0 ? (
@@ -537,6 +542,19 @@ export function TrayControl() {
                       label={item.outcome}
                     />
                   </div>
+                  {(item.category || item.selectedModel) ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {item.category ? (
+                        <StatusBadge
+                          tone="info"
+                          label={categoryDisplayName(item.category)}
+                        />
+                      ) : null}
+                      {item.selectedModel ? (
+                        <ModelChip role="actor" model={item.selectedModel} />
+                      ) : null}
+                    </div>
+                  ) : null}
                   <p className="text-[11px] text-foreground/80">
                     {item.summary}
                   </p>
@@ -571,6 +589,99 @@ export function TrayControl() {
                   })
                 }
               />
+            </Card>
+
+            <Card className="space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-foreground">
+                  Multi-Model Routing (Ollama Cloud)
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfigDraft({
+                      ...configDraft,
+                      models: { ...DEFAULT_MODEL_ROUTING },
+                    })
+                  }
+                  className="text-[11px] font-semibold text-primary hover:underline focus:outline-none"
+                >
+                  Reset Defaults
+                </button>
+              </div>
+              <Input
+                id="model-judge"
+                label="Judge & Classifier Model"
+                type="text"
+                value={configDraft.models.judgeModel}
+                onChange={(e) => updateModelField("judgeModel", e.target.value)}
+              />
+              <Input
+                id="model-planner"
+                label="Planner Model"
+                type="text"
+                value={configDraft.models.plannerModel}
+                onChange={(e) => updateModelField("plannerModel", e.target.value)}
+              />
+              <Input
+                id="model-vision-actor"
+                label="Vision / General UI Actor Model"
+                type="text"
+                value={configDraft.models.visionActorModel}
+                onChange={(e) =>
+                  updateModelField("visionActorModel", e.target.value)
+                }
+              />
+              <Input
+                id="model-coding-actor"
+                label="Coding / Terminal Actor Model"
+                type="text"
+                value={configDraft.models.codingActorModel}
+                onChange={(e) =>
+                  updateModelField("codingActorModel", e.target.value)
+                }
+              />
+              <Input
+                id="model-writing-actor"
+                label="Writing / Notes Actor Model"
+                type="text"
+                value={configDraft.models.writingActorModel}
+                onChange={(e) =>
+                  updateModelField("writingActorModel", e.target.value)
+                }
+              />
+              <Input
+                id="model-recovery"
+                label="Recovery Specialist Model"
+                type="text"
+                value={configDraft.models.recoveryModel}
+                onChange={(e) => updateModelField("recoveryModel", e.target.value)}
+              />
+            </Card>
+
+            <Card className="space-y-3">
+              <span className="text-xs font-semibold text-foreground">
+                Orchestration Options
+              </span>
+              <Switch
+                id="toggle-judge-verify"
+                checked={configDraft.models.enableJudgeVerification}
+                onChange={(checked) =>
+                  updateModelField("enableJudgeVerification", checked)
+                }
+                label="Judge Step Verification"
+                description="Judge verifies stalled steps and completion before stopping."
+              />
+              <Switch
+                id="toggle-auto-panel"
+                checked={configDraft.models.autoOpenPanel}
+                onChange={(checked) => updateModelField("autoOpenPanel", checked)}
+                label="Auto-Open Live HUD Panel"
+                description="Show the floating live planning & thinking HUD when a task starts."
+              />
+            </Card>
+
+            <Card className="space-y-2">
               <Button
                 type="submit"
                 className="w-full"
@@ -578,7 +689,7 @@ export function TrayControl() {
               >
                 {mutations.saveConfig.isPending
                   ? "Saving..."
-                  : "Save API Key"}
+                  : "Save Configuration"}
               </Button>
               {mutations.saveConfig.isError ? (
                 <p className="text-[11px] text-error">
@@ -587,7 +698,7 @@ export function TrayControl() {
               ) : null}
               {mutations.saveConfig.isSuccess ? (
                 <p className="text-[11px] text-success">
-                  API key saved to TaskCompanion/config.json.
+                  Configuration saved to TaskCompanion/config.json.
                 </p>
               ) : null}
             </Card>

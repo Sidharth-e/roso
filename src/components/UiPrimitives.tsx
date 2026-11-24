@@ -4,7 +4,7 @@ import type {
   ReactNode,
   TextareaHTMLAttributes,
 } from "react";
-import type { TrayTab } from "../types";
+import type { TaskPhase, TrayTab } from "../types";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "primary" | "secondary" | "danger";
@@ -162,6 +162,7 @@ interface TabBarProps {
 
 const TABS: ReadonlyArray<{ id: TrayTab; label: string }> = [
   { id: "task", label: "Task" },
+  { id: "live", label: "Live" },
   { id: "history", label: "History" },
   { id: "settings", label: "Settings" },
 ];
@@ -170,7 +171,7 @@ export function TabBar({ activeTab, onSelect }: TabBarProps) {
   return (
     <nav
       aria-label="Task Companion views"
-      className="grid grid-cols-3 gap-1 rounded-lg bg-secondary/80 p-1"
+      className="grid grid-cols-4 gap-1 rounded-lg bg-secondary/80 p-1"
     >
       {TABS.map((tab) => {
         const selected = tab.id === activeTab;
@@ -191,5 +192,136 @@ export function TabBar({ activeTab, onSelect }: TabBarProps) {
         );
       })}
     </nav>
+  );
+}
+
+export function roleDisplayName(role: string): string {
+  switch (role) {
+    case "judge":
+      return "Judge";
+    case "planner":
+      return "Planner";
+    case "coding_actor":
+      return "Coding";
+    case "writing_actor":
+      return "Writing";
+    case "vision_actor":
+      return "Vision";
+    case "recovery":
+      return "Recovery";
+    default:
+      return role || "System";
+  }
+}
+
+export function categoryDisplayName(category: string): string {
+  switch (category) {
+    case "browser_research":
+      return "Browser & Research";
+    case "coding":
+      return "Coding & Dev";
+    case "writing":
+      return "Writing & Notes";
+    case "system_admin":
+      return "System & Files";
+    case "general_ui":
+      return "General UI";
+    default:
+      return category;
+  }
+}
+
+export function phaseBadgeProps(phase: TaskPhase | undefined): {
+  tone: "success" | "warning" | "error" | "neutral" | "info";
+  label: string;
+} {
+  switch (phase) {
+    case "classifying":
+      return { tone: "info", label: "Classifying" };
+    case "planning":
+      return { tone: "info", label: "Planning" };
+    case "running":
+      return { tone: "info", label: "Acting" };
+    case "verifying":
+      return { tone: "info", label: "Verifying" };
+    case "recovering":
+      return { tone: "warning", label: "Recovering" };
+    case "awaiting_confirmation":
+      return { tone: "warning", label: "Approve?" };
+    case "paused":
+      return { tone: "neutral", label: "Paused" };
+    case "completed":
+      return { tone: "success", label: "Done" };
+    case "failed":
+      return { tone: "error", label: "Failed" };
+    case "stopped":
+      return { tone: "warning", label: "Stopped" };
+    default:
+      return { tone: "neutral", label: "Ready" };
+  }
+}
+
+export function outcomeTone(
+  outcome: string
+): "success" | "warning" | "error" | "neutral" | "info" {
+  if (outcome === "completed") {
+    return "success";
+  }
+  if (outcome === "failed") {
+    return "error";
+  }
+  if (outcome === "stopped" || outcome === "max_steps") {
+    return "warning";
+  }
+  return "neutral";
+}
+
+export function stepStatusClass(status: string): string {
+  if (status === "verified" || status === "done") {
+    return "text-success";
+  }
+  if (status === "failed" || status === "unverified_failed") {
+    return "text-error";
+  }
+  if (status === "recovery" || status === "retrying") {
+    return "text-warning";
+  }
+  return "text-tertiary";
+}
+
+interface ModelChipProps {
+  role: string;
+  model: string;
+  active?: boolean;
+}
+
+export function ModelChip({ role, model, active = false }: ModelChipProps) {
+  return (
+    <span className="model-chip max-w-full">
+      {active ? (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary animate-pulse" />
+      ) : null}
+      <span className="shrink-0 text-foreground/75">{roleDisplayName(role)}:</span>
+      <span className="truncate font-mono">{model}</span>
+    </span>
+  );
+}
+
+export function StepMeterBar({ value, max }: { value: number; max: number }) {
+  const pct = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
+
+  return (
+    <svg
+      viewBox="0 0 100 6"
+      preserveAspectRatio="none"
+      role="progressbar"
+      aria-label="Task step progress"
+      aria-valuenow={Math.round(pct)}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      className="h-1.5 w-full overflow-hidden rounded-full bg-background/80"
+    >
+      <rect x={0} y={0} width={pct} height={6} className="fill-primary" />
+    </svg>
   );
 }

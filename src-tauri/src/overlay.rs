@@ -16,8 +16,13 @@ use std::cell::Cell;
 pub const TRAY_ID: &str = "task-companion-tray";
 pub const TRAY_WINDOW_LABEL: &str = "main";
 pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
+pub const PANEL_WINDOW_LABEL: &str = "panel";
 const POPOVER_WIDTH: f64 = 400.0;
 const POPOVER_HEIGHT: f64 = 620.0;
+const PANEL_WIDTH: f64 = 352.0;
+const PANEL_HEIGHT: f64 = 580.0;
+const PANEL_COLLAPSED_WIDTH: f64 = 256.0;
+const PANEL_COLLAPSED_HEIGHT: f64 = 52.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +112,8 @@ mod macos_panel {
         can_become_key: bool,
         level_offset: isize,
         stationary: bool,
+        ignores_mouse_events: bool,
+        exclude_from_capture: bool,
     ) {
         let Ok(raw_ptr) = window.ns_window() else {
             return;
@@ -154,9 +161,10 @@ mod macos_panel {
             ns_panel.setOpaque(false);
             ns_panel.setBackgroundColor(Some(&NSColor::clearColor()));
             ns_panel.setHasShadow(false);
+            ns_panel.setIgnoresMouseEvents(ignores_mouse_events);
 
-            if !can_become_key {
-                ns_panel.setIgnoresMouseEvents(true);
+            if exclude_from_capture {
+                let _: () = msg_send![ns_panel, setSharingType: 0usize];
             }
         }
     }
@@ -190,7 +198,7 @@ mod macos_panel {
     }
 
     pub fn show_popover_on_active_space(window: &WebviewWindow, align_to_cursor: bool) {
-        promote_to_panel(window, true, 0, false);
+        promote_to_panel(window, true, 0, false, false, false);
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -262,7 +270,7 @@ mod macos_panel {
     }
 
     pub fn sync_overlay_to_primary_screen(window: &WebviewWindow) -> (f64, f64) {
-        promote_to_panel(window, false, 2, true);
+        promote_to_panel(window, false, 2, true, true, true);
         let Some(mtm) = MainThreadMarker::new() else {
             return (1440.0, 900.0);
         };
@@ -291,6 +299,59 @@ mod macos_panel {
             }
         }
     }
+
+    pub fn position_and_show_hud_panel(window: &WebviewWindow, width: f64, height: f64) {
+        promote_to_panel(window, false, 1, true, false, true);
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Ok(raw_ptr) = window.ns_window() else {
+            return;
+        };
+        if raw_ptr.is_null() {
+            return;
+        }
+        let (screen_frame, _) = active_screen_frame(mtm);
+        let x = (screen_frame.origin.x + screen_frame.size.width - width - 14.0)
+            .max(screen_frame.origin.x + 12.0);
+        let top_y = screen_frame.origin.y + screen_frame.size.height - 42.0;
+        let origin_y = (top_y - height).max(screen_frame.origin.y + 12.0);
+        let rect = NSRect::new(
+            NSPoint::new(x, origin_y),
+            objc2_foundation::NSSize::new(width, height),
+        );
+        unsafe {
+            let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
+            ns_panel.setIgnoresMouseEvents(false);
+            ns_panel.setFrame_display(rect, true);
+            ns_panel.orderFrontRegardless();
+        }
+    }
+
+    pub fn resize_hud_panel(window: &WebviewWindow, width: f64, height: f64) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Ok(raw_ptr) = window.ns_window() else {
+            return;
+        };
+        if raw_ptr.is_null() {
+            return;
+        }
+        let (screen_frame, _) = active_screen_frame(mtm);
+        let x = (screen_frame.origin.x + screen_frame.size.width - width - 14.0)
+            .max(screen_frame.origin.x + 12.0);
+        let top_y = screen_frame.origin.y + screen_frame.size.height - 42.0;
+        let origin_y = (top_y - height).max(screen_frame.origin.y + 12.0);
+        let rect = NSRect::new(
+            NSPoint::new(x, origin_y),
+            objc2_foundation::NSSize::new(width, height),
+        );
+        unsafe {
+            let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
+            ns_panel.setFrame_display(rect, true);
+        }
+    }
 }
 
 pub fn initialize_windows_and_tray<F, S>(
@@ -307,6 +368,8 @@ where
 
     let toggle_item =
         MenuItemBuilder::with_id("toggle_popover", "Toggle Task Companion").build(app_handle)?;
+    let toggle_panel_item =
+        MenuItemBuilder::with_id("toggle_panel", "Toggle Live Agent Panel").build(app_handle)?;
     let stop_item =
         MenuItemBuilder::with_id("stop_task", "Stop Active Task (⌃⌥S)").build(app_handle)?;
     let test_pointer_item =
@@ -315,7 +378,13 @@ where
         MenuItemBuilder::with_id("quit_app", "Quit Task Companion").build(app_handle)?;
 
     let tray_menu = MenuBuilder::new(app_handle)
-        .items(&[&toggle_item, &stop_item, &test_pointer_item, &quit_item])
+        .items(&[
+            &toggle_item,
+            &toggle_panel_item,
+            &stop_item,
+            &test_pointer_item,
+            &quit_item,
+        ])
         .build()?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -333,6 +402,9 @@ where
         .on_menu_event(move |handle, event| match event.id().as_ref() {
             "toggle_popover" => {
                 toggle_tray_popover(handle, false);
+            }
+            "toggle_panel" => {
+                toggle_orchestration_panel(handle);
             }
             "stop_task" => {
                 on_stop_task(handle);
@@ -406,7 +478,31 @@ fn ensure_windows_created(app_handle: &AppHandle) -> tauri::Result<()> {
         .build()?;
 
         #[cfg(target_os = "macos")]
-        macos_panel::promote_to_panel(&main_win, true, 0, false);
+        macos_panel::promote_to_panel(&main_win, true, 0, false, false, false);
+    }
+
+    if app_handle.get_webview_window(PANEL_WINDOW_LABEL).is_none() {
+        let panel_win = WebviewWindowBuilder::new(
+            app_handle,
+            PANEL_WINDOW_LABEL,
+            WebviewUrl::App("index.html?view=panel".into()),
+        )
+        .title("Task Companion Live HUD")
+        .inner_size(PANEL_WIDTH, PANEL_HEIGHT)
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .focused(false)
+        .focusable(false)
+        .skip_taskbar(true)
+        .shadow(false)
+        .visible(false)
+        .build()?;
+
+        #[cfg(target_os = "macos")]
+        macos_panel::promote_to_panel(&panel_win, false, 1, true, false, true);
     }
 
     Ok(())
@@ -509,6 +605,100 @@ pub fn toggle_tray_popover(app_handle: &AppHandle, align_to_cursor: bool) {
     });
 }
 
+pub fn show_orchestration_panel(app_handle: &AppHandle) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window(PANEL_WINDOW_LABEL) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::position_and_show_hud_panel(&win, PANEL_WIDTH, PANEL_HEIGHT);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Ok(metrics) = primary_screen_metrics() {
+                let x = (metrics.origin_x + metrics.logical_width - PANEL_WIDTH - 14.0)
+                    .max(metrics.origin_x + 12.0);
+                let y = metrics.origin_y + 42.0;
+                let _ = win.set_position(Position::Logical(LogicalPosition::new(x, y)));
+                let _ = win.set_size(Size::Logical(LogicalSize::new(PANEL_WIDTH, PANEL_HEIGHT)));
+            }
+            let _ = win.show();
+        }
+    });
+}
+
+pub fn hide_orchestration_panel(app_handle: &AppHandle) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window(PANEL_WINDOW_LABEL) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::hide_popover_panel(&win);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = win.hide();
+        }
+    });
+}
+
+pub fn toggle_orchestration_panel(app_handle: &AppHandle) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window(PANEL_WINDOW_LABEL) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            if macos_panel::is_popover_visible_on_active_space(&win) {
+                macos_panel::hide_popover_panel(&win);
+            } else {
+                macos_panel::position_and_show_hud_panel(&win, PANEL_WIDTH, PANEL_HEIGHT);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if win.is_visible().unwrap_or(false) {
+                let _ = win.hide();
+            } else {
+                let _ = win.show();
+            }
+        }
+    });
+}
+
+pub fn set_orchestration_panel_collapsed(app_handle: &AppHandle, collapsed: bool) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window(PANEL_WINDOW_LABEL) else {
+            return;
+        };
+        let (width, height) = if collapsed {
+            (PANEL_COLLAPSED_WIDTH, PANEL_COLLAPSED_HEIGHT)
+        } else {
+            (PANEL_WIDTH, PANEL_HEIGHT)
+        };
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::resize_hud_panel(&win, width, height);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Ok(metrics) = primary_screen_metrics() {
+                let x = (metrics.origin_x + metrics.logical_width - width - 14.0)
+                    .max(metrics.origin_x + 12.0);
+                let y = metrics.origin_y + 42.0;
+                let _ = win.set_position(Position::Logical(LogicalPosition::new(x, y)));
+                let _ = win.set_size(Size::Logical(LogicalSize::new(width, height)));
+            }
+        }
+    });
+}
+
 pub fn bring_overlay_to_front(app_handle: &AppHandle) {
     let handle = app_handle.clone();
     let _ = app_handle.run_on_main_thread(move || {
@@ -589,6 +779,7 @@ pub fn update_tray_status_title(app_handle: &AppHandle, snapshot: Option<&Engine
     };
     let title = match snapshot {
         Some(s) => match s.phase {
+            TaskPhase::Classifying => Some("Classifying...".to_string()),
             TaskPhase::Planning => Some("Planning...".to_string()),
             TaskPhase::Running => Some(format!("Step {}/{}", s.current_step, s.max_steps)),
             TaskPhase::Verifying => Some("Verifying...".to_string()),

@@ -8,16 +8,17 @@ use crate::capture::{
     ActiveWindowMetadata, ScreenMetrics, MAX_DOWNSCALED_WIDTH,
 };
 use crate::classifier::{
-    AgentError, NextActionContext, OllamaAgentClient, PlannedActionDecision, RecoveryContext,
+    AgentError, ClassifyTaskContext, CreatePlanContext, NextActionContext, OllamaAgentClient,
+    PlannedActionDecision, RecoveryContext, TaskClassification, VerifyStepContext,
 };
 use crate::config::{
-    append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord, CONFIRM_RISKY_ACTIONS,
-    MAX_STEPS, OLLAMA_BASE_URL, STEP_DELAY_MS, VISION_MODEL,
+    append_history_record, AppConfig, ModelRoutingConfig, TaskHistoryRecord, TaskStepRecord,
+    CONFIRM_RISKY_ACTIONS, MAX_STEPS, OLLAMA_BASE_URL, STEP_DELAY_MS,
 };
 use crate::ocr::{extract_ax_elements, extract_ocr_targets, merge_targets, ScreenTargetMap};
 use crate::overlay::{
-    emit_pointer_cue, hide_tray_popover, show_tray_popover, update_tray_status_title,
-    PointerCuePayload,
+    emit_pointer_cue, hide_tray_popover, show_orchestration_panel, show_tray_popover,
+    update_tray_status_title, PointerCuePayload,
 };
 use chrono::{DateTime, Utc};
 use image::RgbaImage;
@@ -30,11 +31,13 @@ use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
 const MAX_RECOVERY_PLANS: u32 = 3;
+const MAX_TRACE_ENTRIES: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPhase {
     Idle,
+    Classifying,
     Planning,
     Running,
     Verifying,
@@ -50,7 +53,8 @@ impl TaskPhase {
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            Self::Planning
+            Self::Classifying
+                | Self::Planning
                 | Self::Running
                 | Self::Verifying
                 | Self::Recovering
@@ -58,6 +62,20 @@ impl TaskPhase {
                 | Self::Paused
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationTraceEntry {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub stage: String,
+    pub role: String,
+    pub model: String,
+    pub title: String,
+    pub content: String,
+    pub step_number: Option<u32>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +95,10 @@ pub struct EngineSnapshot {
     pub phase: TaskPhase,
     pub task_id: Option<String>,
     pub goal: String,
+    pub classification: Option<TaskClassification>,
+    pub active_role: String,
+    pub active_model: String,
+    pub current_thought: String,
     pub plan_steps: Vec<String>,
     pub active_plan_index: u32,
     pub current_step: u32,
@@ -91,6 +113,7 @@ pub struct EngineSnapshot {
     pub screen_permission_granted: bool,
     pub accessibility_permission_granted: bool,
     pub steps: Vec<TaskStepRecord>,
+    pub traces: Vec<OrchestrationTraceEntry>,
 }
 
 struct TaskRuntimeState {
@@ -98,6 +121,10 @@ struct TaskRuntimeState {
     task_id: Option<String>,
     goal: String,
     started_at: Option<DateTime<Utc>>,
+    classification: Option<TaskClassification>,
+    active_role: String,
+    active_model: String,
+    current_thought: String,
     plan_steps: Vec<String>,
     active_plan_index: u32,
     current_step: u32,
@@ -110,6 +137,7 @@ struct TaskRuntimeState {
     last_error: Option<String>,
     pending_confirmation: Option<PendingConfirmation>,
     steps: Vec<TaskStepRecord>,
+    traces: Vec<OrchestrationTraceEntry>,
     history_saved: bool,
 }
 
@@ -120,6 +148,10 @@ impl TaskRuntimeState {
             task_id: None,
             goal: String::new(),
             started_at: None,
+            classification: None,
+            active_role: String::new(),
+            active_model: String::new(),
+            current_thought: String::new(),
             plan_steps: Vec::new(),
             active_plan_index: 0,
             current_step: 0,
@@ -132,6 +164,7 @@ impl TaskRuntimeState {
             last_error: None,
             pending_confirmation: None,
             steps: Vec::new(),
+            traces: Vec::new(),
             history_saved: false,
         }
     }
@@ -180,6 +213,10 @@ impl TaskEngine {
             phase: st.phase,
             task_id: st.task_id.clone(),
             goal: st.goal.clone(),
+            classification: st.classification.clone(),
+            active_role: st.active_role.clone(),
+            active_model: st.active_model.clone(),
+            current_thought: st.current_thought.clone(),
             plan_steps: st.plan_steps.clone(),
             active_plan_index: st.active_plan_index,
             current_step: st.current_step,
@@ -194,6 +231,7 @@ impl TaskEngine {
             screen_permission_granted: has_screen_recording_permission(),
             accessibility_permission_granted: has_accessibility_permission(),
             steps: st.steps.clone(),
+            traces: st.traces.clone(),
         }
     }
 
@@ -201,13 +239,18 @@ impl TaskEngine {
         self.stop_task(&app_handle, Some("Replaced by new task".to_string()));
 
         let task_id = Uuid::new_v4().to_string();
+        let cfg = self.config();
 
         {
             let mut st = self.state.lock();
-            st.phase = TaskPhase::Planning;
+            st.phase = TaskPhase::Classifying;
             st.task_id = Some(task_id.clone());
             st.goal = goal.clone();
             st.started_at = Some(Utc::now());
+            st.classification = None;
+            st.active_role = "judge".to_string();
+            st.active_model = cfg.models.judge_model.clone();
+            st.current_thought = "Analyzing goal and screen context...".to_string();
             st.plan_steps = Vec::new();
             st.active_plan_index = 0;
             st.current_step = 0;
@@ -215,11 +258,12 @@ impl TaskEngine {
             st.recovery_count = 0;
             st.last_diagnosis = None;
             st.active_app = String::new();
-            st.last_narration = "Inspecting your screen to plan the task...".to_string();
+            st.last_narration = "Judge model classifying task and selecting specialist...".to_string();
             st.last_summary = None;
             st.last_error = None;
             st.pending_confirmation = None;
             st.steps.clear();
+            st.traces.clear();
             st.history_saved = false;
         }
 
@@ -228,6 +272,10 @@ impl TaskEngine {
         *self.stop_tx.lock() = Some(stop_tx);
         *self.pause_tx.lock() = Some(pause_tx);
         *self.confirm_tx.lock() = None;
+
+        if cfg.models.auto_open_panel {
+            show_orchestration_panel(&app_handle);
+        }
 
         let snap = self.snapshot();
         update_tray_status_title(&app_handle, Some(&snap));
@@ -400,6 +448,7 @@ impl TaskEngine {
             return;
         }
 
+        let routing = self.config().models;
         let max_steps = MAX_STEPS;
         let mut plan_steps: Vec<String> = Vec::new();
         let mut recent_steps: Vec<String> = Vec::new();
@@ -410,10 +459,378 @@ impl TaskEngine {
         let mut consecutive_stalls: u32 = 0;
         let mut consecutive_waits: u32 = 0;
         let mut recovery_count: u32 = 0;
+        let mut done_rejections: u32 = 0;
         let mut last_opened_url: Option<String> = None;
         let mut last_action_was_open_url = false;
-        let mut cached_capture: Option<GroundedCapture> = None;
+        let mut cached_capture: Option<GroundedCapture>;
         let mut step_num: u32 = 0;
+
+        let initial_cap = match tokio::task::spawn_blocking(capture_and_ground_screen).await {
+            Ok(Ok(cap)) => cap,
+            Ok(Err(err)) => {
+                self.finalize_task(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Failed,
+                    "failed",
+                    err.to_string(),
+                    Some(err.to_string()),
+                );
+                show_tray_popover(&app_handle, false);
+                return;
+            }
+            Err(err) => {
+                self.finalize_task(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Failed,
+                    "failed",
+                    err.to_string(),
+                    Some(err.to_string()),
+                );
+                show_tray_popover(&app_handle, false);
+                return;
+            }
+        };
+
+        if initial_cap.active_window.is_system_locked {
+            self.finalize_task(
+                &app_handle,
+                &task_id,
+                TaskPhase::Stopped,
+                "stopped",
+                "Stopped because macOS screen locked".to_string(),
+                None,
+            );
+            return;
+        }
+
+        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+            return;
+        }
+
+        let initial_api_key = self.config().resolved_api_key();
+        self.set_active_stage(
+            &app_handle,
+            &task_id,
+            TaskPhase::Classifying,
+            "judge",
+            &routing.judge_model,
+            Some("Judge model analyzing goal and screen...".to_string()),
+        );
+
+        let classify_ctx = ClassifyTaskContext {
+            goal: goal.clone(),
+            active_app: initial_cap.active_window.app_name.clone(),
+            window_title: initial_cap.active_window.window_title.clone(),
+            ocr_lines: initial_cap.target_map.formatted_lines.clone(),
+            base64_jpeg: initial_cap.annotated_jpeg.clone(),
+        };
+
+        let mut judge_model_used = routing.judge_model.clone();
+        let classification = match self
+            .client
+            .classify_task(
+                OLLAMA_BASE_URL,
+                &initial_api_key,
+                &routing.judge_model,
+                classify_ctx.clone(),
+            )
+            .await
+        {
+            Ok(cls) => cls,
+            Err(primary_err) => {
+                if routing.judge_model != routing.vision_actor_model {
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "fallback".to_string(),
+                            role: "judge".to_string(),
+                            model: routing.judge_model.clone(),
+                            title: "Judge model fallback".to_string(),
+                            content: format!(
+                                "Judge {} unavailable ({}); retrying with {}.",
+                                routing.judge_model, primary_err, routing.vision_actor_model
+                            ),
+                            step_number: None,
+                            status: "warning".to_string(),
+                        },
+                    );
+                    match self
+                        .client
+                        .classify_task(
+                            OLLAMA_BASE_URL,
+                            &initial_api_key,
+                            &routing.vision_actor_model,
+                            classify_ctx,
+                        )
+                        .await
+                    {
+                        Ok(cls) => {
+                            judge_model_used = routing.vision_actor_model.clone();
+                            cls
+                        }
+                        Err(fallback_err) => {
+                            self.push_trace(
+                                &app_handle,
+                                &task_id,
+                                OrchestrationTraceEntry {
+                                    id: Uuid::new_v4().to_string(),
+                                    timestamp: Utc::now(),
+                                    stage: "classify".to_string(),
+                                    role: "judge".to_string(),
+                                    model: routing.vision_actor_model.clone(),
+                                    title: "Heuristic classification fallback".to_string(),
+                                    content: format!(
+                                        "Cloud judge unavailable ({fallback_err}); using local classification."
+                                    ),
+                                    step_number: None,
+                                    status: "warning".to_string(),
+                                },
+                            );
+                            fallback_classification(&goal)
+                        }
+                    }
+                } else {
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "classify".to_string(),
+                            role: "judge".to_string(),
+                            model: routing.judge_model.clone(),
+                            title: "Heuristic classification fallback".to_string(),
+                            content: format!(
+                                "Cloud judge unavailable ({primary_err}); using local classification."
+                            ),
+                            step_number: None,
+                            status: "warning".to_string(),
+                        },
+                    );
+                    fallback_classification(&goal)
+                }
+            }
+        };
+
+        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+            return;
+        }
+
+        let (actor_role, actor_model) = select_actor_for_classification(&classification, &routing);
+        {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                st.classification = Some(classification.clone());
+                st.active_app = initial_cap.active_window.app_name.clone();
+            }
+        }
+
+        self.push_trace(
+            &app_handle,
+            &task_id,
+            OrchestrationTraceEntry {
+                id: Uuid::new_v4().to_string(),
+                timestamp: Utc::now(),
+                stage: "classify".to_string(),
+                role: "judge".to_string(),
+                model: judge_model_used.clone(),
+                title: format!(
+                    "Classified: {} ({}) -> {}",
+                    classification.category, classification.complexity, actor_model
+                ),
+                content: classification.reasoning.clone(),
+                step_number: None,
+                status: "success".to_string(),
+            },
+        );
+
+        if classification.needs_dedicated_planner || classification.initial_plan_steps.is_empty() {
+            self.set_active_stage(
+                &app_handle,
+                &task_id,
+                TaskPhase::Planning,
+                "planner",
+                &routing.planner_model,
+                Some("Planner model building execution steps...".to_string()),
+            );
+
+            let plan_ctx = CreatePlanContext {
+                goal: goal.clone(),
+                category: classification.category.clone(),
+                complexity: classification.complexity.clone(),
+                judge_reasoning: classification.reasoning.clone(),
+                active_app: initial_cap.active_window.app_name.clone(),
+                window_title: initial_cap.active_window.window_title.clone(),
+                ocr_lines: initial_cap.target_map.formatted_lines.clone(),
+                base64_jpeg: initial_cap.annotated_jpeg.clone(),
+            };
+
+            let mut planner_model_used = routing.planner_model.clone();
+            let plan_res = match self
+                .client
+                .create_task_plan(
+                    OLLAMA_BASE_URL,
+                    &initial_api_key,
+                    &routing.planner_model,
+                    plan_ctx.clone(),
+                )
+                .await
+            {
+                Ok(p) => Ok(p),
+                Err(err) => {
+                    if routing.planner_model != routing.vision_actor_model {
+                        self.push_trace(
+                            &app_handle,
+                            &task_id,
+                            OrchestrationTraceEntry {
+                                id: Uuid::new_v4().to_string(),
+                                timestamp: Utc::now(),
+                                stage: "fallback".to_string(),
+                                role: "planner".to_string(),
+                                model: routing.planner_model.clone(),
+                                title: "Planner model fallback".to_string(),
+                                content: format!(
+                                    "Planner {} failed ({}); retrying with {}.",
+                                    routing.planner_model, err, routing.vision_actor_model
+                                ),
+                                step_number: None,
+                                status: "warning".to_string(),
+                            },
+                        );
+                        planner_model_used = routing.vision_actor_model.clone();
+                        self.client
+                            .create_task_plan(
+                                OLLAMA_BASE_URL,
+                                &initial_api_key,
+                                &routing.vision_actor_model,
+                                plan_ctx,
+                            )
+                            .await
+                    } else {
+                        Err(err)
+                    }
+                }
+            };
+
+            match plan_res {
+                Ok(plan) => {
+                    plan_steps = plan.steps.clone();
+                    {
+                        let mut st = self.state.lock();
+                        if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                            st.plan_steps = plan_steps.clone();
+                        }
+                    }
+                    let summary = if plan.thinking.is_empty() {
+                        plan_steps
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("{}. {s}", i + 1))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    } else {
+                        format!(
+                            "{} — {}",
+                            plan.thinking,
+                            plan_steps
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| format!("{}. {s}", i + 1))
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        )
+                    };
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "plan".to_string(),
+                            role: "planner".to_string(),
+                            model: planner_model_used,
+                            title: format!("Plan ready ({} steps)", plan_steps.len()),
+                            content: summary,
+                            step_number: None,
+                            status: "success".to_string(),
+                        },
+                    );
+                }
+                Err(err) => {
+                    if !classification.initial_plan_steps.is_empty() {
+                        plan_steps = classification.initial_plan_steps.clone();
+                        {
+                            let mut st = self.state.lock();
+                            if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                                st.plan_steps = plan_steps.clone();
+                            }
+                        }
+                    }
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "plan".to_string(),
+                            role: "planner".to_string(),
+                            model: planner_model_used,
+                            title: "Using Judge initial plan".to_string(),
+                            content: format!("Dedicated planner skipped ({err})."),
+                            step_number: None,
+                            status: "warning".to_string(),
+                        },
+                    );
+                }
+            }
+        } else {
+            plan_steps = classification.initial_plan_steps.clone();
+            {
+                let mut st = self.state.lock();
+                if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                    st.plan_steps = plan_steps.clone();
+                }
+            }
+            self.push_trace(
+                &app_handle,
+                &task_id,
+                OrchestrationTraceEntry {
+                    id: Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    stage: "plan".to_string(),
+                    role: "judge".to_string(),
+                    model: judge_model_used,
+                    title: format!("Fast-path plan ({} steps)", plan_steps.len()),
+                    content: plan_steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("{}. {s}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    step_number: None,
+                    status: "success".to_string(),
+                },
+            );
+        }
+
+        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+            return;
+        }
+
+        cached_capture = Some(initial_cap);
+        self.set_active_stage(
+            &app_handle,
+            &task_id,
+            TaskPhase::Running,
+            actor_role,
+            &actor_model,
+            Some(format!("Running with {actor_model}...")),
+        );
 
         while step_num < max_steps {
             if *stop_rx.borrow() || !self.is_current_task(&task_id) {
@@ -487,27 +904,69 @@ impl TaskEngine {
                 return;
             }
 
-            let decision_res = self
+            self.set_active_stage(
+                &app_handle,
+                &task_id,
+                TaskPhase::Running,
+                actor_role,
+                &actor_model,
+                None,
+            );
+
+            let next_ctx = NextActionContext {
+                goal: goal.clone(),
+                task_category: classification.category.clone(),
+                actor_role: actor_role.to_string(),
+                plan_steps: plan_steps.clone(),
+                step_number: step_num + 1,
+                max_steps,
+                active_app: before_cap.active_window.app_name.clone(),
+                window_title: before_cap.active_window.window_title.clone(),
+                screen_width: before_cap.screen_metrics.logical_width.round() as u32,
+                screen_height: before_cap.screen_metrics.logical_height.round() as u32,
+                ocr_lines: before_cap.target_map.formatted_lines.clone(),
+                recent_steps: recent_steps.clone(),
+                base64_jpeg: before_cap.annotated_jpeg.clone(),
+            };
+
+            let mut used_actor_model = actor_model.clone();
+            let decision_res = match self
                 .client
-                .decide_next_action(
-                    OLLAMA_BASE_URL,
-                    &cycle_api_key,
-                    VISION_MODEL,
-                    NextActionContext {
-                        goal: goal.clone(),
-                        plan_steps: plan_steps.clone(),
-                        step_number: step_num + 1,
-                        max_steps,
-                        active_app: before_cap.active_window.app_name.clone(),
-                        window_title: before_cap.active_window.window_title.clone(),
-                        screen_width: before_cap.screen_metrics.logical_width.round() as u32,
-                        screen_height: before_cap.screen_metrics.logical_height.round() as u32,
-                        ocr_lines: before_cap.target_map.formatted_lines.clone(),
-                        recent_steps: recent_steps.clone(),
-                        base64_jpeg: before_cap.annotated_jpeg.clone(),
-                    },
-                )
-                .await;
+                .decide_next_action(OLLAMA_BASE_URL, &cycle_api_key, &actor_model, next_ctx.clone())
+                .await
+            {
+                Ok(d) => Ok(d),
+                Err(err) if actor_model != routing.vision_actor_model => {
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "fallback".to_string(),
+                            role: actor_role.to_string(),
+                            model: actor_model.clone(),
+                            title: format!("Actor fallback at step {}", step_num + 1),
+                            content: format!(
+                                "Model {} errored ({}); retrying with {}.",
+                                actor_model, err, routing.vision_actor_model
+                            ),
+                            step_number: Some(step_num + 1),
+                            status: "warning".to_string(),
+                        },
+                    );
+                    used_actor_model = routing.vision_actor_model.clone();
+                    self.client
+                        .decide_next_action(
+                            OLLAMA_BASE_URL,
+                            &cycle_api_key,
+                            &routing.vision_actor_model,
+                            next_ctx,
+                        )
+                        .await
+                }
+                Err(err) => Err(err),
+            };
 
             let decision = match decision_res {
                 Ok(d) => {
@@ -530,6 +989,8 @@ impl TaskEngine {
                             target_x: None,
                             target_y: None,
                             verification_note: None,
+                            model: Some(used_actor_model.clone()),
+                            thought: Some(msg.clone()),
                         };
                         self.record_step(
                             &app_handle,
@@ -565,6 +1026,27 @@ impl TaskEngine {
             if *stop_rx.borrow() || !self.is_current_task(&task_id) {
                 return;
             }
+
+            let decision_thought = if decision.thought.is_empty() {
+                decision.narration.clone()
+            } else {
+                decision.thought.clone()
+            };
+            self.push_trace(
+                &app_handle,
+                &task_id,
+                OrchestrationTraceEntry {
+                    id: Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    stage: "think".to_string(),
+                    role: actor_role.to_string(),
+                    model: used_actor_model.clone(),
+                    title: format!("Step {} · {}", step_num + 1, decision.action_type),
+                    content: decision_thought,
+                    step_number: Some(step_num + 1),
+                    status: "info".to_string(),
+                },
+            );
 
             if plan_steps.is_empty() && !decision.plan_steps.is_empty() {
                 plan_steps = decision.plan_steps.clone();
@@ -640,6 +1122,9 @@ impl TaskEngine {
                                 target_x: None,
                                 target_y: None,
                                 verification_note: Some(reason.clone()),
+                                model: Some(used_actor_model.clone()),
+                                thought: (!item_decision.thought.is_empty())
+                                    .then(|| item_decision.thought.clone()),
                             };
                             self.record_step(
                                 &app_handle,
@@ -683,6 +1168,9 @@ impl TaskEngine {
                         target_x: None,
                         target_y: None,
                         verification_note: Some("Duplicate URL entry blocked".to_string()),
+                        model: Some(used_actor_model.clone()),
+                        thought: (!item_decision.thought.is_empty())
+                            .then(|| item_decision.thought.clone()),
                     };
                     self.record_step(
                         &app_handle,
@@ -764,6 +1252,9 @@ impl TaskEngine {
                                 target_x: None,
                                 target_y: None,
                                 verification_note: Some("Loop abort".to_string()),
+                                model: Some(used_actor_model.clone()),
+                                thought: (!item_decision.thought.is_empty())
+                                    .then(|| item_decision.thought.clone()),
                             };
                             self.record_step(
                                 &app_handle,
@@ -829,6 +1320,134 @@ impl TaskEngine {
 
                 match &action {
                     AgentAction::Done { summary } => {
+                        if routing.enable_judge_verification && done_rejections < 2 {
+                            self.set_active_stage(
+                                &app_handle,
+                                &task_id,
+                                TaskPhase::Verifying,
+                                "judge",
+                                &routing.judge_model,
+                                Some("Judge verifying task completion...".to_string()),
+                            );
+                            let verify_ctx = VerifyStepContext {
+                                goal: goal.clone(),
+                                step_number: step_num,
+                                action_description: action_desc.clone(),
+                                expected_narration: summary.clone(),
+                                before_app: before_cap.active_window.app_name.clone(),
+                                after_app: before_cap.active_window.app_name.clone(),
+                                before_title: before_cap.active_window.window_title.clone(),
+                                after_title: before_cap.active_window.window_title.clone(),
+                                visual_diff_pct: 0.0,
+                                action_output: Some(summary.clone()),
+                                visible_targets: before_cap.target_map.formatted_lines.clone(),
+                                after_base64_jpeg: before_cap.annotated_jpeg.clone(),
+                            };
+                            let mut judge_ver_model = routing.judge_model.clone();
+                            let judge_res = match self
+                                .client
+                                .verify_step_outcome(
+                                    OLLAMA_BASE_URL,
+                                    &cycle_api_key,
+                                    &routing.judge_model,
+                                    verify_ctx.clone(),
+                                )
+                                .await
+                            {
+                                Ok(v) => Ok(v),
+                                Err(_) if routing.judge_model != routing.vision_actor_model => {
+                                    judge_ver_model = routing.vision_actor_model.clone();
+                                    self.client
+                                        .verify_step_outcome(
+                                            OLLAMA_BASE_URL,
+                                            &cycle_api_key,
+                                            &routing.vision_actor_model,
+                                            verify_ctx,
+                                        )
+                                        .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            if let Ok(ver) = judge_res {
+                                if !ver.goal_achieved {
+                                    done_rejections += 1;
+                                    let hint = ver
+                                        .recovery_hint
+                                        .clone()
+                                        .unwrap_or_else(|| "Continue working on the remaining goal.".to_string());
+                                    self.push_trace(
+                                        &app_handle,
+                                        &task_id,
+                                        OrchestrationTraceEntry {
+                                            id: Uuid::new_v4().to_string(),
+                                            timestamp: Utc::now(),
+                                            stage: "verify".to_string(),
+                                            role: "judge".to_string(),
+                                            model: judge_ver_model,
+                                            title: format!("Judge rejected completion (check #{done_rejections})"),
+                                            content: format!("{} Hint: {}", ver.observation, hint),
+                                            step_number: Some(step_num),
+                                            status: "warning".to_string(),
+                                        },
+                                    );
+                                    push_recent_step(
+                                        &mut recent_steps,
+                                        format!(
+                                            "JUDGE VERIFICATION REJECTED DONE: {}. Hint: {}. Continue until goal is actually complete.",
+                                            ver.observation, hint
+                                        ),
+                                    );
+                                    let step_rec = TaskStepRecord {
+                                        step_number: step_num,
+                                        timestamp: Utc::now(),
+                                        action_type: action_label,
+                                        description: action_desc,
+                                        narration: item_decision.narration.clone(),
+                                        status: "retrying".to_string(),
+                                        target_ocr_id: item_decision.target_ocr_id,
+                                        target_x: Some(cue_x),
+                                        target_y: Some(cue_y),
+                                        verification_note: Some(format!("Judge rejected Done: {}", ver.observation)),
+                                        model: Some(used_actor_model.clone()),
+                                        thought: (!item_decision.thought.is_empty())
+                                            .then(|| item_decision.thought.clone()),
+                                    };
+                                    self.record_step(
+                                        &app_handle,
+                                        &task_id,
+                                        step_num,
+                                        item_decision.plan_step_index,
+                                        &before_cap.active_window.app_name,
+                                        step_rec,
+                                    );
+                                    self.set_active_stage(
+                                        &app_handle,
+                                        &task_id,
+                                        TaskPhase::Running,
+                                        actor_role,
+                                        &actor_model,
+                                        None,
+                                    );
+                                    break;
+                                }
+                                self.push_trace(
+                                    &app_handle,
+                                    &task_id,
+                                    OrchestrationTraceEntry {
+                                        id: Uuid::new_v4().to_string(),
+                                        timestamp: Utc::now(),
+                                        stage: "verify".to_string(),
+                                        role: "judge".to_string(),
+                                        model: judge_ver_model,
+                                        title: "Judge confirmed goal completion".to_string(),
+                                        content: ver.observation,
+                                        step_number: Some(step_num),
+                                        status: "success".to_string(),
+                                    },
+                                );
+                            }
+                        }
+
                         let cue = PointerCuePayload {
                             id: Uuid::new_v4().to_string(),
                             message: summary.clone(),
@@ -856,6 +1475,9 @@ impl TaskEngine {
                             target_x: Some(cue_x),
                             target_y: Some(cue_y),
                             verification_note: Some("Task marked complete".to_string()),
+                            model: Some(used_actor_model.clone()),
+                            thought: (!item_decision.thought.is_empty())
+                                .then(|| item_decision.thought.clone()),
                         };
                         self.record_step(
                             &app_handle,
@@ -904,6 +1526,9 @@ impl TaskEngine {
                             target_x: Some(cue_x),
                             target_y: Some(cue_y),
                             verification_note: Some(reason.clone()),
+                            model: Some(used_actor_model.clone()),
+                            thought: (!item_decision.thought.is_empty())
+                                .then(|| item_decision.thought.clone()),
                         };
                         self.record_step(
                             &app_handle,
@@ -1018,6 +1643,9 @@ impl TaskEngine {
                                 target_x: Some(cue_x),
                                 target_y: Some(cue_y),
                                 verification_note: Some("Denied by user".to_string()),
+                                model: Some(used_actor_model.clone()),
+                                thought: (!item_decision.thought.is_empty())
+                                    .then(|| item_decision.thought.clone()),
                             };
                             self.record_step(
                                 &app_handle,
@@ -1074,6 +1702,9 @@ impl TaskEngine {
                                 target_x: Some(cue_x),
                                 target_y: Some(cue_y),
                                 verification_note: Some(msg.clone()),
+                                model: Some(used_actor_model.clone()),
+                                thought: (!item_decision.thought.is_empty())
+                                    .then(|| item_decision.thought.clone()),
                             };
                             self.record_step(
                                 &app_handle,
@@ -1121,6 +1752,9 @@ impl TaskEngine {
                     target_x: Some(cue_x),
                     target_y: Some(cue_y),
                     verification_note: err_text.clone().or_else(|| action_output_note.clone()),
+                    model: Some(used_actor_model.clone()),
+                    thought: (!item_decision.thought.is_empty())
+                        .then(|| item_decision.thought.clone()),
                 };
                 self.record_step(
                     &app_handle,
@@ -1259,6 +1893,138 @@ impl TaskEngine {
                 local_ver.note.clone(),
             );
 
+            let mut effective_stalled = local_ver.step_stalled;
+            let mut judge_needs_recovery = false;
+            let mut judge_recovery_hint: Option<String> = None;
+            let mut verification_summary = local_ver.note.clone();
+
+            if routing.enable_judge_verification && (local_ver.step_stalled || batch_repetition_warned) {
+                self.set_active_stage(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Verifying,
+                    "judge",
+                    &routing.judge_model,
+                    Some("Judge inspecting screen change...".to_string()),
+                );
+                let verify_ctx = VerifyStepContext {
+                    goal: goal.clone(),
+                    step_number: step_num,
+                    action_description: last_action_desc.clone(),
+                    expected_narration: verification_summary.clone(),
+                    before_app: before_cap.active_window.app_name.clone(),
+                    after_app: after_cap.active_window.app_name.clone(),
+                    before_title: before_cap.active_window.window_title.clone(),
+                    after_title: after_cap.active_window.window_title.clone(),
+                    visual_diff_pct,
+                    action_output: last_action_output_note.clone(),
+                    visible_targets: after_cap.target_map.formatted_lines.clone(),
+                    after_base64_jpeg: after_cap.annotated_jpeg.clone(),
+                };
+                let mut judge_ver_model = routing.judge_model.clone();
+                let judge_res = match self
+                    .client
+                    .verify_step_outcome(
+                        OLLAMA_BASE_URL,
+                        &cycle_api_key,
+                        &routing.judge_model,
+                        verify_ctx.clone(),
+                    )
+                    .await
+                {
+                    Ok(v) => Ok(v),
+                    Err(_) if routing.judge_model != routing.vision_actor_model => {
+                        judge_ver_model = routing.vision_actor_model.clone();
+                        self.client
+                            .verify_step_outcome(
+                                OLLAMA_BASE_URL,
+                                &cycle_api_key,
+                                &routing.vision_actor_model,
+                                verify_ctx,
+                            )
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+
+                if let Ok(ver) = judge_res {
+                    let trace_status = if ver.status == "succeeded" || ver.goal_achieved {
+                        "success"
+                    } else {
+                        "warning"
+                    };
+                    let trace_content = if ver.thinking.is_empty() {
+                        ver.observation.clone()
+                    } else {
+                        format!("{} — {}", ver.thinking, ver.observation)
+                    };
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "verify".to_string(),
+                            role: "judge".to_string(),
+                            model: judge_ver_model,
+                            title: format!("Judge check ({})", ver.status),
+                            content: trace_content,
+                            step_number: Some(step_num),
+                            status: trace_status.to_string(),
+                        },
+                    );
+                    verification_summary = ver.observation.clone();
+                    if ver.goal_achieved {
+                        self.update_last_step_verification(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            "verified",
+                            ver.observation.clone(),
+                        );
+                        self.finalize_task(
+                            &app_handle,
+                            &task_id,
+                            TaskPhase::Completed,
+                            "completed",
+                            ver.observation,
+                            None,
+                        );
+                        show_tray_popover(&app_handle, false);
+                        return;
+                    }
+                    if ver.status == "succeeded" {
+                        effective_stalled = false;
+                        self.update_last_step_verification(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            "verified",
+                            ver.observation,
+                        );
+                    } else if ver.status == "needs_recovery" || ver.status == "failed" {
+                        effective_stalled = true;
+                        judge_needs_recovery = ver.status == "needs_recovery";
+                        judge_recovery_hint = ver.recovery_hint;
+                        self.update_last_step_verification(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            "unverified_failed",
+                            ver.observation,
+                        );
+                    }
+                }
+                self.set_active_stage(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Running,
+                    actor_role,
+                    &actor_model,
+                    None,
+                );
+            }
+
             let out_suffix = match &last_action_output_note {
                 Some(note) => format!(" | {note}"),
                 None => String::new(),
@@ -1270,41 +2036,38 @@ impl TaskEngine {
                     before_cap.active_window.app_name,
                     after_cap.active_window.app_name,
                     after_cap.active_window.window_title,
-                    if local_ver.step_stalled { "stalled" } else { "ok" },
-                    local_ver.note
+                    if effective_stalled { "stalled" } else { "ok" },
+                    verification_summary
                 ),
             );
 
-            if local_ver.step_stalled {
+            if effective_stalled {
                 stalled_action_signatures.extend(turn_signatures);
             } else {
                 stalled_action_signatures.clear();
             }
 
-            consecutive_stalls = if local_ver.step_stalled || batch_repetition_warned {
+            consecutive_stalls = if effective_stalled || batch_repetition_warned {
                 consecutive_stalls + 1
             } else {
                 0
             };
 
-            if (consecutive_stalls >= 2 || batch_repetition_warned)
+            if (consecutive_stalls >= 2 || batch_repetition_warned || judge_needs_recovery)
                 && recovery_count < MAX_RECOVERY_PLANS
             {
                 if matches!(last_action, AgentAction::OpenUrl { .. }) {
                     last_opened_url = None;
                 }
 
-                {
-                    let mut st = self.state.lock();
-                    if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                        st.phase = TaskPhase::Recovering;
-                        st.last_narration =
-                            "Step stalled—building a quick recovery plan...".to_string();
-                    }
-                }
-                let rec_snap = self.snapshot();
-                update_tray_status_title(&app_handle, Some(&rec_snap));
-                let _ = app_handle.emit("engine-snapshot", &rec_snap);
+                self.set_active_stage(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Recovering,
+                    "recovery",
+                    &routing.recovery_model,
+                    Some("Step stalled—building a quick recovery plan...".to_string()),
+                );
 
                 let rec_cue = PointerCuePayload {
                     id: Uuid::new_v4().to_string(),
@@ -1322,26 +2085,44 @@ impl TaskEngine {
                 };
                 let _ = emit_pointer_cue(&app_handle, rec_cue);
 
-                if let Ok(rec_plan) = self
+                let rec_ctx = RecoveryContext {
+                    goal: goal.clone(),
+                    failed_action: last_action_desc.clone(),
+                    observation: verification_summary.clone(),
+                    recovery_hint: judge_recovery_hint.clone(),
+                    active_app: after_cap.active_window.app_name.clone(),
+                    window_title: after_cap.active_window.window_title.clone(),
+                    recent_steps: recent_steps.clone(),
+                    visible_targets: after_cap.target_map.formatted_lines.clone(),
+                    base64_jpeg: after_cap.annotated_jpeg.clone(),
+                };
+                let mut used_recovery_model = routing.recovery_model.clone();
+                let rec_res = match self
                     .client
                     .create_recovery_plan(
                         OLLAMA_BASE_URL,
                         &cycle_api_key,
-                        VISION_MODEL,
-                        RecoveryContext {
-                            goal: goal.clone(),
-                            failed_action: last_action_desc.clone(),
-                            observation: local_ver.note.clone(),
-                            recovery_hint: None,
-                            active_app: after_cap.active_window.app_name.clone(),
-                            window_title: after_cap.active_window.window_title.clone(),
-                            recent_steps: recent_steps.clone(),
-                            visible_targets: after_cap.target_map.formatted_lines.clone(),
-                            base64_jpeg: after_cap.annotated_jpeg.clone(),
-                        },
+                        &routing.recovery_model,
+                        rec_ctx.clone(),
                     )
                     .await
                 {
+                    Ok(r) => Ok(r),
+                    Err(_) if routing.recovery_model != routing.vision_actor_model => {
+                        used_recovery_model = routing.vision_actor_model.clone();
+                        self.client
+                            .create_recovery_plan(
+                                OLLAMA_BASE_URL,
+                                &cycle_api_key,
+                                &routing.vision_actor_model,
+                                rec_ctx,
+                            )
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+
+                if let Ok(rec_plan) = rec_res {
                     recovery_count += 1;
                     consecutive_stalls = 0;
                     plan_steps = rec_plan.recovery_steps.clone();
@@ -1353,9 +2134,40 @@ impl TaskEngine {
                             st.plan_steps = plan_steps.clone();
                             st.active_plan_index = 0;
                             st.phase = TaskPhase::Running;
+                            st.active_role = actor_role.to_string();
+                            st.active_model = actor_model.clone();
                             st.last_narration = format!("Recovery plan: {}", rec_plan.diagnosis);
                         }
                     }
+                    let rec_content = if rec_plan.thinking.is_empty() {
+                        format!(
+                            "{} -> {}",
+                            rec_plan.diagnosis,
+                            rec_plan.recovery_steps.join(" | ")
+                        )
+                    } else {
+                        format!(
+                            "{} — {} -> {}",
+                            rec_plan.thinking,
+                            rec_plan.diagnosis,
+                            rec_plan.recovery_steps.join(" | ")
+                        )
+                    };
+                    self.push_trace(
+                        &app_handle,
+                        &task_id,
+                        OrchestrationTraceEntry {
+                            id: Uuid::new_v4().to_string(),
+                            timestamp: Utc::now(),
+                            stage: "recover".to_string(),
+                            role: "recovery".to_string(),
+                            model: used_recovery_model.clone(),
+                            title: format!("Recovery #{recovery_count}"),
+                            content: rec_content,
+                            step_number: Some(step_num),
+                            status: "warning".to_string(),
+                        },
+                    );
                     let rec_record = TaskStepRecord {
                         step_number: step_num,
                         timestamp: Utc::now(),
@@ -1367,6 +2179,8 @@ impl TaskEngine {
                         target_x: None,
                         target_y: None,
                         verification_note: Some(rec_plan.recovery_steps.join(" -> ")),
+                        model: Some(used_recovery_model),
+                        thought: (!rec_plan.thinking.is_empty()).then(|| rec_plan.thinking),
                     };
                     self.record_step(
                         &app_handle,
@@ -1384,10 +2198,14 @@ impl TaskEngine {
                         ),
                     );
                 } else {
-                    let mut st = self.state.lock();
-                    if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
-                        st.phase = TaskPhase::Running;
-                    }
+                    self.set_active_stage(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Running,
+                        actor_role,
+                        &actor_model,
+                        None,
+                    );
                 }
             }
 
@@ -1403,6 +2221,56 @@ impl TaskEngine {
             None,
         );
         show_tray_popover(&app_handle, false);
+    }
+
+    fn set_active_stage(
+        &self,
+        app_handle: &AppHandle,
+        task_id: &str,
+        phase: TaskPhase,
+        role: &str,
+        model: &str,
+        narration: Option<String>,
+    ) {
+        {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() != Some(task_id) || !st.phase.is_active() {
+                return;
+            }
+            st.phase = phase;
+            st.active_role = role.to_string();
+            st.active_model = model.to_string();
+            if let Some(msg) = narration {
+                st.last_narration = msg;
+            }
+        }
+        let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+    }
+
+    fn push_trace(
+        &self,
+        app_handle: &AppHandle,
+        task_id: &str,
+        entry: OrchestrationTraceEntry,
+    ) {
+        {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() != Some(task_id) {
+                return;
+            }
+            if !entry.content.is_empty() {
+                st.current_thought = entry.content.clone();
+            }
+            st.traces.push(entry);
+            if st.traces.len() > MAX_TRACE_ENTRIES {
+                let overflow = st.traces.len() - MAX_TRACE_ENTRIES;
+                st.traces.drain(0..overflow);
+            }
+        }
+        let snap = self.snapshot();
+        let _ = app_handle.emit("engine-snapshot", &snap);
     }
 
     fn record_step(
@@ -1478,8 +2346,30 @@ impl TaskEngine {
                 st.phase = final_phase;
                 st.pending_confirmation = None;
                 st.last_summary = Some(summary.clone());
-                st.last_narration = summary;
+                st.last_narration = summary.clone();
                 st.last_error = error;
+                let trace_status = match final_phase {
+                    TaskPhase::Completed => "success",
+                    TaskPhase::Failed => "error",
+                    _ => "warning",
+                };
+                let active_model = st.active_model.clone();
+                let current_step = st.current_step;
+                st.traces.push(OrchestrationTraceEntry {
+                    id: Uuid::new_v4().to_string(),
+                    timestamp: Utc::now(),
+                    stage: "complete".to_string(),
+                    role: "system".to_string(),
+                    model: active_model,
+                    title: format!("Task {outcome}"),
+                    content: summary,
+                    step_number: Some(current_step),
+                    status: trace_status.to_string(),
+                });
+                if st.traces.len() > MAX_TRACE_ENTRIES {
+                    let overflow = st.traces.len() - MAX_TRACE_ENTRIES;
+                    st.traces.drain(0..overflow);
+                }
                 take_history_record_locked(&mut st, outcome)
             }
         };
@@ -1729,6 +2619,67 @@ async fn adaptive_post_action_settle(
     }
 }
 
+pub fn select_actor_for_classification(
+    classification: &TaskClassification,
+    routing: &ModelRoutingConfig,
+) -> (&'static str, String) {
+    if classification.category == "coding" || classification.recommended_role == "coding_actor" {
+        ("coding_actor", routing.coding_actor_model.clone())
+    } else if classification.category == "writing"
+        || classification.recommended_role == "writing_actor"
+    {
+        ("writing_actor", routing.writing_actor_model.clone())
+    } else {
+        ("vision_actor", routing.vision_actor_model.clone())
+    }
+}
+
+pub fn fallback_classification(goal: &str) -> TaskClassification {
+    let lower = goal.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has_any = |keywords: &[&str]| tokens.iter().any(|tok| keywords.contains(tok));
+    if has_any(&["code", "terminal", "vscode", "xcode", "git", "rust", "typescript", "debug", "ide"]) {
+        TaskClassification {
+            category: "coding".to_string(),
+            complexity: "moderate".to_string(),
+            recommended_role: "coding_actor".to_string(),
+            reasoning: "Local heuristic routed coding/terminal task to coding actor.".to_string(),
+            needs_dedicated_planner: true,
+            initial_plan_steps: Vec::new(),
+        }
+    } else if has_any(&["note", "notes", "email", "write", "draft", "document", "checklist", "mail"]) {
+        TaskClassification {
+            category: "writing".to_string(),
+            complexity: "moderate".to_string(),
+            recommended_role: "writing_actor".to_string(),
+            reasoning: "Local heuristic routed writing/notes task to writing actor.".to_string(),
+            needs_dedicated_planner: true,
+            initial_plan_steps: Vec::new(),
+        }
+    } else if has_any(&["safari", "chrome", "http", "https", "github", "search", "browser", "web"]) {
+        TaskClassification {
+            category: "browser_research".to_string(),
+            complexity: "moderate".to_string(),
+            recommended_role: "vision_actor".to_string(),
+            reasoning: "Local heuristic routed browser research task to vision actor.".to_string(),
+            needs_dedicated_planner: true,
+            initial_plan_steps: Vec::new(),
+        }
+    } else {
+        TaskClassification {
+            category: "general_ui".to_string(),
+            complexity: "simple".to_string(),
+            recommended_role: "vision_actor".to_string(),
+            reasoning: "Local heuristic routed UI task to vision actor.".to_string(),
+            needs_dedicated_planner: false,
+            initial_plan_steps: Vec::new(),
+        }
+    }
+}
+
 fn take_history_record_locked(
     st: &mut TaskRuntimeState,
     outcome: &str,
@@ -1748,6 +2699,8 @@ fn take_history_record_locked(
         summary: st.last_summary.clone().unwrap_or_default(),
         step_count: st.steps.len() as u32,
         steps: st.steps.clone(),
+        category: st.classification.as_ref().map(|c| c.category.clone()),
+        selected_model: (!st.active_model.is_empty()).then(|| st.active_model.clone()),
     })
 }
 
@@ -2583,5 +3536,32 @@ mod tests {
             "a".to_string(),
         ];
         assert!(detect_progressing_cycle_abort(&four_toggles, "b"));
+    }
+
+    #[test]
+    fn routes_classified_tasks_to_specialist_models_and_fallbacks() {
+        let routing = ModelRoutingConfig::default();
+
+        let coding_cls = fallback_classification("Open Terminal and run git status");
+        assert_eq!(coding_cls.category, "coding");
+        let (role_code, model_code) = select_actor_for_classification(&coding_cls, &routing);
+        assert_eq!(role_code, "coding_actor");
+        assert_eq!(model_code, routing.coding_actor_model);
+
+        let writing_cls = fallback_classification("Open Notes and write a sprint checklist");
+        assert_eq!(writing_cls.category, "writing");
+        let (role_write, model_write) = select_actor_for_classification(&writing_cls, &routing);
+        assert_eq!(role_write, "writing_actor");
+        assert_eq!(model_write, routing.writing_actor_model);
+
+        let browser_cls = fallback_classification("Open Safari to github.com/trending");
+        assert_eq!(browser_cls.category, "browser_research");
+        let (role_vis, model_vis) = select_actor_for_classification(&browser_cls, &routing);
+        assert_eq!(role_vis, "vision_actor");
+        assert_eq!(model_vis, routing.vision_actor_model);
+
+        let general_cls = fallback_classification("Open Calculator and compute 42 * 18");
+        assert_eq!(general_cls.category, "general_ui");
+        assert!(!general_cls.needs_dedicated_planner);
     }
 }

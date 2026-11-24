@@ -13,11 +13,12 @@ use crate::config::{
 };
 use crate::engine::{EngineSnapshot, TaskEngine};
 use crate::overlay::{
-    hide_tray_popover, initialize_windows_and_tray, show_tray_popover, trigger_mock_pointer_cue,
-    PointerCuePayload,
+    hide_orchestration_panel, hide_tray_popover, initialize_windows_and_tray,
+    set_orchestration_panel_collapsed, show_orchestration_panel, show_tray_popover,
+    toggle_orchestration_panel, trigger_mock_pointer_cue, PointerCuePayload,
 };
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command]
 async fn get_engine_snapshot(engine: State<'_, Arc<TaskEngine>>) -> Result<EngineSnapshot, String> {
@@ -123,6 +124,45 @@ async fn hide_tray_window(app_handle: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn show_orchestration_panel_window(app_handle: AppHandle) -> Result<(), String> {
+    show_orchestration_panel(&app_handle);
+    Ok(())
+}
+
+#[tauri::command]
+async fn hide_orchestration_panel_window(app_handle: AppHandle) -> Result<(), String> {
+    hide_orchestration_panel(&app_handle);
+    Ok(())
+}
+
+#[tauri::command]
+async fn toggle_orchestration_panel_window(app_handle: AppHandle) -> Result<(), String> {
+    toggle_orchestration_panel(&app_handle);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_orchestration_panel_collapsed_state(
+    app_handle: AppHandle,
+    collapsed: bool,
+) -> Result<(), String> {
+    set_orchestration_panel_collapsed(&app_handle, collapsed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn broadcast_theme_mode(app_handle: AppHandle, theme: String) -> Result<(), String> {
+    let normalized = match theme.trim().to_ascii_lowercase().as_str() {
+        "light" => "light",
+        "dark" => "dark",
+        _ => return Err("theme must be 'light' or 'dark'".to_string()),
+    };
+    app_handle
+        .emit("theme-changed", normalized)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let initial_config = load_config().unwrap_or_default();
@@ -166,6 +206,11 @@ pub fn run() {
             request_accessibility_permission,
             fire_test_pointer,
             hide_tray_window,
+            show_orchestration_panel_window,
+            hide_orchestration_panel_window,
+            toggle_orchestration_panel_window,
+            set_orchestration_panel_collapsed_state,
+            broadcast_theme_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Task Companion");

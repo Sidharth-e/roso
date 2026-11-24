@@ -17,7 +17,9 @@ import {
   type EngineSnapshot,
   type PointerCuePayload,
   type TaskHistoryRecord,
+  type ThemeMode,
 } from "./types";
+import { useTaskUiStore } from "./store";
 
 export function createOllamaAxiosInstance(
   baseURL: string,
@@ -141,6 +143,37 @@ export function useEngineEventSync() {
   }, [queryClient]);
 }
 
+export function useThemeEventSync() {
+  useEffect(() => {
+    let active = true;
+    let unlistenFn: (() => void) | null = null;
+
+    listen<unknown>("theme-changed", (event) => {
+      if (!active) {
+        return;
+      }
+      if (event.payload === "light" || event.payload === "dark") {
+        useTaskUiStore.getState().setTheme(event.payload);
+      }
+    })
+      .then((unlisten) => {
+        if (active) {
+          unlistenFn = unlisten;
+        } else {
+          unlisten();
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+      if (unlistenFn) {
+        unlistenFn();
+      }
+    };
+  }, []);
+}
+
 export function useTaskMutations() {
   const queryClient = useQueryClient();
 
@@ -242,6 +275,38 @@ export function useTaskMutations() {
     },
   });
 
+  const showPanel = useMutation({
+    mutationFn: async (): Promise<void> => {
+      await invoke<unknown>("show_orchestration_panel_window");
+    },
+  });
+
+  const hidePanel = useMutation({
+    mutationFn: async (): Promise<void> => {
+      await invoke<unknown>("hide_orchestration_panel_window");
+    },
+  });
+
+  const togglePanel = useMutation({
+    mutationFn: async (): Promise<void> => {
+      await invoke<unknown>("toggle_orchestration_panel_window");
+    },
+  });
+
+  const setPanelCollapsed = useMutation({
+    mutationFn: async (collapsed: boolean): Promise<void> => {
+      await invoke<unknown>("set_orchestration_panel_collapsed_state", {
+        collapsed,
+      });
+    },
+  });
+
+  const broadcastTheme = useMutation({
+    mutationFn: async (theme: ThemeMode): Promise<void> => {
+      await invoke<unknown>("broadcast_theme_mode", { theme });
+    },
+  });
+
   return {
     startTask,
     pauseTask,
@@ -253,5 +318,10 @@ export function useTaskMutations() {
     requestAccessibilityPermission,
     testPointer,
     hidePopover,
+    showPanel,
+    hidePanel,
+    togglePanel,
+    setPanelCollapsed,
+    broadcastTheme,
   };
 }

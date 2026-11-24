@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { FloatingOrchestrationHud } from "./components/OrchestrationPanel";
 import { PointerOverlay } from "./components/PointerOverlay";
 import { TrayControl } from "./components/TrayControl";
 import { useTaskUiStore } from "./store";
@@ -14,26 +15,30 @@ const queryClient = new QueryClient({
   },
 });
 
-function detectOverlayView(): boolean {
+type AppView = "tray" | "overlay" | "panel";
+
+function detectAppView(): AppView {
   if (typeof window !== "undefined") {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("view") === "overlay") {
-      return true;
-    }
-    if (params.get("view") === "tray") {
-      return false;
+    const paramView = params.get("view");
+    if (paramView === "overlay" || paramView === "panel" || paramView === "tray") {
+      return paramView;
     }
   }
   try {
-    return getCurrentWindow().label === "overlay";
+    const label = getCurrentWindow().label;
+    if (label === "overlay" || label === "panel") {
+      return label;
+    }
+    return "tray";
   } catch {
-    return false;
+    return "tray";
   }
 }
 
 export function App() {
   const theme = useTaskUiStore((s) => s.theme);
-  const isOverlay = useMemo(() => detectOverlayView(), []);
+  const view = useMemo(() => detectAppView(), []);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -46,7 +51,13 @@ export function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      {isOverlay ? <PointerOverlay /> : <TrayControl />}
+      {view === "overlay" ? (
+        <PointerOverlay />
+      ) : view === "panel" ? (
+        <FloatingOrchestrationHud />
+      ) : (
+        <TrayControl />
+      )}
     </QueryClientProvider>
   );
 }

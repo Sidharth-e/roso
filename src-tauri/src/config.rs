@@ -5,10 +5,110 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub const OLLAMA_BASE_URL: &str = "https://ollama.com";
-pub const VISION_MODEL: &str = "deepseek-v4.1-flash:cloud";
+pub const DEFAULT_JUDGE_MODEL: &str = "gemma4:31b-cloud";
+pub const DEFAULT_PLANNER_MODEL: &str = "kimi-k3.1-pro:cloud";
+pub const DEFAULT_VISION_ACTOR_MODEL: &str = "deepseek-v4.1-flash:cloud";
+pub const DEFAULT_CODING_ACTOR_MODEL: &str = "qwen3-vl:235b-cloud";
+pub const DEFAULT_WRITING_ACTOR_MODEL: &str = "kimi-k3.1-pro:cloud";
+pub const DEFAULT_RECOVERY_MODEL: &str = "qwen3-vl:235b-cloud";
+pub const VISION_MODEL: &str = DEFAULT_VISION_ACTOR_MODEL;
 pub const MAX_STEPS: u32 = 20;
 pub const STEP_DELAY_MS: u64 = 250;
 pub const CONFIRM_RISKY_ACTIONS: bool = true;
+
+fn default_judge_model() -> String {
+    DEFAULT_JUDGE_MODEL.to_string()
+}
+
+fn default_planner_model() -> String {
+    DEFAULT_PLANNER_MODEL.to_string()
+}
+
+fn default_vision_actor_model() -> String {
+    DEFAULT_VISION_ACTOR_MODEL.to_string()
+}
+
+fn default_coding_actor_model() -> String {
+    DEFAULT_CODING_ACTOR_MODEL.to_string()
+}
+
+fn default_writing_actor_model() -> String {
+    DEFAULT_WRITING_ACTOR_MODEL.to_string()
+}
+
+fn default_recovery_model() -> String {
+    DEFAULT_RECOVERY_MODEL.to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn sanitize_model_name(raw: &str, fallback: &str) -> String {
+    let cleaned = raw
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .take(120)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoutingConfig {
+    #[serde(default = "default_judge_model")]
+    pub judge_model: String,
+    #[serde(default = "default_planner_model")]
+    pub planner_model: String,
+    #[serde(default = "default_vision_actor_model")]
+    pub vision_actor_model: String,
+    #[serde(default = "default_coding_actor_model")]
+    pub coding_actor_model: String,
+    #[serde(default = "default_writing_actor_model")]
+    pub writing_actor_model: String,
+    #[serde(default = "default_recovery_model")]
+    pub recovery_model: String,
+    #[serde(default = "default_true")]
+    pub enable_judge_verification: bool,
+    #[serde(default = "default_true")]
+    pub auto_open_panel: bool,
+}
+
+impl Default for ModelRoutingConfig {
+    fn default() -> Self {
+        Self {
+            judge_model: default_judge_model(),
+            planner_model: default_planner_model(),
+            vision_actor_model: default_vision_actor_model(),
+            coding_actor_model: default_coding_actor_model(),
+            writing_actor_model: default_writing_actor_model(),
+            recovery_model: default_recovery_model(),
+            enable_judge_verification: true,
+            auto_open_panel: true,
+        }
+    }
+}
+
+impl ModelRoutingConfig {
+    pub fn sanitized(mut self) -> Self {
+        self.judge_model = sanitize_model_name(&self.judge_model, DEFAULT_JUDGE_MODEL);
+        self.planner_model = sanitize_model_name(&self.planner_model, DEFAULT_PLANNER_MODEL);
+        self.vision_actor_model =
+            sanitize_model_name(&self.vision_actor_model, DEFAULT_VISION_ACTOR_MODEL);
+        self.coding_actor_model =
+            sanitize_model_name(&self.coding_actor_model, DEFAULT_CODING_ACTOR_MODEL);
+        self.writing_actor_model =
+            sanitize_model_name(&self.writing_actor_model, DEFAULT_WRITING_ACTOR_MODEL);
+        self.recovery_model = sanitize_model_name(&self.recovery_model, DEFAULT_RECOVERY_MODEL);
+        self
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -27,6 +127,8 @@ pub enum ConfigError {
 pub struct AppConfig {
     #[serde(default)]
     pub ollama_api_key: String,
+    #[serde(default)]
+    pub models: ModelRoutingConfig,
 }
 
 impl AppConfig {
@@ -49,6 +151,7 @@ impl AppConfig {
             .collect::<String>()
             .trim()
             .to_string();
+        self.models = self.models.sanitized();
         Ok(self)
     }
 }
@@ -67,6 +170,10 @@ pub struct TaskStepRecord {
     pub target_y: Option<f64>,
     #[serde(default)]
     pub verification_note: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub thought: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +187,10 @@ pub struct TaskHistoryRecord {
     pub summary: String,
     pub step_count: u32,
     pub steps: Vec<TaskStepRecord>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub selected_model: Option<String>,
 }
 
 pub fn app_support_dir() -> Result<PathBuf, ConfigError> {
@@ -187,9 +298,31 @@ mod tests {
 
         let cfg = AppConfig {
             ollama_api_key: "  sk-test\n\t123  ".to_string(),
+            models: ModelRoutingConfig {
+                judge_model: "  \n".to_string(),
+                planner_model: "kimi-k3:cloud\t".to_string(),
+                ..ModelRoutingConfig::default()
+            },
         };
         let sanitized = cfg.sanitized().unwrap();
         assert_eq!(sanitized.ollama_api_key, "sk-test123");
+        assert_eq!(sanitized.models.judge_model, DEFAULT_JUDGE_MODEL);
+        assert_eq!(sanitized.models.planner_model, "kimi-k3:cloud");
+        assert_eq!(
+            sanitized.models.vision_actor_model,
+            DEFAULT_VISION_ACTOR_MODEL
+        );
+        assert_eq!(
+            sanitized.models.coding_actor_model,
+            DEFAULT_CODING_ACTOR_MODEL
+        );
+        assert_eq!(
+            sanitized.models.writing_actor_model,
+            DEFAULT_WRITING_ACTOR_MODEL
+        );
+        assert_eq!(sanitized.models.recovery_model, DEFAULT_RECOVERY_MODEL);
+        assert!(sanitized.models.enable_judge_verification);
+        assert!(sanitized.models.auto_open_panel);
 
         let legacy_json = r#"{
             "ollamaBaseUrl": "https://ollama.com",
@@ -201,6 +334,7 @@ mod tests {
         }"#;
         let parsed_legacy: AppConfig = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(parsed_legacy.ollama_api_key, "legacy-key");
+        assert_eq!(parsed_legacy.models, ModelRoutingConfig::default());
 
         assert_eq!(OLLAMA_BASE_URL, "https://ollama.com");
         assert_eq!(VISION_MODEL, "deepseek-v4.1-flash:cloud");
