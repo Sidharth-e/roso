@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PointerOverlay } from "./components/PointerOverlay";
 import { TrayControl } from "./components/TrayControl";
-import { useFocusUiStore } from "./store";
+import { useTaskUiStore } from "./store";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -32,7 +32,7 @@ function detectOverlayView(): boolean {
 }
 
 export function App() {
-  const theme = useFocusUiStore((s) => s.theme);
+  const theme = useTaskUiStore((s) => s.theme);
   const isOverlay = useMemo(() => detectOverlayView(), []);
 
   useEffect(() => {

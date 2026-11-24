@@ -1,5 +1,5 @@
 use crate::capture::primary_screen_metrics;
-use crate::engine::{EngineSnapshot, SessionPhase};
+use crate::engine::{EngineSnapshot, TaskPhase};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -13,21 +13,23 @@ use uuid::Uuid;
 #[cfg(target_os = "macos")]
 use std::cell::Cell;
 
-pub const TRAY_ID: &str = "focus-companion-tray";
+pub const TRAY_ID: &str = "task-companion-tray";
 pub const TRAY_WINDOW_LABEL: &str = "main";
 pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
-const POPOVER_WIDTH: f64 = 388.0;
-const POPOVER_HEIGHT: f64 = 600.0;
+const POPOVER_WIDTH: f64 = 400.0;
+const POPOVER_HEIGHT: f64 = 620.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NudgeEventPayload {
+pub struct PointerCuePayload {
     pub id: String,
-    pub nudge_text: String,
+    pub message: String,
+    pub action_badge: String,
     pub target_x: f64,
     pub target_y: f64,
     pub target_ocr_id: Option<u32>,
-    pub active_app: String,
+    pub step_number: u32,
+    pub is_acting: bool,
     pub dismiss_after_ms: u64,
 }
 
@@ -253,36 +255,40 @@ mod macos_panel {
     }
 }
 
-pub fn initialize_windows_and_tray<F>(
+pub fn initialize_windows_and_tray<F, S>(
     app_handle: &AppHandle,
-    on_test_nudge: F,
+    on_test_pointer: F,
+    on_stop_task: S,
 ) -> tauri::Result<()>
 where
     F: Fn(&AppHandle) + Send + Sync + 'static,
+    S: Fn(&AppHandle) + Send + Sync + 'static,
 {
     ensure_windows_created(app_handle)?;
     configure_overlay_window(app_handle);
 
     let toggle_item =
-        MenuItemBuilder::with_id("toggle_popover", "Toggle Focus Companion").build(app_handle)?;
-    let test_nudge_item =
-        MenuItemBuilder::with_id("test_nudge", "Test Nudge").build(app_handle)?;
+        MenuItemBuilder::with_id("toggle_popover", "Toggle Task Companion").build(app_handle)?;
+    let stop_item =
+        MenuItemBuilder::with_id("stop_task", "Stop Active Task (⌃⌥S)").build(app_handle)?;
+    let test_pointer_item =
+        MenuItemBuilder::with_id("test_pointer", "Test Pointer Overlay").build(app_handle)?;
     let quit_item =
-        MenuItemBuilder::with_id("quit_app", "Quit Focus Companion").build(app_handle)?;
+        MenuItemBuilder::with_id("quit_app", "Quit Task Companion").build(app_handle)?;
 
     let tray_menu = MenuBuilder::new(app_handle)
-        .items(&[&toggle_item, &test_nudge_item, &quit_item])
+        .items(&[&toggle_item, &stop_item, &test_pointer_item, &quit_item])
         .build()?;
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&tray_menu)
-        .tooltip("Focus Companion — Click to toggle over any app or full-screen Space")
+        .tooltip("Task Companion — Click to open task orchestrator")
         .show_menu_on_left_click(false);
 
     if let Some(default_icon) = app_handle.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(default_icon).icon_as_template(true);
     } else {
-        tray_builder = tray_builder.title("Focus");
+        tray_builder = tray_builder.title("Task");
     }
 
     tray_builder
@@ -290,8 +296,11 @@ where
             "toggle_popover" => {
                 toggle_tray_popover(handle, false);
             }
-            "test_nudge" => {
-                on_test_nudge(handle);
+            "stop_task" => {
+                on_stop_task(handle);
+            }
+            "test_pointer" => {
+                on_test_pointer(handle);
             }
             "quit_app" => {
                 handle.exit(0);
@@ -322,7 +331,7 @@ fn ensure_windows_created(app_handle: &AppHandle) -> tauri::Result<()> {
             OVERLAY_WINDOW_LABEL,
             WebviewUrl::App("index.html?view=overlay".into()),
         )
-        .title("Focus Companion Overlay")
+        .title("Task Companion Overlay")
         .inner_size(1440.0, 900.0)
         .position(0.0, 0.0)
         .resizable(false)
@@ -344,7 +353,7 @@ fn ensure_windows_created(app_handle: &AppHandle) -> tauri::Result<()> {
             TRAY_WINDOW_LABEL,
             WebviewUrl::App("index.html?view=tray".into()),
         )
-        .title("Focus Companion")
+        .title("Task Companion")
         .inner_size(POPOVER_WIDTH, POPOVER_HEIGHT)
         .resizable(false)
         .decorations(false)
@@ -462,18 +471,18 @@ pub fn toggle_tray_popover(app_handle: &AppHandle, align_to_cursor: bool) {
     });
 }
 
-pub fn emit_nudge_event(
+pub fn emit_pointer_cue(
     app_handle: &AppHandle,
-    payload: NudgeEventPayload,
+    payload: PointerCuePayload,
 ) -> tauri::Result<()> {
     configure_overlay_window(app_handle);
-    app_handle.emit("nudge-event", payload)
+    app_handle.emit("pointer-cue", payload)
 }
 
-pub fn trigger_mock_nudge(
+pub fn trigger_mock_pointer_cue(
     app_handle: &AppHandle,
-    declared_task: &str,
-) -> tauri::Result<NudgeEventPayload> {
+    goal: &str,
+) -> tauri::Result<PointerCuePayload> {
     let (screen_w, screen_h) = app_handle
         .get_webview_window(OVERLAY_WINDOW_LABEL)
         .and_then(|w| w.current_monitor().ok().flatten())
@@ -491,46 +500,41 @@ pub fn trigger_mock_nudge(
         })
         .unwrap_or((1440.0, 900.0));
 
-    let clean_task = if declared_task.trim().is_empty() {
-        "shipping your deep-work milestone"
+    let clean_goal = if goal.trim().is_empty() {
+        "your next macOS task"
     } else {
-        declared_task.trim()
+        goal.trim()
     };
 
-    let payload = NudgeEventPayload {
+    let payload = PointerCuePayload {
         id: Uuid::new_v4().to_string(),
-        nudge_text: format!(
-            "Hey! That tab looks tempting—ready to jump back into {clean_task}?"
-        ),
+        message: format!("Ready to glide here and tackle: {clean_goal}"),
+        action_badge: "Preview".to_string(),
         target_x: (screen_w * 0.56).clamp(120.0, screen_w - 160.0),
         target_y: (screen_h * 0.36).clamp(100.0, screen_h - 140.0),
         target_ocr_id: Some(1),
-        active_app: "Test Preview".to_string(),
-        dismiss_after_ms: 4800,
+        step_number: 1,
+        is_acting: true,
+        dismiss_after_ms: 4200,
     };
 
-    emit_nudge_event(app_handle, payload.clone())?;
+    emit_pointer_cue(app_handle, payload.clone())?;
     Ok(payload)
 }
 
-pub fn update_tray_timer_title(app_handle: &AppHandle, snapshot: Option<&EngineSnapshot>) {
+pub fn update_tray_status_title(app_handle: &AppHandle, snapshot: Option<&EngineSnapshot>) {
     let Some(tray) = app_handle.tray_by_id(TRAY_ID) else {
         return;
     };
     let title = match snapshot {
-        Some(s) if s.phase != SessionPhase::Idle => {
-            let total_secs = s.remaining_focus_seconds.ceil().max(0.0) as u64;
-            let mins = total_secs / 60;
-            let secs = total_secs % 60;
-            if s.phase == SessionPhase::Paused {
-                Some(format!("⏸ {mins:02}:{secs:02}"))
-            } else if s.developer_mode {
-                Some(format!("⚡ {mins:02}:{secs:02}"))
-            } else {
-                Some(format!("{mins:02}:{secs:02}"))
-            }
-        }
-        _ => Some(String::new()),
+        Some(s) => match s.phase {
+            TaskPhase::Planning => Some("Planning...".to_string()),
+            TaskPhase::Running => Some(format!("Step {}/{}", s.current_step, s.max_steps)),
+            TaskPhase::AwaitingConfirmation => Some("Approve?".to_string()),
+            TaskPhase::Paused => Some("Paused".to_string()),
+            _ => Some(String::new()),
+        },
+        None => Some(String::new()),
     };
     let _ = tray.set_title(title.as_deref());
 }

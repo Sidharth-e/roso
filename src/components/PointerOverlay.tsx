@@ -2,12 +2,12 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AnimatePresence, motion } from "framer-motion";
-import { NudgeEventPayloadSchema } from "../types";
-import { useFocusUiStore } from "../store";
+import { PointerCuePayloadSchema } from "../types";
+import { useTaskUiStore } from "../store";
 
 export function PointerOverlay() {
-  const activeNudge = useFocusUiStore((s) => s.activeNudge);
-  const setActiveNudge = useFocusUiStore((s) => s.setActiveNudge);
+  const activeCue = useTaskUiStore((s) => s.activeCue);
+  const setActiveCue = useTaskUiStore((s) => s.setActiveCue);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -17,22 +17,22 @@ export function PointerOverlay() {
     let dismissTimer: ReturnType<typeof setTimeout> | null = null;
     let unlistenFn: (() => void) | null = null;
 
-    listen<unknown>("nudge-event", (event) => {
+    listen<unknown>("pointer-cue", (event) => {
       if (!mounted) {
         return;
       }
       void win.setIgnoreCursorEvents(true).catch(() => undefined);
-      const parsed = NudgeEventPayloadSchema.safeParse(event.payload);
+      const parsed = PointerCuePayloadSchema.safeParse(event.payload);
       if (!parsed.success) {
         return;
       }
       if (dismissTimer !== null) {
         clearTimeout(dismissTimer);
       }
-      setActiveNudge(parsed.data);
+      setActiveCue(parsed.data);
       dismissTimer = setTimeout(() => {
         if (mounted) {
-          setActiveNudge(null);
+          setActiveCue(null);
         }
       }, parsed.data.dismissAfterMs);
     })
@@ -54,35 +54,47 @@ export function PointerOverlay() {
         unlistenFn();
       }
     };
-  }, [setActiveNudge]);
+  }, [setActiveCue]);
 
   const flipBubbleLeft =
-    activeNudge !== null &&
+    activeCue !== null &&
     typeof window !== "undefined" &&
-    activeNudge.targetX > window.innerWidth - 340;
+    activeCue.targetX > window.innerWidth - 340;
+
+  const flipBubbleUp =
+    activeCue !== null &&
+    typeof window !== "undefined" &&
+    activeCue.targetY > window.innerHeight - 160;
+
+  const bubbleOffsetClass = [
+    flipBubbleLeft ? "-translate-x-full -ml-10" : "",
+    flipBubbleUp ? "-translate-y-full -mt-2" : "mt-3",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <main aria-live="polite" className="overlay-canvas">
       <AnimatePresence mode="wait">
-        {activeNudge ? (
+        {activeCue ? (
           <motion.div
-            key={activeNudge.id}
+            key={activeCue.id}
             initial={{ x: -120, y: -120, opacity: 0, scale: 0.78 }}
             animate={{
-              x: activeNudge.targetX,
-              y: activeNudge.targetY,
+              x: activeCue.targetX,
+              y: activeCue.targetY,
               opacity: 1,
               scale: 1,
             }}
             exit={{
-              x: activeNudge.targetX + 64,
+              x: activeCue.targetX + 64,
               y: -140,
               opacity: 0,
               scale: 0.82,
             }}
             transition={{
               type: "spring",
-              stiffness: 210,
+              stiffness: 220,
               damping: 22,
               mass: 0.85,
             }}
@@ -92,13 +104,15 @@ export function PointerOverlay() {
               <motion.div
                 animate={{ scale: [1, 1.08, 1], rotate: [0, -6, 0] }}
                 transition={{
-                  duration: 1.6,
-                  repeat: 2,
+                  duration: 1.4,
+                  repeat: activeCue.isActing ? Infinity : 1,
                   ease: "easeInOut",
                 }}
                 className="relative"
               >
-                <span className="absolute -left-2 -top-2 h-8 w-8 rounded-full bg-primary/25 animate-ping" />
+                {activeCue.isActing ? (
+                  <span className="absolute -left-2 -top-2 h-8 w-8 rounded-full bg-primary/30 animate-ping" />
+                ) : null}
                 <svg
                   width="34"
                   height="34"
@@ -123,24 +137,22 @@ export function PointerOverlay() {
                   type: "spring",
                   stiffness: 280,
                   damping: 24,
-                  delay: 0.12,
+                  delay: 0.1,
                 }}
-                className={`speech-bubble ${
-                  flipBubbleLeft ? "-translate-x-full -ml-10" : "mt-3"
-                }`}
+                className={`speech-bubble ${bubbleOffsetClass}`}
               >
                 <div className="mb-1 flex items-center justify-between gap-2">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
-                    Focus Companion
+                    {activeCue.actionBadge} · Step #{activeCue.stepNumber}
                   </span>
-                  {activeNudge.targetOcrId !== null ? (
+                  {activeCue.targetOcrId !== null ? (
                     <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                      OCR #{activeNudge.targetOcrId}
+                      OCR #{activeCue.targetOcrId}
                     </span>
                   ) : null}
                 </div>
                 <p className="text-xs font-medium text-foreground">
-                  {activeNudge.nudgeText}
+                  {activeCue.message}
                 </p>
               </motion.div>
             </div>

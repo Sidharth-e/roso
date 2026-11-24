@@ -1,263 +1,142 @@
-use crate::capture::{capture_primary_display_in_ram, has_screen_recording_permission};
+use crate::automation::{
+    action_type_label, assess_action_risk, describe_action, execute_action,
+    has_accessibility_permission, is_kill_switch_pressed, AgentAction, MouseButtonKind,
+};
+use crate::capture::{
+    capture_primary_display_in_ram, has_screen_recording_permission, ScreenMetrics,
+};
 use crate::classifier::{
-    ActivityChoice, ClassificationOutcome, ClassifierError, OllamaCloudClient, SystemOneState,
-    MAX_CLASSIFICATION_LATENCY,
+    AgentError, NextActionContext, OllamaAgentClient, PlannedActionDecision,
 };
 use crate::config::{
-    append_history_record, AppConfig, ProbabilityLogEntry, SessionHistoryRecord,
+    append_history_record, AppConfig, TaskHistoryRecord, TaskStepRecord,
 };
-use crate::ocr::{extract_ocr_from_rgba, vision_bbox_to_screen_rect};
-use crate::overlay::{emit_nudge_event, update_tray_timer_title, NudgeEventPayload};
+use crate::ocr::{extract_ocr_from_rgba, vision_bbox_to_screen_rect, OcrExtractionResult};
+use crate::overlay::{
+    emit_pointer_cue, hide_tray_popover, show_tray_popover, update_tray_status_title,
+    PointerCuePayload,
+};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
-
-pub const NORMAL_CHECK_INTERVAL_SECS: u64 = 30;
-pub const DEV_CHECK_INTERVAL_SECS: u64 = 10;
-pub const DEV_CLOCK_MULTIPLIER: f64 = 4.0;
-pub const NORMAL_COOLDOWN_REAL_SECS: f64 = 120.0;
-pub const DEV_COOLDOWN_REAL_SECS: f64 = 30.0;
-const MAX_TIMELINE_POINTS: usize = 120;
-const MAX_SESSION_TICKS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionPhase {
+pub enum TaskPhase {
     Idle,
+    Planning,
     Running,
+    AwaitingConfirmation,
     Paused,
+    Completed,
+    Failed,
+    Stopped,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl TaskPhase {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Planning | Self::Running | Self::AwaitingConfirmation | Self::Paused
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct TimelineSegment {
-    pub timestamp: DateTime<Utc>,
-    pub status: String,
-    pub prob_off_task: f64,
-    pub confidence: f64,
+pub struct PendingConfirmation {
+    pub id: String,
+    pub step_number: u32,
+    pub action_type: String,
+    pub description: String,
+    pub narration: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSnapshot {
-    pub phase: SessionPhase,
-    pub session_id: Option<String>,
-    pub declared_task: String,
-    pub duration_minutes: u32,
-    pub remaining_focus_seconds: f64,
-    pub elapsed_focus_seconds: f64,
-    pub developer_mode: bool,
-    pub evidence_focus_seconds: f64,
-    pub required_evidence_focus_seconds: f64,
-    pub cooldown_remaining_real_seconds: f64,
-    pub last_choice: String,
-    pub last_prob_off_task: f64,
-    pub last_confidence: f64,
+    pub phase: TaskPhase,
+    pub task_id: Option<String>,
+    pub goal: String,
+    pub plan_steps: Vec<String>,
+    pub active_plan_index: u32,
+    pub current_step: u32,
+    pub max_steps: u32,
     pub active_app: String,
-    pub check_count: u32,
-    pub nudge_count: u32,
-    pub screen_permission_granted: bool,
+    pub last_narration: String,
+    pub last_summary: Option<String>,
     pub last_error: Option<String>,
-    pub timeline: Vec<TimelineSegment>,
+    pub pending_confirmation: Option<PendingConfirmation>,
+    pub screen_permission_granted: bool,
+    pub accessibility_permission_granted: bool,
+    pub steps: Vec<TaskStepRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ObservationDecision {
-    ResetEvidence,
-    InCooldown,
-    Accumulated {
-        evidence_focus_seconds: f64,
-        required_focus_seconds: f64,
-    },
-    TriggerNudge {
-        evidence_focus_seconds: f64,
-        required_focus_seconds: f64,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct EvidenceStateMachine {
-    pub developer_mode: bool,
-    pub evidence_focus_seconds: f64,
-    pub cooldown_remaining_real_seconds: f64,
-    pub last_required_focus_seconds: f64,
-}
-
-impl EvidenceStateMachine {
-    pub fn new(developer_mode: bool) -> Self {
-        let initial_req = required_off_task_span(0.95, developer_mode);
-        Self {
-            developer_mode,
-            evidence_focus_seconds: 0.0,
-            cooldown_remaining_real_seconds: 0.0,
-            last_required_focus_seconds: initial_req,
-        }
-    }
-
-    pub fn set_developer_mode(&mut self, developer_mode: bool) {
-        if self.developer_mode != developer_mode {
-            self.developer_mode = developer_mode;
-            self.reset_evidence();
-            if self.cooldown_remaining_real_seconds > cooldown_duration_real_secs(developer_mode) {
-                self.cooldown_remaining_real_seconds = cooldown_duration_real_secs(developer_mode);
-            }
-        }
-    }
-
-    pub fn reset_evidence(&mut self) {
-        self.evidence_focus_seconds = 0.0;
-    }
-
-    pub fn advance_cooldown(&mut self, real_delta_secs: f64) {
-        if real_delta_secs > 0.0 {
-            self.cooldown_remaining_real_seconds =
-                (self.cooldown_remaining_real_seconds - real_delta_secs).max(0.0);
-        }
-    }
-
-    pub fn on_pause_or_system_sleep(&mut self) {
-        self.reset_evidence();
-    }
-
-    pub fn record_observation(
-        &mut self,
-        outcome: Result<&ClassificationOutcome, &ClassifierError>,
-        observation_real_secs: f64,
-        is_paused_or_locked: bool,
-    ) -> ObservationDecision {
-        if is_paused_or_locked {
-            self.reset_evidence();
-            return ObservationDecision::ResetEvidence;
-        }
-
-        let expected_interval = check_interval_real_secs(self.developer_mode) as f64;
-        if observation_real_secs > expected_interval * 2.5 {
-            self.reset_evidence();
-            return ObservationDecision::ResetEvidence;
-        }
-
-        let outcome = match outcome {
-            Ok(val) => val,
-            Err(_) => {
-                self.reset_evidence();
-                return ObservationDecision::ResetEvidence;
-            }
-        };
-
-        if outcome.latency > MAX_CLASSIFICATION_LATENCY {
-            self.reset_evidence();
-            return ObservationDecision::ResetEvidence;
-        }
-
-        if self.cooldown_remaining_real_seconds > 0.0 {
-            self.reset_evidence();
-            return ObservationDecision::InCooldown;
-        }
-
-        if outcome.choice != ActivityChoice::OffTask || outcome.prob_off_task < 0.50 {
-            self.reset_evidence();
-            return ObservationDecision::ResetEvidence;
-        }
-
-        let focus_delta = real_to_focus_seconds(observation_real_secs, self.developer_mode);
-        self.evidence_focus_seconds += focus_delta;
-
-        let required = required_off_task_span(outcome.prob_off_task, self.developer_mode);
-        self.last_required_focus_seconds = required;
-
-        if self.evidence_focus_seconds + 1e-6 >= required {
-            let triggered_evidence = self.evidence_focus_seconds;
-            self.evidence_focus_seconds = 0.0;
-            self.cooldown_remaining_real_seconds = cooldown_duration_real_secs(self.developer_mode);
-            ObservationDecision::TriggerNudge {
-                evidence_focus_seconds: triggered_evidence,
-                required_focus_seconds: required,
-            }
-        } else {
-            ObservationDecision::Accumulated {
-                evidence_focus_seconds: self.evidence_focus_seconds,
-                required_focus_seconds: required,
-            }
-        }
-    }
-}
-
-pub fn required_off_task_span(prob_off_task: f64, developer_mode: bool) -> f64 {
-    let clamped = prob_off_task.clamp(0.50, 0.95);
-    let ratio = (clamped - 0.50) / (0.95 - 0.50);
-    let (max_span, min_span) = if developer_mode {
-        (80.0, 40.0)
-    } else {
-        (240.0, 120.0)
-    };
-    max_span - ratio * (max_span - min_span)
-}
-
-pub fn real_to_focus_seconds(real_secs: f64, developer_mode: bool) -> f64 {
-    if developer_mode {
-        real_secs * DEV_CLOCK_MULTIPLIER
-    } else {
-        real_secs
-    }
-}
-
-pub fn check_interval_real_secs(developer_mode: bool) -> u64 {
-    if developer_mode {
-        DEV_CHECK_INTERVAL_SECS
-    } else {
-        NORMAL_CHECK_INTERVAL_SECS
-    }
-}
-
-pub fn cooldown_duration_real_secs(developer_mode: bool) -> f64 {
-    if developer_mode {
-        DEV_COOLDOWN_REAL_SECS
-    } else {
-        NORMAL_COOLDOWN_REAL_SECS
-    }
-}
-
-struct ActiveSessionData {
-    session_id: String,
-    declared_task: String,
-    started_at: DateTime<Utc>,
-    duration_minutes: u32,
-    total_focus_seconds: f64,
-    elapsed_focus_seconds: f64,
-    phase: SessionPhase,
-    evidence: EvidenceStateMachine,
-    last_choice: String,
-    last_prob_off_task: f64,
-    last_confidence: f64,
+struct TaskRuntimeState {
+    phase: TaskPhase,
+    task_id: Option<String>,
+    goal: String,
+    started_at: Option<DateTime<Utc>>,
+    plan_steps: Vec<String>,
+    active_plan_index: u32,
+    current_step: u32,
+    max_steps: u32,
     active_app: String,
-    check_count: u32,
-    probability_logs: Vec<ProbabilityLogEntry>,
-    nudge_timestamps: Vec<DateTime<Utc>>,
-    timeline: Vec<TimelineSegment>,
+    last_narration: String,
+    last_summary: Option<String>,
     last_error: Option<String>,
-    real_since_last_check: f64,
-    check_in_flight: bool,
+    pending_confirmation: Option<PendingConfirmation>,
+    steps: Vec<TaskStepRecord>,
+    history_saved: bool,
 }
 
-pub struct FocusEngine {
+impl TaskRuntimeState {
+    fn idle(max_steps: u32) -> Self {
+        Self {
+            phase: TaskPhase::Idle,
+            task_id: None,
+            goal: String::new(),
+            started_at: None,
+            plan_steps: Vec::new(),
+            active_plan_index: 0,
+            current_step: 0,
+            max_steps,
+            active_app: String::new(),
+            last_narration: String::new(),
+            last_summary: None,
+            last_error: None,
+            pending_confirmation: None,
+            steps: Vec::new(),
+            history_saved: false,
+        }
+    }
+}
+
+pub struct TaskEngine {
     config: Mutex<AppConfig>,
-    session: Mutex<Option<ActiveSessionData>>,
-    stop_sender: Mutex<Option<watch::Sender<bool>>>,
-    client: OllamaCloudClient,
+    state: Mutex<TaskRuntimeState>,
+    stop_tx: Mutex<Option<watch::Sender<bool>>>,
+    pause_tx: Mutex<Option<watch::Sender<bool>>>,
+    confirm_tx: Mutex<Option<(String, oneshot::Sender<bool>)>>,
+    client: OllamaAgentClient,
 }
 
-impl FocusEngine {
-    pub fn new(initial_config: AppConfig) -> Result<Arc<Self>, ClassifierError> {
+impl TaskEngine {
+    pub fn new(initial_config: AppConfig) -> Result<Arc<Self>, AgentError> {
+        let max_steps = initial_config.max_steps;
         Ok(Arc::new(Self {
             config: Mutex::new(initial_config),
-            session: Mutex::new(None),
-            stop_sender: Mutex::new(None),
-            client: OllamaCloudClient::new()?,
+            state: Mutex::new(TaskRuntimeState::idle(max_steps)),
+            stop_tx: Mutex::new(None),
+            pause_tx: Mutex::new(None),
+            confirm_tx: Mutex::new(None),
+            client: OllamaAgentClient::new()?,
         }))
     }
 
@@ -266,293 +145,238 @@ impl FocusEngine {
     }
 
     pub fn update_config(&self, next: AppConfig) {
-        let dev_mode = next.developer_mode;
+        let next_max = next.max_steps;
         *self.config.lock() = next;
-        if let Some(session) = self.session.lock().as_mut() {
-            session.evidence.set_developer_mode(dev_mode);
+        let mut st = self.state.lock();
+        if !st.phase.is_active() {
+            st.max_steps = next_max;
         }
-    }
-
-    pub fn set_developer_mode(&self, enabled: bool) -> AppConfig {
-        let mut cfg = self.config.lock();
-        cfg.developer_mode = enabled;
-        let updated = cfg.clone();
-        drop(cfg);
-        if let Some(session) = self.session.lock().as_mut() {
-            session.evidence.set_developer_mode(enabled);
-        }
-        updated
     }
 
     pub fn snapshot(&self) -> EngineSnapshot {
-        let cfg = self.config.lock().clone();
-        let guard = self.session.lock();
-        let screen_permission_granted = has_screen_recording_permission();
-
-        match guard.as_ref() {
-            Some(s) => {
-                let remaining = (s.total_focus_seconds - s.elapsed_focus_seconds).max(0.0);
-                EngineSnapshot {
-                    phase: s.phase,
-                    session_id: Some(s.session_id.clone()),
-                    declared_task: s.declared_task.clone(),
-                    duration_minutes: s.duration_minutes,
-                    remaining_focus_seconds: remaining,
-                    elapsed_focus_seconds: s.elapsed_focus_seconds,
-                    developer_mode: s.evidence.developer_mode,
-                    evidence_focus_seconds: s.evidence.evidence_focus_seconds,
-                    required_evidence_focus_seconds: s.evidence.last_required_focus_seconds,
-                    cooldown_remaining_real_seconds: s.evidence.cooldown_remaining_real_seconds,
-                    last_choice: s.last_choice.clone(),
-                    last_prob_off_task: s.last_prob_off_task,
-                    last_confidence: s.last_confidence,
-                    active_app: s.active_app.clone(),
-                    check_count: s.check_count,
-                    nudge_count: s.nudge_timestamps.len() as u32,
-                    screen_permission_granted,
-                    last_error: s.last_error.clone(),
-                    timeline: s.timeline.clone(),
-                }
-            }
-            None => EngineSnapshot {
-                phase: SessionPhase::Idle,
-                session_id: None,
-                declared_task: String::new(),
-                duration_minutes: cfg.default_duration_minutes,
-                remaining_focus_seconds: f64::from(cfg.default_duration_minutes) * 60.0,
-                elapsed_focus_seconds: 0.0,
-                developer_mode: cfg.developer_mode,
-                evidence_focus_seconds: 0.0,
-                required_evidence_focus_seconds: required_off_task_span(0.95, cfg.developer_mode),
-                cooldown_remaining_real_seconds: 0.0,
-                last_choice: "idle".to_string(),
-                last_prob_off_task: 0.0,
-                last_confidence: 0.0,
-                active_app: String::new(),
-                check_count: 0,
-                nudge_count: 0,
-                screen_permission_granted,
-                last_error: None,
-                timeline: Vec::new(),
-            },
+        let st = self.state.lock();
+        EngineSnapshot {
+            phase: st.phase,
+            task_id: st.task_id.clone(),
+            goal: st.goal.clone(),
+            plan_steps: st.plan_steps.clone(),
+            active_plan_index: st.active_plan_index,
+            current_step: st.current_step,
+            max_steps: st.max_steps,
+            active_app: st.active_app.clone(),
+            last_narration: st.last_narration.clone(),
+            last_summary: st.last_summary.clone(),
+            last_error: st.last_error.clone(),
+            pending_confirmation: st.pending_confirmation.clone(),
+            screen_permission_granted: has_screen_recording_permission(),
+            accessibility_permission_granted: has_accessibility_permission(),
+            steps: st.steps.clone(),
         }
     }
 
-    pub fn start_session(
-        self: &Arc<Self>,
-        app_handle: AppHandle,
-        declared_task: String,
-        duration_minutes: u32,
-    ) -> EngineSnapshot {
-        self.stop_session(&app_handle);
+    pub fn start_task(self: &Arc<Self>, app_handle: AppHandle, goal: String) -> EngineSnapshot {
+        self.stop_task(&app_handle, Some("Replaced by new task".to_string()));
 
-        let dev_mode = self.config.lock().developer_mode;
-        let total_focus_seconds = f64::from(duration_minutes) * 60.0;
-        let session_id = Uuid::new_v4().to_string();
+        let cfg = self.config();
+        let task_id = Uuid::new_v4().to_string();
 
-        let data = ActiveSessionData {
-            session_id: session_id.clone(),
-            declared_task,
-            started_at: Utc::now(),
-            duration_minutes,
-            total_focus_seconds,
-            elapsed_focus_seconds: 0.0,
-            phase: SessionPhase::Running,
-            evidence: EvidenceStateMachine::new(dev_mode),
-            last_choice: "on_task".to_string(),
-            last_prob_off_task: 0.0,
-            last_confidence: 0.0,
-            active_app: String::new(),
-            check_count: 0,
-            probability_logs: Vec::new(),
-            nudge_timestamps: Vec::new(),
-            timeline: Vec::new(),
-            last_error: None,
-            real_since_last_check: 0.0,
-            check_in_flight: false,
-        };
+        {
+            let mut st = self.state.lock();
+            st.phase = TaskPhase::Planning;
+            st.task_id = Some(task_id.clone());
+            st.goal = goal.clone();
+            st.started_at = Some(Utc::now());
+            st.plan_steps = Vec::new();
+            st.active_plan_index = 0;
+            st.current_step = 0;
+            st.max_steps = cfg.max_steps;
+            st.active_app = String::new();
+            st.last_narration = "Inspecting your screen to plan the task...".to_string();
+            st.last_summary = None;
+            st.last_error = None;
+            st.pending_confirmation = None;
+            st.steps.clear();
+            st.history_saved = false;
+        }
 
-        *self.session.lock() = Some(data);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(false);
+        *self.stop_tx.lock() = Some(stop_tx);
+        *self.pause_tx.lock() = Some(pause_tx);
+        *self.confirm_tx.lock() = None;
 
-        let (tx, rx) = watch::channel(false);
-        *self.stop_sender.lock() = Some(tx);
+        let snap = self.snapshot();
+        update_tray_status_title(&app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
 
         let engine_clone = Arc::clone(self);
         let handle_clone = app_handle.clone();
         tauri::async_runtime::spawn(async move {
             engine_clone
-                .run_session_loop(handle_clone, session_id, rx)
+                .run_task_loop(handle_clone, task_id, goal, stop_rx, pause_rx)
                 .await;
         });
 
-        let snap = self.snapshot();
-        let _ = app_handle.emit("engine-snapshot", &snap);
         snap
     }
 
-    pub fn pause_session(&self, app_handle: &AppHandle) -> EngineSnapshot {
-        if let Some(s) = self.session.lock().as_mut() {
-            if s.phase == SessionPhase::Running {
-                s.phase = SessionPhase::Paused;
-                s.evidence.on_pause_or_system_sleep();
-                s.real_since_last_check = 0.0;
+    pub fn pause_task(&self, app_handle: &AppHandle) -> EngineSnapshot {
+        {
+            let mut st = self.state.lock();
+            if st.phase == TaskPhase::Running {
+                st.phase = TaskPhase::Paused;
+                st.last_narration = "Paused task execution.".to_string();
             }
         }
-        let snap = self.snapshot();
-        update_tray_timer_title(app_handle, Some(&snap));
-        let _ = app_handle.emit("engine-snapshot", &snap);
-        snap
-    }
-
-    pub fn resume_session(&self, app_handle: &AppHandle) -> EngineSnapshot {
-        if let Some(s) = self.session.lock().as_mut() {
-            if s.phase == SessionPhase::Paused {
-                s.phase = SessionPhase::Running;
-                s.evidence.reset_evidence();
-                s.real_since_last_check = 0.0;
-            }
-        }
-        let snap = self.snapshot();
-        update_tray_timer_title(app_handle, Some(&snap));
-        let _ = app_handle.emit("engine-snapshot", &snap);
-        snap
-    }
-
-    pub fn stop_session(&self, app_handle: &AppHandle) -> EngineSnapshot {
-        if let Some(tx) = self.stop_sender.lock().take() {
+        if let Some(tx) = self.pause_tx.lock().as_ref() {
             let _ = tx.send(true);
         }
-        let finished = self.session.lock().take();
-        if let Some(s) = finished {
-            let record = SessionHistoryRecord {
-                session_id: s.session_id,
-                declared_task: s.declared_task,
-                started_at: s.started_at,
-                ended_at: Utc::now(),
-                planned_duration_minutes: s.duration_minutes,
-                developer_mode: s.evidence.developer_mode,
-                check_count: s.check_count,
-                probability_logs: s.probability_logs,
-                nudge_timestamps: s.nudge_timestamps,
-            };
-            let _ = append_history_record(record);
-        }
-        update_tray_timer_title(app_handle, None);
         let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
         let _ = app_handle.emit("engine-snapshot", &snap);
         snap
     }
 
-    async fn run_session_loop(
-        self: Arc<Self>,
-        app_handle: AppHandle,
-        session_id: String,
-        mut stop_rx: watch::Receiver<bool>,
-    ) {
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_tick = Instant::now();
-
-        for _ in 0..MAX_SESSION_TICKS {
-            tokio::select! {
-                _ = stop_rx.changed() => {
-                    if *stop_rx.borrow() {
-                        break;
-                    }
-                }
-                _ = ticker.tick() => {
-                    if *stop_rx.borrow() {
-                        break;
-                    }
-
-                    let now = Instant::now();
-                    let real_delta = now.duration_since(last_tick).as_secs_f64();
-                    last_tick = now;
-
-                    let mut should_finish = false;
-                    let mut trigger_check: Option<f64> = None;
-
-                    {
-                        let mut guard = self.session.lock();
-                        let Some(s) = guard.as_mut() else {
-                            break;
-                        };
-                        if s.session_id != session_id {
-                            break;
-                        }
-
-                        if real_delta > 15.0 {
-                            s.evidence.on_pause_or_system_sleep();
-                            s.real_since_last_check = 0.0;
-                        } else if s.phase == SessionPhase::Running {
-                            let focus_delta = real_to_focus_seconds(real_delta, s.evidence.developer_mode);
-                            s.elapsed_focus_seconds = (s.elapsed_focus_seconds + focus_delta).min(s.total_focus_seconds);
-                            s.evidence.advance_cooldown(real_delta);
-                            s.real_since_last_check += real_delta;
-
-                            let interval = check_interval_real_secs(s.evidence.developer_mode) as f64;
-                            if s.real_since_last_check + 1e-3 >= interval && !s.check_in_flight {
-                                let accumulated_span = s.real_since_last_check;
-                                s.real_since_last_check = 0.0;
-                                s.check_in_flight = true;
-                                trigger_check = Some(accumulated_span);
-                            }
-
-                            if s.elapsed_focus_seconds + 1e-3 >= s.total_focus_seconds {
-                                should_finish = true;
-                            }
-                        }
-                    }
-
-                    let snap = self.snapshot();
-                    update_tray_timer_title(&app_handle, Some(&snap));
-                    let _ = app_handle.emit("engine-snapshot", &snap);
-
-                    if should_finish {
-                        self.stop_session(&app_handle);
-                        break;
-                    }
-
-                    if let Some(observation_real_secs) = trigger_check {
-                        let engine_ref = Arc::clone(&self);
-                        let handle_ref = app_handle.clone();
-                        let sid = session_id.clone();
-                        tauri::async_runtime::spawn(async move {
-                            engine_ref
-                                .execute_observation_cycle(handle_ref, sid, observation_real_secs)
-                                .await;
-                        });
-                    }
-                }
+    pub fn resume_task(&self, app_handle: &AppHandle) -> EngineSnapshot {
+        {
+            let mut st = self.state.lock();
+            if st.phase == TaskPhase::Paused {
+                st.phase = TaskPhase::Running;
+                st.last_narration = "Resuming task execution...".to_string();
             }
         }
+        if let Some(tx) = self.pause_tx.lock().as_ref() {
+            let _ = tx.send(false);
+        }
+        let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+        snap
     }
 
-    async fn execute_observation_cycle(
-        self: Arc<Self>,
-        app_handle: AppHandle,
-        session_id: String,
-        observation_real_secs: f64,
-    ) {
-        let (declared_task, elapsed_minutes, cfg) = {
-            let guard = self.session.lock();
-            let Some(s) = guard.as_ref() else {
-                return;
-            };
-            if s.session_id != session_id || s.phase != SessionPhase::Running {
-                if let Some(s_mut) = self.session.lock().as_mut() {
-                    s_mut.check_in_flight = false;
-                }
-                return;
+    pub fn stop_task(&self, app_handle: &AppHandle, reason: Option<String>) -> EngineSnapshot {
+        if let Some(tx) = self.stop_tx.lock().take() {
+            let _ = tx.send(true);
+        }
+        if let Some((_, confirm)) = self.confirm_tx.lock().take() {
+            let _ = confirm.send(false);
+        }
+
+        let record_to_save = {
+            let mut st = self.state.lock();
+            if st.phase.is_active() {
+                let msg = reason.unwrap_or_else(|| "Task stopped by user".to_string());
+                st.phase = TaskPhase::Stopped;
+                st.pending_confirmation = None;
+                st.last_summary = Some(msg.clone());
+                st.last_narration = msg;
+                take_history_record_locked(&mut st, "stopped")
+            } else {
+                None
             }
-            let mins = (s.elapsed_focus_seconds / 60.0).floor() as u32;
-            (s.declared_task.clone(), mins, self.config())
         };
 
-        let capture_and_ocr = tokio::task::spawn_blocking(|| {
+        if let Some(record) = record_to_save {
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = append_history_record(record);
+            });
+        }
+
+        let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+        snap
+    }
+
+    pub fn resolve_confirmation(
+        &self,
+        app_handle: &AppHandle,
+        confirmation_id: &str,
+        approved: bool,
+    ) -> Result<EngineSnapshot, String> {
+        let sender = {
+            let mut confirm_guard = self.confirm_tx.lock();
+            match confirm_guard.take() {
+                Some((id, tx)) if id == confirmation_id => tx,
+                Some(existing) => {
+                    *confirm_guard = Some(existing);
+                    return Err("confirmation id does not match active prompt".to_string());
+                }
+                None => return Err("no confirmation is currently pending".to_string()),
+            }
+        };
+
+        {
+            let mut st = self.state.lock();
+            st.pending_confirmation = None;
+            if st.phase == TaskPhase::AwaitingConfirmation {
+                st.phase = TaskPhase::Running;
+                st.last_narration = if approved {
+                    "Action approved—executing now.".to_string()
+                } else {
+                    "Action skipped—replanning next step.".to_string()
+                };
+            }
+        }
+
+        let _ = sender.send(approved);
+        let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+        Ok(snap)
+    }
+
+    fn is_current_task(&self, task_id: &str) -> bool {
+        self.state
+            .lock()
+            .task_id
+            .as_deref()
+            .is_some_and(|id| id == task_id)
+    }
+
+    async fn run_task_loop(
+        self: Arc<Self>,
+        app_handle: AppHandle,
+        task_id: String,
+        goal: String,
+        mut stop_rx: watch::Receiver<bool>,
+        mut pause_rx: watch::Receiver<bool>,
+    ) {
+        let kill_engine = Arc::clone(&self);
+        let kill_handle = app_handle.clone();
+        let kill_task_id = task_id.clone();
+        let mut kill_stop_rx = stop_rx.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = kill_stop_rx.changed() => {
+                        if *kill_stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                        if *kill_stop_rx.borrow() || !kill_engine.is_current_task(&kill_task_id) {
+                            break;
+                        }
+                        if is_kill_switch_pressed() {
+                            kill_engine.stop_task(
+                                &kill_handle,
+                                Some("Stopped by emergency shortcut (⌃⌥S)".to_string()),
+                            );
+                            show_tray_popover(&kill_handle, false);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let cfg = self.config();
+        let api_key = cfg.resolved_api_key();
+
+        let initial_capture = tokio::task::spawn_blocking(|| {
             let frame = capture_primary_display_in_ram()?;
-            let ocr = extract_ocr_from_rgba(&frame.full_res_rgba)
-                .unwrap_or_default();
+            let ocr = extract_ocr_from_rgba(&frame.full_res_rgba).unwrap_or_default();
             Ok::<_, crate::capture::CaptureError>((
                 frame.base64_jpeg,
                 frame.active_window,
@@ -562,318 +386,898 @@ impl FocusEngine {
         })
         .await;
 
-        let (base64_jpeg, active_win, screen_metrics, ocr) = match capture_and_ocr {
+        let (init_jpeg, init_win, _, init_ocr) = match initial_capture {
             Ok(Ok(tuple)) => tuple,
             Ok(Err(err)) => {
-                self.record_failed_cycle(&app_handle, &session_id, err.to_string());
+                self.finalize_task(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Failed,
+                    "failed",
+                    err.to_string(),
+                    Some(err.to_string()),
+                );
                 return;
             }
             Err(err) => {
-                self.record_failed_cycle(&app_handle, &session_id, err.to_string());
+                self.finalize_task(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Failed,
+                    "failed",
+                    err.to_string(),
+                    Some(err.to_string()),
+                );
                 return;
             }
         };
 
-        if active_win.is_system_locked {
-            if let Some(s) = self.session.lock().as_mut() {
-                if s.session_id == session_id {
-                    s.evidence.on_pause_or_system_sleep();
-                    s.check_in_flight = false;
-                }
-            }
-            let snap = self.snapshot();
-            let _ = app_handle.emit("engine-snapshot", &snap);
+        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
             return;
         }
 
-        let api_key = cfg.resolved_api_key();
-        let state = SystemOneState {
-            declared_task: declared_task.clone(),
-            active_app: active_win.app_name.clone(),
-            elapsed_minutes,
-            ocr_lines: ocr.formatted_lines.clone(),
-        };
-
-        let outcome_res = self
+        let plan_steps = match self
             .client
-            .classify_activity(
+            .create_task_plan(
                 &cfg.ollama_base_url,
                 &api_key,
-                &cfg.classifier_model,
-                state,
-                base64_jpeg,
+                &cfg.vision_model,
+                &goal,
+                &init_win.app_name,
+                &init_ocr.formatted_lines,
+                init_jpeg,
             )
+            .await
+        {
+            Ok(plan) => plan.steps,
+            Err(_) => vec![goal.clone()],
+        };
+
+        if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+            return;
+        }
+
+        {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                st.plan_steps = plan_steps.clone();
+                st.active_app = init_win.app_name;
+                st.phase = TaskPhase::Running;
+                st.last_narration = format!("Plan ready ({} steps). Starting...", plan_steps.len());
+            }
+        }
+        let snap = self.snapshot();
+        update_tray_status_title(&app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+
+        hide_tray_popover(&app_handle);
+        if sleep_interruptible(Duration::from_millis(320), &mut stop_rx).await {
+            return;
+        }
+
+        let max_steps = cfg.max_steps;
+        let mut recent_steps: Vec<String> = Vec::new();
+
+        for step_num in 1..=max_steps {
+            if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                return;
+            }
+
+            while *pause_rx.borrow() {
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        if *stop_rx.borrow() {
+                            return;
+                        }
+                    }
+                    _ = pause_rx.changed() => {}
+                }
+            }
+
+            if !self.is_current_task(&task_id) {
+                return;
+            }
+
+            let cycle_cfg = self.config();
+            let cycle_api_key = cycle_cfg.resolved_api_key();
+
+            let capture_res = tokio::task::spawn_blocking(|| {
+                let frame = capture_primary_display_in_ram()?;
+                let ocr = extract_ocr_from_rgba(&frame.full_res_rgba).unwrap_or_default();
+                Ok::<_, crate::capture::CaptureError>((
+                    frame.base64_jpeg,
+                    frame.active_window,
+                    frame.screen_metrics,
+                    ocr,
+                ))
+            })
             .await;
 
-        let mut should_fire_nudge = false;
-        {
-            let mut guard = self.session.lock();
-            let Some(s) = guard.as_mut() else {
-                return;
-            };
-            if s.session_id != session_id {
-                return;
-            }
-            s.check_in_flight = false;
-            s.active_app = active_win.app_name.clone();
-
-            let is_paused = s.phase != SessionPhase::Running;
-            let decision = s.evidence.record_observation(
-                outcome_res.as_ref(),
-                observation_real_secs,
-                is_paused,
-            );
-
-            match &outcome_res {
-                Ok(outcome) => {
-                    s.check_count += 1;
-                    s.last_error = None;
-                    s.last_choice = outcome.choice.as_str().to_string();
-                    s.last_prob_off_task = outcome.prob_off_task;
-                    s.last_confidence = outcome.confidence;
-
-                    let now_utc = Utc::now();
-                    s.probability_logs.push(ProbabilityLogEntry {
-                        timestamp: now_utc,
-                        choice: outcome.choice.as_str().to_string(),
-                        prob_off_task: outcome.prob_off_task,
-                        confidence: outcome.confidence,
-                        evidence_focus_seconds: s.evidence.evidence_focus_seconds,
-                    });
-                    s.timeline.push(TimelineSegment {
-                        timestamp: now_utc,
-                        status: outcome.choice.as_str().to_string(),
-                        prob_off_task: outcome.prob_off_task,
-                        confidence: outcome.confidence,
-                    });
-                    if s.timeline.len() > MAX_TIMELINE_POINTS {
-                        let drain_len = s.timeline.len() - MAX_TIMELINE_POINTS;
-                        s.timeline.drain(0..drain_len);
-                    }
+            let (base64_jpeg, active_win, metrics, ocr) = match capture_res {
+                Ok(Ok(tuple)) => tuple,
+                Ok(Err(err)) => {
+                    self.finalize_task(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Failed,
+                        "failed",
+                        err.to_string(),
+                        Some(err.to_string()),
+                    );
+                    show_tray_popover(&app_handle, false);
+                    return;
                 }
                 Err(err) => {
-                    s.last_error = Some(err.to_string());
+                    self.finalize_task(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Failed,
+                        "failed",
+                        err.to_string(),
+                        Some(err.to_string()),
+                    );
+                    show_tray_popover(&app_handle, false);
+                    return;
+                }
+            };
+
+            if active_win.is_system_locked {
+                self.finalize_task(
+                    &app_handle,
+                    &task_id,
+                    TaskPhase::Stopped,
+                    "stopped",
+                    "Stopped because macOS screen locked".to_string(),
+                    None,
+                );
+                return;
+            }
+
+            if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                return;
+            }
+
+            let decision_res = self
+                .client
+                .decide_next_action(
+                    &cycle_cfg.ollama_base_url,
+                    &cycle_api_key,
+                    &cycle_cfg.vision_model,
+                    NextActionContext {
+                        goal: goal.clone(),
+                        plan_steps: plan_steps.clone(),
+                        step_number: step_num,
+                        max_steps,
+                        active_app: active_win.app_name.clone(),
+                        window_title: active_win.window_title.clone(),
+                        screen_width: metrics.logical_width.round() as u32,
+                        screen_height: metrics.logical_height.round() as u32,
+                        ocr_lines: ocr.formatted_lines.clone(),
+                        recent_steps: recent_steps.clone(),
+                        base64_jpeg,
+                    },
+                )
+                .await;
+
+            let decision = match decision_res {
+                Ok(d) => d,
+                Err(err) => {
+                    self.finalize_task(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Failed,
+                        "failed",
+                        err.to_string(),
+                        Some(err.to_string()),
+                    );
+                    show_tray_popover(&app_handle, false);
+                    return;
+                }
+            };
+
+            if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                return;
+            }
+
+            let (action, (overlay_x, overlay_y), target_text) =
+                match resolve_action_from_decision(&decision, &ocr, metrics) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        let step_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: decision.action_type.clone(),
+                            description: format!("Invalid parameters: {reason}"),
+                            narration: decision.narration.clone(),
+                            status: "skipped".to_string(),
+                            target_ocr_id: decision.target_ocr_id,
+                            target_x: None,
+                            target_y: None,
+                        };
+                        self.record_step(&app_handle, &task_id, step_num, decision.plan_step_index, &active_win.app_name, step_rec);
+                        recent_steps.push(format!("Step {step_num} skipped: {reason}"));
+                        if recent_steps.len() > 8 {
+                            recent_steps.remove(0);
+                        }
+                        continue;
+                    }
+                };
+
+            let action_label = action_type_label(&action).to_string();
+            let action_desc = describe_action(&action);
+
+            match &action {
+                AgentAction::Done { summary } => {
+                    let cue = PointerCuePayload {
+                        id: Uuid::new_v4().to_string(),
+                        message: summary.clone(),
+                        action_badge: "Done".to_string(),
+                        target_x: overlay_x,
+                        target_y: overlay_y,
+                        target_ocr_id: decision.target_ocr_id,
+                        step_number: step_num,
+                        is_acting: false,
+                        dismiss_after_ms: 4200,
+                    };
+                    let _ = emit_pointer_cue(&app_handle, cue);
+
+                    let step_rec = TaskStepRecord {
+                        step_number: step_num,
+                        timestamp: Utc::now(),
+                        action_type: action_label,
+                        description: action_desc,
+                        narration: decision.narration.clone(),
+                        status: "done".to_string(),
+                        target_ocr_id: decision.target_ocr_id,
+                        target_x: Some(overlay_x),
+                        target_y: Some(overlay_y),
+                    };
+                    self.record_step(
+                        &app_handle,
+                        &task_id,
+                        step_num,
+                        decision.plan_step_index,
+                        &active_win.app_name,
+                        step_rec,
+                    );
+                    self.finalize_task(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Completed,
+                        "completed",
+                        summary.clone(),
+                        None,
+                    );
+                    show_tray_popover(&app_handle, false);
+                    return;
+                }
+                AgentAction::Fail { reason } => {
+                    let cue = PointerCuePayload {
+                        id: Uuid::new_v4().to_string(),
+                        message: reason.clone(),
+                        action_badge: "Blocked".to_string(),
+                        target_x: overlay_x,
+                        target_y: overlay_y,
+                        target_ocr_id: decision.target_ocr_id,
+                        step_number: step_num,
+                        is_acting: false,
+                        dismiss_after_ms: 4200,
+                    };
+                    let _ = emit_pointer_cue(&app_handle, cue);
+
+                    let step_rec = TaskStepRecord {
+                        step_number: step_num,
+                        timestamp: Utc::now(),
+                        action_type: action_label,
+                        description: action_desc,
+                        narration: decision.narration.clone(),
+                        status: "failed".to_string(),
+                        target_ocr_id: decision.target_ocr_id,
+                        target_x: Some(overlay_x),
+                        target_y: Some(overlay_y),
+                    };
+                    self.record_step(
+                        &app_handle,
+                        &task_id,
+                        step_num,
+                        decision.plan_step_index,
+                        &active_win.app_name,
+                        step_rec,
+                    );
+                    self.finalize_task(
+                        &app_handle,
+                        &task_id,
+                        TaskPhase::Failed,
+                        "failed",
+                        reason.clone(),
+                        Some(reason.clone()),
+                    );
+                    show_tray_popover(&app_handle, false);
+                    return;
+                }
+                _ => {}
+            }
+
+            let cue = PointerCuePayload {
+                id: Uuid::new_v4().to_string(),
+                message: decision.narration.clone(),
+                action_badge: action_badge_text(&action).to_string(),
+                target_x: overlay_x,
+                target_y: overlay_y,
+                target_ocr_id: decision.target_ocr_id,
+                step_number: step_num,
+                is_acting: true,
+                dismiss_after_ms: 3600,
+            };
+            let _ = emit_pointer_cue(&app_handle, cue);
+
+            {
+                let mut st = self.state.lock();
+                if st.task_id.as_deref() == Some(&task_id) && st.phase.is_active() {
+                    st.current_step = step_num;
+                    st.active_plan_index = decision.plan_step_index;
+                    st.active_app = active_win.app_name.clone();
+                    st.last_narration = decision.narration.clone();
+                }
+            }
+            let snap = self.snapshot();
+            update_tray_status_title(&app_handle, Some(&snap));
+            let _ = app_handle.emit("engine-snapshot", &snap);
+
+            if cycle_cfg.confirm_risky_actions {
+                if let Some(risk_reason) = assess_action_risk(
+                    &action,
+                    &decision.narration,
+                    target_text.as_deref(),
+                    decision.requires_confirmation,
+                ) {
+                    let conf_id = Uuid::new_v4().to_string();
+                    let (tx, rx) = oneshot::channel();
+                    *self.confirm_tx.lock() = Some((conf_id.clone(), tx));
+
+                    {
+                        let mut st = self.state.lock();
+                        if st.task_id.as_deref() != Some(&task_id) || !st.phase.is_active() {
+                            return;
+                        }
+                        st.phase = TaskPhase::AwaitingConfirmation;
+                        st.pending_confirmation = Some(PendingConfirmation {
+                            id: conf_id,
+                            step_number: step_num,
+                            action_type: action_label.clone(),
+                            description: action_desc.clone(),
+                            narration: decision.narration.clone(),
+                            reason: risk_reason,
+                        });
+                    }
+                    let snap = self.snapshot();
+                    update_tray_status_title(&app_handle, Some(&snap));
+                    let _ = app_handle.emit("engine-snapshot", &snap);
+                    show_tray_popover(&app_handle, false);
+
+                    let approved = tokio::select! {
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                return;
+                            }
+                            false
+                        }
+                        res = rx => res.unwrap_or(false)
+                    };
+
+                    if *stop_rx.borrow() || !self.is_current_task(&task_id) {
+                        return;
+                    }
+
+                    if !approved {
+                        let step_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: action_label,
+                            description: action_desc.clone(),
+                            narration: decision.narration.clone(),
+                            status: "denied".to_string(),
+                            target_ocr_id: decision.target_ocr_id,
+                            target_x: Some(overlay_x),
+                            target_y: Some(overlay_y),
+                        };
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            decision.plan_step_index,
+                            &active_win.app_name,
+                            step_rec,
+                        );
+                        recent_steps.push(format!("Step {step_num} ({action_desc}) was denied by user"));
+                        if recent_steps.len() > 8 {
+                            recent_steps.remove(0);
+                        }
+                        hide_tray_popover(&app_handle);
+                        continue;
+                    }
+
+                    hide_tray_popover(&app_handle);
+                    if sleep_interruptible(Duration::from_millis(250), &mut stop_rx).await {
+                        return;
+                    }
                 }
             }
 
-            if matches!(decision, ObservationDecision::TriggerNudge { .. }) {
-                s.nudge_timestamps.push(Utc::now());
-                should_fire_nudge = true;
+            if sleep_interruptible(Duration::from_millis(280), &mut stop_rx).await {
+                return;
+            }
+            if !self.is_current_task(&task_id) {
+                return;
+            }
+
+            let action_for_exec = action.clone();
+            let exec_res = tokio::task::spawn_blocking(move || execute_action(&action_for_exec, metrics)).await;
+            let (step_status, err_text) = match exec_res {
+                Ok(Ok(())) => ("executed".to_string(), None),
+                Ok(Err(err)) => {
+                    let msg = err.to_string();
+                    if matches!(err, crate::automation::AutomationError::AccessibilityPermissionDenied) {
+                        let step_rec = TaskStepRecord {
+                            step_number: step_num,
+                            timestamp: Utc::now(),
+                            action_type: action_label,
+                            description: action_desc,
+                            narration: decision.narration.clone(),
+                            status: "failed".to_string(),
+                            target_ocr_id: decision.target_ocr_id,
+                            target_x: Some(overlay_x),
+                            target_y: Some(overlay_y),
+                        };
+                        self.record_step(
+                            &app_handle,
+                            &task_id,
+                            step_num,
+                            decision.plan_step_index,
+                            &active_win.app_name,
+                            step_rec,
+                        );
+                        self.finalize_task(
+                            &app_handle,
+                            &task_id,
+                            TaskPhase::Failed,
+                            "failed",
+                            msg.clone(),
+                            Some(msg),
+                        );
+                        show_tray_popover(&app_handle, false);
+                        return;
+                    }
+                    ("failed".to_string(), Some(msg))
+                }
+                Err(err) => ("failed".to_string(), Some(err.to_string())),
+            };
+
+            let step_rec = TaskStepRecord {
+                step_number: step_num,
+                timestamp: Utc::now(),
+                action_type: action_label,
+                description: action_desc.clone(),
+                narration: decision.narration.clone(),
+                status: step_status.clone(),
+                target_ocr_id: decision.target_ocr_id,
+                target_x: Some(overlay_x),
+                target_y: Some(overlay_y),
+            };
+            self.record_step(
+                &app_handle,
+                &task_id,
+                step_num,
+                decision.plan_step_index,
+                &active_win.app_name,
+                step_rec,
+            );
+
+            let recent_entry = match err_text {
+                Some(e) => format!("Step {step_num} ({action_desc}) failed: {e}"),
+                None => format!("Step {step_num} ({action_desc}) -> {step_status}"),
+            };
+            recent_steps.push(recent_entry);
+            if recent_steps.len() > 8 {
+                recent_steps.remove(0);
+            }
+
+            if sleep_interruptible(Duration::from_millis(cycle_cfg.step_delay_ms), &mut stop_rx).await {
+                return;
             }
         }
 
+        self.finalize_task(
+            &app_handle,
+            &task_id,
+            TaskPhase::Completed,
+            "max_steps",
+            format!("Reached maximum limit of {max_steps} steps."),
+            None,
+        );
+        show_tray_popover(&app_handle, false);
+    }
+
+    fn record_step(
+        &self,
+        app_handle: &AppHandle,
+        task_id: &str,
+        step_number: u32,
+        plan_index: u32,
+        active_app: &str,
+        record: TaskStepRecord,
+    ) {
+        {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() != Some(task_id) {
+                return;
+            }
+            st.current_step = step_number;
+            st.active_plan_index = plan_index;
+            st.active_app = active_app.to_string();
+            st.steps.push(record);
+        }
         let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
         let _ = app_handle.emit("engine-snapshot", &snap);
+    }
 
-        if should_fire_nudge {
-            let directive = self
-                .client
-                .generate_nudge(
-                    &cfg.ollama_base_url,
-                    &api_key,
-                    &cfg.nudge_model,
-                    &declared_task,
-                    &active_win.app_name,
-                    &active_win.window_title,
-                    &ocr.formatted_lines,
-                )
-                .await
-                .unwrap_or_else(|_| crate::classifier::NudgeDirective {
-                    nudge_text: format!(
-                        "Quick detour in {}? Let's glide back to: {}",
-                        active_win.app_name, declared_task
-                    ),
-                    target_ocr_id: ocr.bbox_by_id.keys().copied().min(),
-                });
+    fn finalize_task(
+        &self,
+        app_handle: &AppHandle,
+        task_id: &str,
+        final_phase: TaskPhase,
+        outcome: &str,
+        summary: String,
+        error: Option<String>,
+    ) {
+        if let Some(tx) = self.stop_tx.lock().take() {
+            let _ = tx.send(true);
+        }
 
-            let (target_x, target_y) = directive
-                .target_ocr_id
-                .and_then(|id| ocr.bbox_by_id.get(&id).copied())
-                .map(|bbox| {
-                    let rect = vision_bbox_to_screen_rect(
-                        bbox,
-                        screen_metrics.logical_width,
-                        screen_metrics.logical_height,
-                    );
-                    (rect.center_x, rect.center_y)
-                })
-                .unwrap_or((
-                    screen_metrics.logical_width * 0.52,
-                    screen_metrics.logical_height * 0.34,
-                ));
+        let record_to_save = {
+            let mut st = self.state.lock();
+            if st.task_id.as_deref() != Some(task_id) || !st.phase.is_active() {
+                None
+            } else {
+                st.phase = final_phase;
+                st.pending_confirmation = None;
+                st.last_summary = Some(summary.clone());
+                st.last_narration = summary;
+                st.last_error = error;
+                take_history_record_locked(&mut st, outcome)
+            }
+        };
 
-            let payload = NudgeEventPayload {
-                id: Uuid::new_v4().to_string(),
-                nudge_text: directive.nudge_text,
-                target_x,
-                target_y,
-                target_ocr_id: directive.target_ocr_id,
-                active_app: active_win.app_name,
-                dismiss_after_ms: 5200,
-            };
-            let _ = emit_nudge_event(&app_handle, payload);
+        if let Some(record) = record_to_save {
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = append_history_record(record);
+            });
+        }
+
+        let snap = self.snapshot();
+        update_tray_status_title(app_handle, Some(&snap));
+        let _ = app_handle.emit("engine-snapshot", &snap);
+    }
+}
+
+fn take_history_record_locked(
+    st: &mut TaskRuntimeState,
+    outcome: &str,
+) -> Option<TaskHistoryRecord> {
+    if st.history_saved {
+        return None;
+    }
+    let task_id = st.task_id.clone()?;
+    let started_at = st.started_at?;
+    st.history_saved = true;
+    Some(TaskHistoryRecord {
+        task_id,
+        goal: st.goal.clone(),
+        started_at,
+        ended_at: Utc::now(),
+        outcome: outcome.to_string(),
+        summary: st.last_summary.clone().unwrap_or_default(),
+        step_count: st.steps.len() as u32,
+        steps: st.steps.clone(),
+    })
+}
+
+async fn sleep_interruptible(duration: Duration, stop_rx: &mut watch::Receiver<bool>) -> bool {
+    if *stop_rx.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = stop_rx.changed() => *stop_rx.borrow(),
+        _ = tokio::time::sleep(duration) => *stop_rx.borrow(),
+    }
+}
+
+fn find_ocr_text(formatted_lines: &[String], id: u32) -> Option<String> {
+    let prefix = format!("[{id}] ");
+    formatted_lines
+        .iter()
+        .find_map(|line| line.strip_prefix(&prefix).map(|rest| rest.trim().to_string()))
+}
+
+fn resolve_target_point(
+    decision: &PlannedActionDecision,
+    ocr: &OcrExtractionResult,
+    metrics: ScreenMetrics,
+) -> ((f64, f64), (f64, f64), Option<String>) {
+    if let Some(ocr_id) = decision.target_ocr_id {
+        if let Some(&bbox) = ocr.bbox_by_id.get(&ocr_id) {
+            let rect = vision_bbox_to_screen_rect(
+                bbox,
+                metrics.logical_width,
+                metrics.logical_height,
+            );
+            let target_text = find_ocr_text(&ocr.formatted_lines, ocr_id);
+            return (
+                (rect.center_x, rect.center_y),
+                (metrics.origin_x + rect.center_x, metrics.origin_y + rect.center_y),
+                target_text,
+            );
         }
     }
 
-    fn record_failed_cycle(&self, app_handle: &AppHandle, session_id: &str, message: String) {
-        if let Some(s) = self.session.lock().as_mut() {
-            if s.session_id == session_id {
-                s.evidence.reset_evidence();
-                s.check_in_flight = false;
-                s.last_error = Some(message);
+    if let (Some(xn), Some(yn)) = (decision.x_norm, decision.y_norm) {
+        let ox = xn.clamp(0.0, 1.0) * metrics.logical_width;
+        let oy = yn.clamp(0.0, 1.0) * metrics.logical_height;
+        return (
+            (ox, oy),
+            (metrics.origin_x + ox, metrics.origin_y + oy),
+            None,
+        );
+    }
+
+    let cx = metrics.logical_width * 0.5;
+    let cy = metrics.logical_height * 0.4;
+    (
+        (cx, cy),
+        (metrics.origin_x + cx, metrics.origin_y + cy),
+        None,
+    )
+}
+
+pub fn resolve_action_from_decision(
+    decision: &PlannedActionDecision,
+    ocr: &OcrExtractionResult,
+    metrics: ScreenMetrics,
+) -> Result<(AgentAction, (f64, f64), Option<String>), String> {
+    let ((overlay_x, overlay_y), (abs_x, abs_y), target_text) =
+        resolve_target_point(decision, ocr, metrics);
+
+    let action = match decision.action_type.as_str() {
+        "click" => AgentAction::Click {
+            x: abs_x,
+            y: abs_y,
+            button: MouseButtonKind::Left,
+            double: false,
+        },
+        "double_click" => AgentAction::Click {
+            x: abs_x,
+            y: abs_y,
+            button: MouseButtonKind::Left,
+            double: true,
+        },
+        "right_click" => AgentAction::Click {
+            x: abs_x,
+            y: abs_y,
+            button: MouseButtonKind::Right,
+            double: false,
+        },
+        "type_text" => {
+            let text = decision
+                .text
+                .clone()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| "type_text missing text".to_string())?;
+            AgentAction::TypeText { text }
+        }
+        "press_key" => {
+            let key = decision
+                .key
+                .clone()
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| "press_key missing key".to_string())?;
+            AgentAction::PressKey {
+                key,
+                modifiers: decision.modifiers.clone(),
             }
         }
-        let snap = self.snapshot();
-        let _ = app_handle.emit("engine-snapshot", &snap);
+        "scroll" => AgentAction::Scroll {
+            x: abs_x,
+            y: abs_y,
+            delta_y: decision.scroll_delta_y.unwrap_or(-5),
+        },
+        "open_app" => {
+            let app_name = decision
+                .app_name
+                .clone()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "open_app missing app_name".to_string())?;
+            AgentAction::OpenApp { app_name }
+        }
+        "open_url" => {
+            let url = decision
+                .url
+                .clone()
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| "open_url missing url".to_string())?;
+            AgentAction::OpenUrl { url }
+        }
+        "wait" => AgentAction::Wait {
+            ms: decision.wait_ms.unwrap_or(1000).clamp(100, 5000),
+        },
+        "done" => AgentAction::Done {
+            summary: decision
+                .summary
+                .clone()
+                .unwrap_or_else(|| decision.narration.clone()),
+        },
+        "fail" => AgentAction::Fail {
+            reason: decision
+                .summary
+                .clone()
+                .unwrap_or_else(|| decision.narration.clone()),
+        },
+        other => return Err(format!("unsupported action_type \"{other}\"")),
+    };
+
+    Ok((action, (overlay_x, overlay_y), target_text))
+}
+
+fn action_badge_text(action: &AgentAction) -> &'static str {
+    match action {
+        AgentAction::Click { double: true, .. } => "Double-Click",
+        AgentAction::Click {
+            button: MouseButtonKind::Right,
+            ..
+        } => "Right-Click",
+        AgentAction::Click { .. } => "Click",
+        AgentAction::TypeText { .. } => "Type",
+        AgentAction::PressKey { .. } => "Shortcut",
+        AgentAction::Scroll { .. } => "Scroll",
+        AgentAction::OpenApp { .. } => "Open App",
+        AgentAction::OpenUrl { .. } => "Open URL",
+        AgentAction::Wait { .. } => "Wait",
+        AgentAction::Done { .. } => "Done",
+        AgentAction::Fail { .. } => "Blocked",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ocr::NormalizedBoundingBox;
+    use std::collections::HashMap;
 
-    fn sample_outcome(
-        choice: ActivityChoice,
-        prob_off_task: f64,
-        latency_ms: u64,
-    ) -> ClassificationOutcome {
-        ClassificationOutcome {
-            choice,
-            prob_off_task,
-            confidence: 0.92,
-            latency: Duration::from_millis(latency_ms),
+    fn sample_metrics() -> ScreenMetrics {
+        ScreenMetrics {
+            origin_x: 100.0,
+            origin_y: 50.0,
+            logical_width: 1000.0,
+            logical_height: 800.0,
+            pixel_width: 2000,
+            pixel_height: 1600,
+            scale_factor: 2.0,
+        }
+    }
+
+    fn base_decision(action_type: &str) -> PlannedActionDecision {
+        PlannedActionDecision {
+            thought: String::new(),
+            narration: "Working on it".to_string(),
+            plan_step_index: 0,
+            action_type: action_type.to_string(),
+            target_ocr_id: None,
+            x_norm: None,
+            y_norm: None,
+            text: None,
+            key: None,
+            modifiers: Vec::new(),
+            scroll_delta_y: None,
+            app_name: None,
+            url: None,
+            wait_ms: None,
+            requires_confirmation: false,
+            summary: None,
         }
     }
 
     #[test]
-    fn scales_required_off_task_span_linearly_between_050_and_095() {
-        assert!((required_off_task_span(0.50, false) - 240.0).abs() < 1e-6);
-        assert!((required_off_task_span(0.725, false) - 180.0).abs() < 1e-6);
-        assert!((required_off_task_span(0.95, false) - 120.0).abs() < 1e-6);
-        assert!((required_off_task_span(0.99, false) - 120.0).abs() < 1e-6);
+    fn resolves_click_from_ocr_id_and_falls_back_to_normalized_coords() {
+        let mut bbox_by_id = HashMap::new();
+        bbox_by_id.insert(
+            3,
+            NormalizedBoundingBox {
+                x: 0.20,
+                y: 0.50,
+                width: 0.10,
+                height: 0.10,
+            },
+        );
+        let ocr = OcrExtractionResult {
+            formatted_lines: vec!["[3] Compose".to_string()],
+            bbox_by_id,
+        };
+        let metrics = sample_metrics();
 
-        assert!((required_off_task_span(0.50, true) - 80.0).abs() < 1e-6);
-        assert!((required_off_task_span(0.725, true) - 60.0).abs() < 1e-6);
-        assert!((required_off_task_span(0.95, true) - 40.0).abs() < 1e-6);
+        let mut d_ocr = base_decision("click");
+        d_ocr.target_ocr_id = Some(3);
+        let (action, (ox, oy), text) =
+            resolve_action_from_decision(&d_ocr, &ocr, metrics).expect("ocr resolve");
+        assert!((ox - 250.0).abs() < 1e-6);
+        assert!((oy - 360.0).abs() < 1e-6);
+        assert_eq!(text.as_deref(), Some("Compose"));
+        assert_eq!(
+            action,
+            AgentAction::Click {
+                x: 350.0,
+                y: 410.0,
+                button: MouseButtonKind::Left,
+                double: false,
+            }
+        );
+
+        let mut d_norm = base_decision("right_click");
+        d_norm.x_norm = Some(0.4);
+        d_norm.y_norm = Some(0.25);
+        let (action2, (ox2, oy2), text2) =
+            resolve_action_from_decision(&d_norm, &ocr, metrics).expect("norm resolve");
+        assert!((ox2 - 400.0).abs() < 1e-6);
+        assert!((oy2 - 200.0).abs() < 1e-6);
+        assert!(text2.is_none());
+        assert_eq!(
+            action2,
+            AgentAction::Click {
+                x: 500.0,
+                y: 250.0,
+                button: MouseButtonKind::Right,
+                double: false,
+            }
+        );
     }
 
     #[test]
-    fn normal_mode_triggers_at_120s_for_high_prob_and_240s_for_050() {
-        let mut sm = EvidenceStateMachine::new(false);
-        let high = sample_outcome(ActivityChoice::OffTask, 0.96, 350);
+    fn resolves_open_app_open_url_and_press_key() {
+        let ocr = OcrExtractionResult::default();
+        let metrics = sample_metrics();
 
-        for step in 1..=3 {
-            let dec = sm.record_observation(Ok(&high), 30.0, false);
-            assert_eq!(
-                dec,
-                ObservationDecision::Accumulated {
-                    evidence_focus_seconds: f64::from(step) * 30.0,
-                    required_focus_seconds: 120.0,
-                }
-            );
-        }
-        let fourth = sm.record_observation(Ok(&high), 30.0, false);
+        let mut d_app = base_decision("open_app");
+        d_app.app_name = Some("Notes".to_string());
+        let (act_app, _, _) = resolve_action_from_decision(&d_app, &ocr, metrics).unwrap();
         assert_eq!(
-            fourth,
-            ObservationDecision::TriggerNudge {
-                evidence_focus_seconds: 120.0,
-                required_focus_seconds: 120.0,
+            act_app,
+            AgentAction::OpenApp {
+                app_name: "Notes".to_string()
             }
         );
 
-        let mut sm_low = EvidenceStateMachine::new(false);
-        let low = sample_outcome(ActivityChoice::OffTask, 0.50, 350);
-        for _ in 1..=7 {
-            let dec = sm_low.record_observation(Ok(&low), 30.0, false);
-            assert!(matches!(dec, ObservationDecision::Accumulated { .. }));
-        }
-        let eighth = sm_low.record_observation(Ok(&low), 30.0, false);
+        let mut d_url = base_decision("open_url");
+        d_url.url = Some("https://github.com".to_string());
+        let (act_url, _, _) = resolve_action_from_decision(&d_url, &ocr, metrics).unwrap();
         assert_eq!(
-            eighth,
-            ObservationDecision::TriggerNudge {
-                evidence_focus_seconds: 240.0,
-                required_focus_seconds: 240.0,
-            }
-        );
-    }
-
-    #[test]
-    fn developer_mode_uses_4x_focus_clock_and_30s_cooldown() {
-        let mut sm = EvidenceStateMachine::new(true);
-        let border = sample_outcome(ActivityChoice::OffTask, 0.50, 250);
-
-        let first = sm.record_observation(Ok(&border), 10.0, false);
-        assert_eq!(
-            first,
-            ObservationDecision::Accumulated {
-                evidence_focus_seconds: 40.0,
-                required_focus_seconds: 80.0,
+            act_url,
+            AgentAction::OpenUrl {
+                url: "https://github.com".to_string()
             }
         );
 
-        let second = sm.record_observation(Ok(&border), 10.0, false);
+        let mut d_key = base_decision("press_key");
+        d_key.key = Some("enter".to_string());
+        d_key.modifiers = vec!["cmd".to_string()];
+        let (act_key, _, _) = resolve_action_from_decision(&d_key, &ocr, metrics).unwrap();
         assert_eq!(
-            second,
-            ObservationDecision::TriggerNudge {
-                evidence_focus_seconds: 80.0,
-                required_focus_seconds: 80.0,
+            act_key,
+            AgentAction::PressKey {
+                key: "enter".to_string(),
+                modifiers: vec!["cmd".to_string()],
             }
         );
-        assert!((sm.cooldown_remaining_real_seconds - 30.0).abs() < 1e-6);
-
-        sm.advance_cooldown(10.0);
-        let during_cooldown = sm.record_observation(Ok(&border), 10.0, false);
-        assert_eq!(during_cooldown, ObservationDecision::InCooldown);
-
-        sm.advance_cooldown(20.0);
-        let after_cooldown = sm.record_observation(Ok(&border), 10.0, false);
-        assert!(matches!(
-            after_cooldown,
-            ObservationDecision::Accumulated { .. }
-        ));
-    }
-
-    #[test]
-    fn resets_immediately_on_on_task_uncertain_low_prob_pause_or_stale_timeout() {
-        let mut sm = EvidenceStateMachine::new(false);
-        let off = sample_outcome(ActivityChoice::OffTask, 0.90, 300);
-        sm.record_observation(Ok(&off), 30.0, false);
-        assert!(sm.evidence_focus_seconds > 0.0);
-
-        let on_task = sample_outcome(ActivityChoice::OnTask, 0.10, 300);
-        assert_eq!(
-            sm.record_observation(Ok(&on_task), 30.0, false),
-            ObservationDecision::ResetEvidence
-        );
-        assert_eq!(sm.evidence_focus_seconds, 0.0);
-
-        sm.record_observation(Ok(&off), 30.0, false);
-        let uncertain = sample_outcome(ActivityChoice::Uncertain, 0.65, 300);
-        assert_eq!(
-            sm.record_observation(Ok(&uncertain), 30.0, false),
-            ObservationDecision::ResetEvidence
-        );
-        assert_eq!(sm.evidence_focus_seconds, 0.0);
-
-        sm.record_observation(Ok(&off), 30.0, false);
-        let low_prob_off = sample_outcome(ActivityChoice::OffTask, 0.49, 300);
-        assert_eq!(
-            sm.record_observation(Ok(&low_prob_off), 30.0, false),
-            ObservationDecision::ResetEvidence
-        );
-
-        sm.record_observation(Ok(&off), 30.0, false);
-        assert_eq!(
-            sm.record_observation(Ok(&off), 30.0, true),
-            ObservationDecision::ResetEvidence
-        );
-
-        sm.record_observation(Ok(&off), 30.0, false);
-        let stale = sample_outcome(ActivityChoice::OffTask, 0.95, 21_000);
-        assert_eq!(
-            sm.record_observation(Ok(&stale), 30.0, false),
-            ObservationDecision::ResetEvidence
-        );
-        assert_eq!(sm.evidence_focus_seconds, 0.0);
     }
 }

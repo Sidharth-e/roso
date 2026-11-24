@@ -1,4 +1,9 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import type {
+  ButtonHTMLAttributes,
+  InputHTMLAttributes,
+  ReactNode,
+  TextareaHTMLAttributes,
+} from "react";
 import type { TrayTab } from "../types";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -38,6 +43,22 @@ export function Input({ label, id, className = "", ...rest }: InputProps) {
         {label}
       </label>
       <input id={id} className={`ui-input ${className}`} {...rest} />
+    </div>
+  );
+}
+
+interface TextAreaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
+  label: string;
+  id: string;
+}
+
+export function TextArea({ label, id, className = "", ...rest }: TextAreaProps) {
+  return (
+    <div className="flex flex-col gap-1">
+      <label htmlFor={id} className="text-xs font-medium text-foreground/80">
+        {label}
+      </label>
+      <textarea id={id} className={`ui-input resize-none ${className}`} {...rest} />
     </div>
   );
 }
@@ -91,7 +112,7 @@ export function Switch({
 }
 
 interface StatusBadgeProps {
-  tone: "success" | "warning" | "neutral" | "info";
+  tone: "success" | "warning" | "error" | "neutral" | "info";
   label: string;
 }
 
@@ -101,17 +122,21 @@ export function StatusBadge({ tone, label }: StatusBadgeProps) {
       ? "bg-success/15 text-success border border-success/30"
       : tone === "warning"
         ? "bg-warning/15 text-warning border border-warning/30"
-        : tone === "info"
-          ? "bg-info/15 text-info border border-info/30"
-          : "bg-tertiary/20 text-tertiary border border-tertiary/30";
+        : tone === "error"
+          ? "bg-error/15 text-error border border-error/30"
+          : tone === "info"
+            ? "bg-info/15 text-info border border-info/30"
+            : "bg-tertiary/20 text-tertiary border border-tertiary/30";
   const dotClass =
     tone === "success"
       ? "bg-success"
       : tone === "warning"
         ? "bg-warning"
-        : tone === "info"
-          ? "bg-info"
-          : "bg-tertiary";
+        : tone === "error"
+          ? "bg-error"
+          : tone === "info"
+            ? "bg-info"
+            : "bg-tertiary";
 
   return (
     <span className={`ui-badge ${toneClasses}`}>
@@ -136,7 +161,7 @@ interface TabBarProps {
 }
 
 const TABS: ReadonlyArray<{ id: TrayTab; label: string }> = [
-  { id: "focus", label: "Focus" },
+  { id: "task", label: "Task" },
   { id: "history", label: "History" },
   { id: "settings", label: "Settings" },
 ];
@@ -144,7 +169,7 @@ const TABS: ReadonlyArray<{ id: TrayTab; label: string }> = [
 export function TabBar({ activeTab, onSelect }: TabBarProps) {
   return (
     <nav
-      aria-label="Focus Companion views"
+      aria-label="Task Companion views"
       className="grid grid-cols-3 gap-1 rounded-lg bg-secondary/80 p-1"
     >
       {TABS.map((tab) => {

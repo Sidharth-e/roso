@@ -1,81 +1,93 @@
 import { z } from "zod";
 
-export const SessionPhaseSchema = z.enum(["idle", "running", "paused"]);
-export type SessionPhase = z.infer<typeof SessionPhaseSchema>;
+export const TaskPhaseSchema = z.enum([
+  "idle",
+  "planning",
+  "running",
+  "awaiting_confirmation",
+  "paused",
+  "completed",
+  "failed",
+  "stopped",
+]);
+export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
 
-export const TimelineSegmentSchema = z.object({
+export const TaskStepRecordSchema = z.object({
+  stepNumber: z.number().int().nonnegative(),
   timestamp: z.string(),
+  actionType: z.string(),
+  description: z.string(),
+  narration: z.string(),
   status: z.string(),
-  probOffTask: z.number(),
-  confidence: z.number(),
+  targetOcrId: z.number().int().nullable(),
+  targetX: z.number().nullable(),
+  targetY: z.number().nullable(),
 });
-export type TimelineSegment = z.infer<typeof TimelineSegmentSchema>;
+export type TaskStepRecord = z.infer<typeof TaskStepRecordSchema>;
+
+export const PendingConfirmationSchema = z.object({
+  id: z.string(),
+  stepNumber: z.number().int().positive(),
+  actionType: z.string(),
+  description: z.string(),
+  narration: z.string(),
+  reason: z.string(),
+});
+export type PendingConfirmation = z.infer<typeof PendingConfirmationSchema>;
 
 export const EngineSnapshotSchema = z.object({
-  phase: SessionPhaseSchema,
-  sessionId: z.string().nullable(),
-  declaredTask: z.string(),
-  durationMinutes: z.number().int().min(1).max(240),
-  remainingFocusSeconds: z.number().nonnegative(),
-  elapsedFocusSeconds: z.number().nonnegative(),
-  developerMode: z.boolean(),
-  evidenceFocusSeconds: z.number().nonnegative(),
-  requiredEvidenceFocusSeconds: z.number().positive(),
-  cooldownRemainingRealSeconds: z.number().nonnegative(),
-  lastChoice: z.string(),
-  lastProbOffTask: z.number().min(0).max(1),
-  lastConfidence: z.number().min(0).max(1),
+  phase: TaskPhaseSchema,
+  taskId: z.string().nullable(),
+  goal: z.string(),
+  planSteps: z.array(z.string()),
+  activePlanIndex: z.number().int().nonnegative(),
+  currentStep: z.number().int().nonnegative(),
+  maxSteps: z.number().int().positive(),
   activeApp: z.string(),
-  checkCount: z.number().int().nonnegative(),
-  nudgeCount: z.number().int().nonnegative(),
-  screenPermissionGranted: z.boolean(),
+  lastNarration: z.string(),
+  lastSummary: z.string().nullable(),
   lastError: z.string().nullable(),
-  timeline: z.array(TimelineSegmentSchema),
+  pendingConfirmation: PendingConfirmationSchema.nullable(),
+  screenPermissionGranted: z.boolean(),
+  accessibilityPermissionGranted: z.boolean(),
+  steps: z.array(TaskStepRecordSchema),
 });
 export type EngineSnapshot = z.infer<typeof EngineSnapshotSchema>;
 
 export const AppConfigSchema = z.object({
   ollamaBaseUrl: z.string().min(1),
   ollamaApiKey: z.string(),
-  classifierModel: z.string().min(1),
-  nudgeModel: z.string().min(1),
-  developerMode: z.boolean(),
-  defaultDurationMinutes: z.number().int().min(1).max(240),
+  visionModel: z.string().min(1),
+  maxSteps: z.number().int().min(1).max(50),
+  stepDelayMs: z.number().int().min(200).max(5000),
+  confirmRiskyActions: z.boolean(),
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
-export const ProbabilityLogEntrySchema = z.object({
-  timestamp: z.string(),
-  choice: z.string(),
-  probOffTask: z.number(),
-  confidence: z.number(),
-  evidenceFocusSeconds: z.number(),
-});
-export type ProbabilityLogEntry = z.infer<typeof ProbabilityLogEntrySchema>;
-
-export const SessionHistoryRecordSchema = z.object({
-  sessionId: z.string(),
-  declaredTask: z.string(),
+export const TaskHistoryRecordSchema = z.object({
+  taskId: z.string(),
+  goal: z.string(),
   startedAt: z.string(),
   endedAt: z.string(),
-  plannedDurationMinutes: z.number().int(),
-  developerMode: z.boolean(),
-  checkCount: z.number().int(),
-  probabilityLogs: z.array(ProbabilityLogEntrySchema),
-  nudgeTimestamps: z.array(z.string()),
+  outcome: z.string(),
+  summary: z.string(),
+  stepCount: z.number().int().nonnegative(),
+  steps: z.array(TaskStepRecordSchema),
 });
-export type SessionHistoryRecord = z.infer<typeof SessionHistoryRecordSchema>;
+export type TaskHistoryRecord = z.infer<typeof TaskHistoryRecordSchema>;
 
-export const NudgeEventPayloadSchema = z.object({
+export const PointerCuePayloadSchema = z.object({
   id: z.string(),
-  nudgeText: z.string(),
+  message: z.string(),
+  actionBadge: z.string(),
   targetX: z.number(),
   targetY: z.number(),
   targetOcrId: z.number().int().nullable(),
-  activeApp: z.string(),
+  stepNumber: z.number().int().nonnegative(),
+  isActing: z.boolean(),
   dismissAfterMs: z.number().int().positive(),
 });
-export type NudgeEventPayload = z.infer<typeof NudgeEventPayloadSchema>;
+export type PointerCuePayload = z.infer<typeof PointerCuePayloadSchema>;
 
-export type TrayTab = "focus" | "history" | "settings";
+export type TrayTab = "task" | "history" | "settings";
 export type ThemeMode = "light" | "dark";

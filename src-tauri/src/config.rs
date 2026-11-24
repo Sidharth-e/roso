@@ -21,10 +21,10 @@ pub enum ConfigError {
 pub struct AppConfig {
     pub ollama_base_url: String,
     pub ollama_api_key: String,
-    pub classifier_model: String,
-    pub nudge_model: String,
-    pub developer_mode: bool,
-    pub default_duration_minutes: u32,
+    pub vision_model: String,
+    pub max_steps: u32,
+    pub step_delay_ms: u64,
+    pub confirm_risky_actions: bool,
 }
 
 impl Default for AppConfig {
@@ -32,10 +32,10 @@ impl Default for AppConfig {
         Self {
             ollama_base_url: "https://ollama.com".to_string(),
             ollama_api_key: String::new(),
-            classifier_model: "clef".to_string(),
-            nudge_model: "deepseek-v4.1-flash:cloud".to_string(),
-            developer_mode: false,
-            default_duration_minutes: 25,
+            vision_model: "qwen3-vl:235b-cloud".to_string(),
+            max_steps: 20,
+            step_delay_ms: 900,
+            confirm_risky_actions: true,
         }
     }
 }
@@ -61,11 +61,15 @@ impl AppConfig {
             .collect::<String>()
             .trim()
             .to_string();
-        self.classifier_model = validate_model_name(&self.classifier_model, "classifier_model")?;
-        self.nudge_model = validate_model_name(&self.nudge_model, "nudge_model")?;
-        if !(1..=240).contains(&self.default_duration_minutes) {
+        self.vision_model = validate_model_name(&self.vision_model, "vision_model")?;
+        if !(1..=50).contains(&self.max_steps) {
             return Err(ConfigError::Validation(
-                "default_duration_minutes must be between 1 and 240".to_string(),
+                "max_steps must be between 1 and 50".to_string(),
+            ));
+        }
+        if !(200..=5000).contains(&self.step_delay_ms) {
+            return Err(ConfigError::Validation(
+                "step_delay_ms must be between 200 and 5000".to_string(),
             ));
         }
         Ok(self)
@@ -74,31 +78,34 @@ impl AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProbabilityLogEntry {
+pub struct TaskStepRecord {
+    pub step_number: u32,
     pub timestamp: DateTime<Utc>,
-    pub choice: String,
-    pub prob_off_task: f64,
-    pub confidence: f64,
-    pub evidence_focus_seconds: f64,
+    pub action_type: String,
+    pub description: String,
+    pub narration: String,
+    pub status: String,
+    pub target_ocr_id: Option<u32>,
+    pub target_x: Option<f64>,
+    pub target_y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionHistoryRecord {
-    pub session_id: String,
-    pub declared_task: String,
+pub struct TaskHistoryRecord {
+    pub task_id: String,
+    pub goal: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
-    pub planned_duration_minutes: u32,
-    pub developer_mode: bool,
-    pub check_count: u32,
-    pub probability_logs: Vec<ProbabilityLogEntry>,
-    pub nudge_timestamps: Vec<DateTime<Utc>>,
+    pub outcome: String,
+    pub summary: String,
+    pub step_count: u32,
+    pub steps: Vec<TaskStepRecord>,
 }
 
 pub fn app_support_dir() -> Result<PathBuf, ConfigError> {
     let base = dirs::data_dir().ok_or(ConfigError::SupportDirUnavailable)?;
-    let dir = base.join("FocusCompanion");
+    let dir = base.join("TaskCompanion");
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
     }
@@ -110,7 +117,7 @@ pub fn config_file_path() -> Result<PathBuf, ConfigError> {
 }
 
 pub fn history_file_path() -> Result<PathBuf, ConfigError> {
-    Ok(app_support_dir()?.join("focus-history.json"))
+    Ok(app_support_dir()?.join("task-history.json"))
 }
 
 pub fn load_config() -> Result<AppConfig, ConfigError> {
@@ -120,9 +127,15 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         save_config(&default_cfg)?;
         return Ok(default_cfg);
     }
-    let raw = fs::read_to_string(path)?;
-    let parsed: AppConfig = serde_json::from_str(&raw)?;
-    parsed.sanitized()
+    let raw = fs::read_to_string(&path)?;
+    match serde_json::from_str::<AppConfig>(&raw) {
+        Ok(parsed) => parsed.sanitized(),
+        Err(_) => {
+            let default_cfg = AppConfig::default();
+            save_config(&default_cfg)?;
+            Ok(default_cfg)
+        }
+    }
 }
 
 pub fn save_config(config: &AppConfig) -> Result<AppConfig, ConfigError> {
@@ -139,18 +152,18 @@ pub fn save_config(config: &AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(validated)
 }
 
-pub fn load_history() -> Result<Vec<SessionHistoryRecord>, ConfigError> {
+pub fn load_history() -> Result<Vec<TaskHistoryRecord>, ConfigError> {
     let path = history_file_path()?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let raw = fs::read_to_string(path)?;
-    let mut records: Vec<SessionHistoryRecord> = serde_json::from_str(&raw)?;
+    let mut records: Vec<TaskHistoryRecord> = serde_json::from_str(&raw)?;
     records.sort_by(|a, b| b.started_at.cmp(&a.started_at));
     Ok(records)
 }
 
-pub fn append_history_record(record: SessionHistoryRecord) -> Result<(), ConfigError> {
+pub fn append_history_record(record: TaskHistoryRecord) -> Result<(), ConfigError> {
     let mut existing = load_history().unwrap_or_default();
     existing.insert(0, record);
     if existing.len() > 100 {
@@ -162,8 +175,8 @@ pub fn append_history_record(record: SessionHistoryRecord) -> Result<(), ConfigE
     Ok(())
 }
 
-pub fn validate_task_input(task: &str) -> Result<String, ConfigError> {
-    let cleaned = task
+pub fn validate_goal_input(goal: &str) -> Result<String, ConfigError> {
+    let cleaned = goal
         .chars()
         .filter(|c| !c.is_control())
         .collect::<String>()
@@ -171,24 +184,15 @@ pub fn validate_task_input(task: &str) -> Result<String, ConfigError> {
         .to_string();
     if cleaned.is_empty() {
         return Err(ConfigError::Validation(
-            "declared task must not be empty".to_string(),
+            "task goal must not be empty".to_string(),
         ));
     }
-    if cleaned.chars().count() > 240 {
+    if cleaned.chars().count() > 500 {
         return Err(ConfigError::Validation(
-            "declared task must not exceed 240 characters".to_string(),
+            "task goal must not exceed 500 characters".to_string(),
         ));
     }
     Ok(cleaned)
-}
-
-pub fn validate_duration_minutes(minutes: u32) -> Result<u32, ConfigError> {
-    if !(1..=240).contains(&minutes) {
-        return Err(ConfigError::Validation(
-            "duration must be between 1 and 240 minutes".to_string(),
-        ));
-    }
-    Ok(minutes)
 }
 
 fn validate_base_url(url: &str) -> Result<String, ConfigError> {
@@ -222,4 +226,27 @@ fn validate_model_name(name: &str, field: &str) -> Result<String, ConfigError> {
         )));
     }
     Ok(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_goal_and_config_bounds() {
+        assert_eq!(validate_goal_input("  Open Notes  ").unwrap(), "Open Notes");
+        assert!(validate_goal_input("   ").is_err());
+        let too_long = "a".repeat(501);
+        assert!(validate_goal_input(&too_long).is_err());
+
+        let mut cfg = AppConfig::default();
+        assert!(cfg.clone().sanitized().is_ok());
+
+        cfg.max_steps = 0;
+        assert!(cfg.clone().sanitized().is_err());
+
+        cfg.max_steps = 20;
+        cfg.step_delay_ms = 50;
+        assert!(cfg.sanitized().is_err());
+    }
 }

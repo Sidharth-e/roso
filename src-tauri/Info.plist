@@ -5,6 +5,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Focus Companion captures periodic in-memory screen snapshots during active focus sessions to detect off-task drift and display gentle on-screen nudges. Screenshots are never saved to disk.</string>
+    <string>Task Companion captures in-memory screen snapshots during active task runs so the agent can inspect the screen, locate UI elements via Vision OCR, and perform automated steps. Screenshots are never saved to disk.</string>
 </dict>
 </plist>

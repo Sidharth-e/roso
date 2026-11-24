@@ -1,112 +1,73 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
-pub const MAX_CLASSIFICATION_LATENCY: Duration = Duration::from_secs(20);
-const NUDGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Error)]
-pub enum ClassifierError {
+pub enum AgentError {
     #[error("network request failed: {0}")]
     Http(String),
-    #[error("request exceeded maximum latency of {0}ms")]
-    StaleLatency(u128),
     #[error("API returned status {status}: {body}")]
     UpstreamStatus { status: u16, body: String },
     #[error("invalid API response payload: {0}")]
     MalformedPayload(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivityChoice {
-    OnTask,
-    OffTask,
-    Uncertain,
-}
-
-impl ActivityChoice {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OnTask => "on_task",
-            Self::OffTask => "off_task",
-            Self::Uncertain => "uncertain",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemOneState {
-    pub declared_task: String,
-    pub active_app: String,
-    pub elapsed_minutes: u32,
-    pub ocr_lines: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SystemOneQuestion {
-    #[serde(rename = "type")]
-    pub question_type: &'static str,
-    pub instructions: &'static str,
-    pub criteria: SystemOneCriteria,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SystemOneCriteria {
-    pub on_task: &'static str,
-    pub off_task: &'static str,
-    pub uncertain: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SystemOneRequest {
-    pub model: String,
-    pub state: SystemOneState,
-    pub images: Vec<String>,
-    pub questions: HashMap<&'static str, SystemOneQuestion>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemOneResponse {
-    pub answers: SystemOneAnswers,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemOneAnswers {
-    pub activity: SystemOneActivityAnswer,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SystemOneActivityAnswer {
-    pub choice: ActivityChoice,
-    pub probabilities: ActivityProbabilities,
-    pub confidence: f64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ActivityProbabilities {
-    #[serde(default)]
-    pub on_task: f64,
-    pub off_task: f64,
-    #[serde(default)]
-    pub uncertain: f64,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskPlan {
+    pub steps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ClassificationOutcome {
-    pub choice: ActivityChoice,
-    pub prob_off_task: f64,
-    pub confidence: f64,
-    pub latency: Duration,
+pub struct NextActionContext {
+    pub goal: String,
+    pub plan_steps: Vec<String>,
+    pub step_number: u32,
+    pub max_steps: u32,
+    pub active_app: String,
+    pub window_title: String,
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub ocr_lines: Vec<String>,
+    pub recent_steps: Vec<String>,
+    pub base64_jpeg: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NudgeDirective {
-    pub nudge_text: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlannedActionDecision {
+    #[serde(default)]
+    pub thought: String,
+    pub narration: String,
+    #[serde(default)]
+    pub plan_step_index: u32,
+    pub action_type: String,
+    #[serde(default)]
     pub target_ocr_id: Option<u32>,
+    #[serde(default)]
+    pub x_norm: Option<f64>,
+    #[serde(default)]
+    pub y_norm: Option<f64>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+    #[serde(default)]
+    pub scroll_delta_y: Option<i32>,
+    #[serde(default)]
+    pub app_name: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub requires_confirmation: bool,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,6 +88,8 @@ struct OllamaChatOptions {
 struct OllamaChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,160 +98,209 @@ struct OllamaChatResponse {
 }
 
 #[derive(Clone)]
-pub struct OllamaCloudClient {
+pub struct OllamaAgentClient {
     http: Client,
 }
 
-impl OllamaCloudClient {
-    pub fn new() -> Result<Self, ClassifierError> {
+impl OllamaAgentClient {
+    pub fn new() -> Result<Self, AgentError> {
         let http = Client::builder()
-            .timeout(MAX_CLASSIFICATION_LATENCY)
+            .timeout(AGENT_REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(8))
             .build()
-            .map_err(|e| ClassifierError::Http(e.to_string()))?;
+            .map_err(|e| AgentError::Http(e.to_string()))?;
         Ok(Self { http })
     }
 
-    pub fn build_system_one_request(
-        model: &str,
-        state: SystemOneState,
-        base64_jpeg: String,
-    ) -> SystemOneRequest {
-        let mut questions = HashMap::with_capacity(1);
-        questions.insert(
-            "activity",
-            SystemOneQuestion {
-                question_type: "choice",
-                instructions: "Is the user actively working on or researching their declared_task, or are they distracted off_task?",
-                criteria: SystemOneCriteria {
-                    on_task: "Working directly on the declared task, reading relevant documentation, tutorials, or waiting on builds",
-                    off_task: "Unrelated entertainment, social media feeds, shopping, or unrelated videos",
-                    uncertain: "Insufficient or ambiguous screen context",
-                },
-            },
-        );
-        SystemOneRequest {
-            model: model.to_string(),
-            state,
-            images: vec![base64_jpeg],
-            questions,
-        }
-    }
-
-    pub async fn classify_activity(
+    pub async fn create_task_plan(
         &self,
         base_url: &str,
         api_key: &str,
         model: &str,
-        state: SystemOneState,
-        base64_jpeg: String,
-    ) -> Result<ClassificationOutcome, ClassifierError> {
-        let endpoint = format!("{}/v1/systemone", base_url.trim_end_matches('/'));
-        let effective_model = normalize_model_for_endpoint(base_url, model);
-        let payload = Self::build_system_one_request(&effective_model, state, base64_jpeg);
-        let headers = build_headers(api_key)?;
-
-        let started = Instant::now();
-        let response = self
-            .http
-            .post(&endpoint)
-            .headers(headers)
-            .timeout(MAX_CLASSIFICATION_LATENCY)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|err| {
-                if err.is_timeout() {
-                    ClassifierError::StaleLatency(started.elapsed().as_millis())
-                } else {
-                    ClassifierError::Http(err.to_string())
-                }
-            })?;
-
-        let latency = started.elapsed();
-        if latency > MAX_CLASSIFICATION_LATENCY {
-            return Err(ClassifierError::StaleLatency(latency.as_millis()));
-        }
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|err| ClassifierError::Http(err.to_string()))?;
-
-        if !status.is_success() {
-            return Err(ClassifierError::UpstreamStatus {
-                status: status.as_u16(),
-                body: truncate_error_body(&body),
-            });
-        }
-
-        parse_system_one_response(&body, latency)
-    }
-
-    pub async fn generate_nudge(
-        &self,
-        base_url: &str,
-        api_key: &str,
-        model: &str,
-        declared_task: &str,
+        goal: &str,
         active_app: &str,
-        window_title: &str,
         ocr_lines: &[String],
-    ) -> Result<NudgeDirective, ClassifierError> {
-        let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
+        base64_jpeg: String,
+    ) -> Result<TaskPlan, AgentError> {
         let effective_model = normalize_model_for_endpoint(base_url, model);
-
         let ocr_block = if ocr_lines.is_empty() {
             "(no visible OCR lines)".to_string()
         } else {
             ocr_lines.join("\n")
         };
 
-        let system_prompt = "You are a witty, warm macOS focus companion cursor. \
-Write ONE concise, playful, non-judgmental sentence (max 18 words) nudging the user back to their declared_task. \
-Also select target_ocr_id matching the integer ID in brackets [N] of the most distracting visible element on screen, or null if none match. \
-Respond strictly as JSON with keys nudge_text and target_ocr_id.";
+        let system_prompt = "You are a macOS task orchestrator companion. \
+Break the user's goal into 2 to 6 concise, concrete UI action steps tailored to their current screen. \
+Respond strictly as JSON with a \"steps\" array of short imperative strings.";
 
         let user_prompt = format!(
-            "Declared task: {declared_task}\nActive app: {active_app}\nWindow title: {window_title}\nVisible OCR lines:\n{ocr_block}"
+            "Goal: {goal}\nActive app: {active_app}\nVisible OCR lines:\n{ocr_block}"
         );
 
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "nudge_text": { "type": "string" },
-                "target_ocr_id": { "type": ["integer", "null"] }
+                "steps": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
             },
-            "required": ["nudge_text", "target_ocr_id"]
+            "required": ["steps"]
         });
 
-        let chat_req = OllamaChatRequest {
+        let req = OllamaChatRequest {
             model: effective_model,
             messages: vec![
                 OllamaChatMessage {
                     role: "system".to_string(),
                     content: system_prompt.to_string(),
+                    images: None,
                 },
                 OllamaChatMessage {
                     role: "user".to_string(),
                     content: user_prompt,
+                    images: Some(vec![base64_jpeg]),
                 },
             ],
             stream: false,
             format: schema,
-            options: OllamaChatOptions { temperature: 0.4 },
+            options: OllamaChatOptions { temperature: 0.2 },
         };
 
-        let mut last_err: Option<ClassifierError> = None;
+        let raw = self.post_chat_with_retry(base_url, api_key, &req).await?;
+        parse_task_plan_response(&raw)
+    }
+
+    pub async fn decide_next_action(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        ctx: NextActionContext,
+    ) -> Result<PlannedActionDecision, AgentError> {
+        let effective_model = normalize_model_for_endpoint(base_url, model);
+
+        let plan_block = if ctx.plan_steps.is_empty() {
+            "(no plan)".to_string()
+        } else {
+            ctx.plan_steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {s}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let recent_block = if ctx.recent_steps.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            ctx.recent_steps.join("\n")
+        };
+
+        let ocr_block = if ctx.ocr_lines.is_empty() {
+            "(no visible OCR lines)".to_string()
+        } else {
+            ctx.ocr_lines.join("\n")
+        };
+
+        let system_prompt = "You are a precise, warm, playful macOS computer-use companion (like Bluey). \
+Look at the screenshot, OCR lines, plan, and recent steps, then choose the SINGLE best next action to advance the user's goal.\n\
+Available action_type values:\n\
+- \"click\", \"double_click\", \"right_click\": specify target_ocr_id matching [N] from OCR lines whenever text matches your target; otherwise provide normalized x_norm and y_norm in [0.0, 1.0] from top-left.\n\
+- \"type_text\": set text (types into currently focused input).\n\
+- \"press_key\": set key (e.g. \"enter\", \"tab\", \"escape\", \"space\", \"a\"-\"z\", \"up\", \"down\") and modifiers ([\"cmd\"], [\"shift\"], [\"alt\"], [\"ctrl\"]).\n\
+- \"scroll\": set scroll_delta_y (negative scrolls down, positive scrolls up) and optional target_ocr_id or x_norm/y_norm.\n\
+- \"open_app\": set app_name directly (prefer this over Spotlight when launching an app).\n\
+- \"open_url\": set url directly (https:// or http://, prefer this over clicking browser bars when opening a known site).\n\
+- \"wait\": set wait_ms (100..5000) if waiting for a page or app to load.\n\
+- \"done\": set summary once the goal is visibly completed on screen.\n\
+- \"fail\": set summary explaining why the task cannot proceed.\n\
+Rules:\n\
+1. narration must be ONE friendly, concise line (max 16 words) telling the user what you are doing right now.\n\
+2. Set requires_confirmation=true before deleting, sending messages/emails, submitting forms, purchasing, or making irreversible changes.\n\
+3. Do not repeat an identical failed or ineffective step; adapt if the UI did not change.\n\
+4. Respond strictly as JSON matching the schema.";
+
+        let user_prompt = format!(
+            "Goal: {}\nStep: {} / {}\nActive app: {}\nWindow title: {}\nScreen: {}x{}\nPlan:\n{}\nRecent steps:\n{}\nVisible OCR lines:\n{}",
+            ctx.goal,
+            ctx.step_number,
+            ctx.max_steps,
+            ctx.active_app,
+            ctx.window_title,
+            ctx.screen_width,
+            ctx.screen_height,
+            plan_block,
+            recent_block,
+            ocr_block
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thought": { "type": "string" },
+                "narration": { "type": "string" },
+                "plan_step_index": { "type": "integer" },
+                "action_type": {
+                    "type": "string",
+                    "enum": ["click", "double_click", "right_click", "type_text", "press_key", "scroll", "open_app", "open_url", "wait", "done", "fail"]
+                },
+                "target_ocr_id": { "type": ["integer", "null"] },
+                "x_norm": { "type": ["number", "null"] },
+                "y_norm": { "type": ["number", "null"] },
+                "text": { "type": ["string", "null"] },
+                "key": { "type": ["string", "null"] },
+                "modifiers": { "type": "array", "items": { "type": "string" } },
+                "scroll_delta_y": { "type": ["integer", "null"] },
+                "app_name": { "type": ["string", "null"] },
+                "url": { "type": ["string", "null"] },
+                "wait_ms": { "type": ["integer", "null"] },
+                "requires_confirmation": { "type": "boolean" },
+                "summary": { "type": ["string", "null"] }
+            },
+            "required": ["narration", "plan_step_index", "action_type", "requires_confirmation"]
+        });
+
+        let req = OllamaChatRequest {
+            model: effective_model,
+            messages: vec![
+                OllamaChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt.to_string(),
+                    images: None,
+                },
+                OllamaChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                    images: Some(vec![ctx.base64_jpeg]),
+                },
+            ],
+            stream: false,
+            format: schema,
+            options: OllamaChatOptions { temperature: 0.15 },
+        };
+
+        let raw = self.post_chat_with_retry(base_url, api_key, &req).await?;
+        parse_action_decision_response(&raw)
+    }
+
+    async fn post_chat_with_retry(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        req: &OllamaChatRequest,
+    ) -> Result<String, AgentError> {
+        let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
+        let mut last_err: Option<AgentError> = None;
+
         for attempt in 0..2 {
             let headers = build_headers(api_key)?;
             match self
                 .http
                 .post(&endpoint)
                 .headers(headers)
-                .timeout(NUDGE_REQUEST_TIMEOUT)
-                .json(&chat_req)
+                .timeout(AGENT_REQUEST_TIMEOUT)
+                .json(req)
                 .send()
                 .await
             {
@@ -297,11 +309,11 @@ Respond strictly as JSON with keys nudge_text and target_ocr_id.";
                     let text = resp
                         .text()
                         .await
-                        .map_err(|e| ClassifierError::Http(e.to_string()))?;
+                        .map_err(|e| AgentError::Http(e.to_string()))?;
                     if status.is_success() {
-                        return parse_nudge_chat_response(&text);
+                        return Ok(text);
                     }
-                    let err = ClassifierError::UpstreamStatus {
+                    let err = AgentError::UpstreamStatus {
                         status: status.as_u16(),
                         body: truncate_error_body(&text),
                     };
@@ -313,7 +325,7 @@ Respond strictly as JSON with keys nudge_text and target_ocr_id.";
                     return Err(err);
                 }
                 Err(err) => {
-                    let mapped = ClassifierError::Http(err.to_string());
+                    let mapped = AgentError::Http(err.to_string());
                     if attempt == 0 {
                         last_err = Some(mapped);
                         tokio::time::sleep(Duration::from_millis(350)).await;
@@ -324,55 +336,96 @@ Respond strictly as JSON with keys nudge_text and target_ocr_id.";
             }
         }
 
-        Err(last_err.unwrap_or_else(|| ClassifierError::Http("unknown nudge error".to_string())))
+        Err(last_err.unwrap_or_else(|| AgentError::Http("unknown agent error".to_string())))
     }
 }
 
-pub fn parse_system_one_response(
-    raw_json: &str,
-    latency: Duration,
-) -> Result<ClassificationOutcome, ClassifierError> {
-    if latency > MAX_CLASSIFICATION_LATENCY {
-        return Err(ClassifierError::StaleLatency(latency.as_millis()));
-    }
-    let parsed: SystemOneResponse = serde_json::from_str(raw_json)
-        .map_err(|err| ClassifierError::MalformedPayload(err.to_string()))?;
-    let prob_off_task = parsed.answers.activity.probabilities.off_task.clamp(0.0, 1.0);
-    let confidence = parsed.answers.activity.confidence.clamp(0.0, 1.0);
-    Ok(ClassificationOutcome {
-        choice: parsed.answers.activity.choice,
-        prob_off_task,
-        confidence,
-        latency,
-    })
-}
-
-pub fn parse_nudge_chat_response(raw_json: &str) -> Result<NudgeDirective, ClassifierError> {
+pub fn parse_task_plan_response(raw_json: &str) -> Result<TaskPlan, AgentError> {
     let chat: OllamaChatResponse = serde_json::from_str(raw_json)
-        .map_err(|err| ClassifierError::MalformedPayload(err.to_string()))?;
-    let raw_content = chat.message.content.trim();
-    let directive: NudgeDirective = serde_json::from_str(raw_content)
-        .map_err(|err| ClassifierError::MalformedPayload(err.to_string()))?;
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let content = extract_json_object(chat.message.content.trim());
+    let parsed: TaskPlan = serde_json::from_str(content)
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
 
-    let sanitized_text = directive
-        .nudge_text
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect::<String>()
-        .trim()
-        .to_string();
+    let steps: Vec<String> = parsed
+        .steps
+        .into_iter()
+        .map(|s| sanitize_line(&s, 140))
+        .filter(|s| !s.is_empty())
+        .take(6)
+        .collect();
 
-    if sanitized_text.is_empty() {
-        return Err(ClassifierError::MalformedPayload(
-            "empty nudge_text returned by model".to_string(),
+    if steps.is_empty() {
+        return Err(AgentError::MalformedPayload(
+            "task plan returned zero steps".to_string(),
         ));
     }
 
-    Ok(NudgeDirective {
-        nudge_text: sanitized_text,
-        target_ocr_id: directive.target_ocr_id.filter(|id| *id >= 1),
-    })
+    Ok(TaskPlan { steps })
+}
+
+pub fn parse_action_decision_response(raw_json: &str) -> Result<PlannedActionDecision, AgentError> {
+    let chat: OllamaChatResponse = serde_json::from_str(raw_json)
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+    let content = extract_json_object(chat.message.content.trim());
+    let mut decision: PlannedActionDecision = serde_json::from_str(content)
+        .map_err(|err| AgentError::MalformedPayload(err.to_string()))?;
+
+    decision.action_type = decision.action_type.trim().to_ascii_lowercase();
+    let valid_action = matches!(
+        decision.action_type.as_str(),
+        "click"
+            | "double_click"
+            | "right_click"
+            | "type_text"
+            | "press_key"
+            | "scroll"
+            | "open_app"
+            | "open_url"
+            | "wait"
+            | "done"
+            | "fail"
+    );
+    if !valid_action {
+        return Err(AgentError::MalformedPayload(format!(
+            "unsupported action_type \"{}\"",
+            decision.action_type
+        )));
+    }
+
+    decision.narration = sanitize_line(&decision.narration, 180);
+    if decision.narration.is_empty() {
+        decision.narration = format!("Performing {}", decision.action_type);
+    }
+    decision.thought = sanitize_line(&decision.thought, 240);
+    decision.target_ocr_id = decision.target_ocr_id.filter(|id| *id >= 1);
+    decision.x_norm = decision.x_norm.map(|v| v.clamp(0.0, 1.0));
+    decision.y_norm = decision.y_norm.map(|v| v.clamp(0.0, 1.0));
+    decision.summary = decision
+        .summary
+        .map(|s| sanitize_line(&s, 280))
+        .filter(|s| !s.is_empty());
+
+    Ok(decision)
+}
+
+fn extract_json_object(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            return &trimmed[start..=end];
+        }
+    }
+    trimmed
+}
+
+fn sanitize_line(raw: &str, max_chars: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn normalize_model_for_endpoint(base_url: &str, model: &str) -> String {
@@ -384,14 +437,14 @@ fn normalize_model_for_endpoint(base_url: &str, model: &str) -> String {
     }
 }
 
-fn build_headers(api_key: &str) -> Result<HeaderMap, ClassifierError> {
+fn build_headers(api_key: &str) -> Result<HeaderMap, AgentError> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let trimmed = api_key.trim();
     if !trimmed.is_empty() {
         let bearer = format!("Bearer {trimmed}");
         let header_val = HeaderValue::from_str(&bearer)
-            .map_err(|_| ClassifierError::Http("invalid API key header characters".to_string()))?;
+            .map_err(|_| AgentError::Http("invalid API key header characters".to_string()))?;
         headers.insert(AUTHORIZATION, header_val);
     }
     Ok(headers)
@@ -409,87 +462,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serializes_exact_clef_systemone_request_contract() {
-        let req = OllamaCloudClient::build_system_one_request(
-            "clef",
-            SystemOneState {
-                declared_task: "Building a Rust focus app".to_string(),
-                active_app: "Google Chrome".to_string(),
-                elapsed_minutes: 12,
-                ocr_lines: vec![
-                    "[1] YouTube - Trending".to_string(),
-                    "[2] Shorts".to_string(),
-                ],
-            },
-            "rawbase64jpeg".to_string(),
-        );
-        let val = serde_json::to_value(&req).expect("serialize systemone request");
-        assert_eq!(val["model"], "clef");
-        assert_eq!(val["state"]["declared_task"], "Building a Rust focus app");
-        assert_eq!(val["state"]["active_app"], "Google Chrome");
-        assert_eq!(val["state"]["elapsed_minutes"], 12);
-        assert_eq!(val["images"][0], "rawbase64jpeg");
-        assert_eq!(val["questions"]["activity"]["type"], "choice");
-        assert!(val["questions"]["activity"]["criteria"]["on_task"].is_string());
-        assert!(val["questions"]["activity"]["criteria"]["off_task"].is_string());
-        assert!(val["questions"]["activity"]["criteria"]["uncertain"].is_string());
-    }
-
-    #[test]
-    fn parses_valid_systemone_response() {
-        let sample = r#"{
-            "model": "clef",
-            "answers": {
-                "activity": {
-                    "type": "choice",
-                    "choice": "off_task",
-                    "probabilities": {
-                        "on_task": 0.04,
-                        "off_task": 0.93,
-                        "uncertain": 0.03
-                    },
-                    "confidence": 0.91
-                }
-            }
-        }"#;
-        let outcome =
-            parse_system_one_response(sample, Duration::from_millis(420)).expect("valid parse");
-        assert_eq!(outcome.choice, ActivityChoice::OffTask);
-        assert!((outcome.prob_off_task - 0.93).abs() < 1e-6);
-        assert!((outcome.confidence - 0.91).abs() < 1e-6);
-    }
-
-    #[test]
-    fn rejects_stale_systemone_response_exceeding_20s() {
-        let sample = r#"{
-            "answers": {
-                "activity": {
-                    "choice": "off_task",
-                    "probabilities": { "off_task": 0.98 },
-                    "confidence": 0.95
-                }
-            }
-        }"#;
-        let err = parse_system_one_response(sample, Duration::from_millis(20_500))
-            .expect_err("latency over 20s must fail");
-        assert!(matches!(err, ClassifierError::StaleLatency(_)));
-    }
-
-    #[test]
-    fn parses_deepseek_nudge_chat_response() {
+    fn parses_task_plan_and_sanitizes_steps() {
         let raw = r#"{
-            "model": "deepseek-v4.1-flash",
+            "model": "qwen3-vl:235b",
             "message": {
                 "role": "assistant",
-                "content": "{\"nudge_text\":\"Those Shorts can wait—your Rust compiler misses you!\",\"target_ocr_id\":2}"
+                "content": "{\"steps\":[\"Open Notes app\",\"Create a new note\",\"Type shopping list\",\"\",\"Step 4\",\"Step 5\",\"Step 6\",\"Step 7\"]}"
             },
             "done": true
         }"#;
-        let parsed = parse_nudge_chat_response(raw).expect("valid nudge json");
-        assert_eq!(
-            parsed.nudge_text,
-            "Those Shorts can wait—your Rust compiler misses you!"
-        );
-        assert_eq!(parsed.target_ocr_id, Some(2));
+        let plan = parse_task_plan_response(raw).expect("valid plan");
+        assert_eq!(plan.steps.len(), 6);
+        assert_eq!(plan.steps[0], "Open Notes app");
+    }
+
+    #[test]
+    fn parses_valid_action_decision_and_clamps_coordinates() {
+        let raw = r#"{
+            "model": "qwen3-vl:235b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"thought\":\"Click compose button\",\"narration\":\"Opening a fresh note for you!\",\"plan_step_index\":1,\"action_type\":\"CLICK\",\"target_ocr_id\":4,\"x_norm\":1.4,\"y_norm\":-0.2,\"requires_confirmation\":false}"
+            },
+            "done": true
+        }"#;
+        let decision = parse_action_decision_response(raw).expect("valid decision");
+        assert_eq!(decision.action_type, "click");
+        assert_eq!(decision.target_ocr_id, Some(4));
+        assert_eq!(decision.x_norm, Some(1.0));
+        assert_eq!(decision.y_norm, Some(0.0));
+        assert_eq!(decision.narration, "Opening a fresh note for you!");
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_action_responses() {
+        let bad_action = r#"{
+            "message": {
+                "role": "assistant",
+                "content": "{\"narration\":\"hi\",\"plan_step_index\":0,\"action_type\":\"run_shell\",\"requires_confirmation\":false}"
+            }
+        }"#;
+        assert!(matches!(
+            parse_action_decision_response(bad_action),
+            Err(AgentError::MalformedPayload(_))
+        ));
+
+        let bad_json = r#"{"message":{"role":"assistant","content":"not json"}}"#;
+        assert!(matches!(
+            parse_task_plan_response(bad_json),
+            Err(AgentError::MalformedPayload(_))
+        ));
     }
 }

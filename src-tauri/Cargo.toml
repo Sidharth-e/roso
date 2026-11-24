@@ -1,7 +1,7 @@
 [package]
 name = "focus-companion"
 version = "0.1.0"
-description = "Standalone macOS focus companion powered by Ollama Cloud"
+description = "Standalone macOS task orchestrator and computer-use companion powered by Ollama"
 authors = ["Focus Companion"]
 edition = "2021"
 
@@ -32,6 +32,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSDictionary", "NSError", "NSGeometry", "NSString"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase", "CFData", "CFCGTypes"] }
-objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGDataProvider", "CGColorSpace", "CGWindow", "objc2"] }
+objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGDataProvider", "CGColorSpace", "CGWindow", "CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "objc2"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPanel", "NSWindow", "NSResponder", "NSScreen", "NSEvent", "NSGraphics", "NSColor", "NSView", "objc2-core-foundation"] }
 objc2-vision = { version = "0.3", features = ["VNObservation", "VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "objc2-core-graphics"] }

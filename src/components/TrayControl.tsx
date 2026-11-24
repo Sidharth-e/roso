@@ -3,108 +3,81 @@ import {
   useAppConfigQuery,
   useEngineEventSync,
   useEngineSnapshotQuery,
-  useFocusHistoryQuery,
-  useFocusMutations,
+  useTaskHistoryQuery,
+  useTaskMutations,
 } from "../api";
-import { useFocusUiStore } from "../store";
-import type { AppConfig, TimelineSegment } from "../types";
-import { Button, Card, Input, StatusBadge, Switch, TabBar } from "./UiPrimitives";
+import { useTaskUiStore } from "../store";
+import type { AppConfig, TaskPhase } from "../types";
+import {
+  Button,
+  Card,
+  Input,
+  StatusBadge,
+  Switch,
+  TabBar,
+  TextArea,
+} from "./UiPrimitives";
 
-const DURATION_PRESETS: ReadonlyArray<number> = [15, 25, 45, 60, 90];
+const EXAMPLE_GOALS: ReadonlyArray<string> = [
+  "Open Notes and create a checklist for today's sprint",
+  "Open Safari to github.com/trending and scroll down",
+  "Open Calculator and compute 42 * 18",
+];
 
-function formatClock(totalSeconds: number): string {
-  const safe = Math.max(0, Math.ceil(totalSeconds));
-  const mins = Math.floor(safe / 60);
-  const secs = safe % 60;
-  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
-function statusBadgeProps(choice: string): {
-  tone: "success" | "warning" | "neutral" | "info";
+function phaseBadgeProps(phase: TaskPhase | undefined): {
+  tone: "success" | "warning" | "error" | "neutral" | "info";
   label: string;
 } {
-  if (choice === "on_task") {
-    return { tone: "success", label: "On Task" };
+  switch (phase) {
+    case "planning":
+      return { tone: "info", label: "Planning" };
+    case "running":
+      return { tone: "info", label: "Acting" };
+    case "awaiting_confirmation":
+      return { tone: "warning", label: "Approve?" };
+    case "paused":
+      return { tone: "neutral", label: "Paused" };
+    case "completed":
+      return { tone: "success", label: "Done" };
+    case "failed":
+      return { tone: "error", label: "Failed" };
+    case "stopped":
+      return { tone: "warning", label: "Stopped" };
+    default:
+      return { tone: "neutral", label: "Ready" };
   }
-  if (choice === "off_task") {
-    return { tone: "warning", label: "Off Task" };
-  }
-  if (choice === "uncertain") {
-    return { tone: "neutral", label: "Uncertain" };
-  }
-  return { tone: "info", label: "Ready" };
 }
 
-function segmentFillClass(status: string): string {
-  if (status === "on_task") {
-    return "fill-success";
+function outcomeTone(
+  outcome: string
+): "success" | "warning" | "error" | "neutral" | "info" {
+  if (outcome === "completed") {
+    return "success";
   }
-  if (status === "off_task") {
-    return "fill-warning";
+  if (outcome === "failed") {
+    return "error";
   }
-  return "fill-tertiary";
+  if (outcome === "stopped" || outcome === "max_steps") {
+    return "warning";
+  }
+  return "neutral";
 }
 
-function TimelineBar({ segments }: { segments: ReadonlyArray<TimelineSegment> }) {
-  if (segments.length === 0) {
-    return (
-      <div className="flex h-3 w-full items-center justify-center rounded-full bg-background/80">
-        <span className="sr-only">No classifications recorded yet</span>
-      </div>
-    );
-  }
-
-  const total = segments.length;
-  const stepWidth = 100 / total;
-
-  return (
-    <svg
-      viewBox="0 0 100 8"
-      preserveAspectRatio="none"
-      role="img"
-      aria-label="Live session activity timeline"
-      className="h-3 w-full overflow-hidden rounded-full bg-background/80"
-    >
-      {segments.map((seg, idx) => (
-        <rect
-          key={`${seg.timestamp}-${idx}`}
-          x={idx * stepWidth}
-          y={0}
-          width={Math.max(stepWidth - 0.35, 0.4)}
-          height={8}
-          className={segmentFillClass(seg.status)}
-        />
-      ))}
-    </svg>
-  );
-}
-
-function MeterBar({
-  value,
-  max,
-  tone,
-  label,
-}: {
-  value: number;
-  max: number;
-  tone: "primary" | "warning";
-  label: string;
-}) {
+function StepMeterBar({ value, max }: { value: number; max: number }) {
   const pct = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0;
-  const fillClass = tone === "warning" ? "fill-warning" : "fill-primary";
 
   return (
     <svg
       viewBox="0 0 100 6"
       preserveAspectRatio="none"
       role="progressbar"
-      aria-label={label}
+      aria-label="Task step progress"
       aria-valuenow={Math.round(pct)}
       aria-valuemin={0}
       aria-valuemax={100}
       className="h-1.5 w-full overflow-hidden rounded-full bg-background/80"
     >
-      <rect x={0} y={0} width={pct} height={6} className={fillClass} />
+      <rect x={0} y={0} width={pct} height={6} className="fill-primary" />
     </svg>
   );
 }
@@ -112,28 +85,25 @@ function MeterBar({
 export function TrayControl() {
   useEngineEventSync();
 
-  const activeTab = useFocusUiStore((s) => s.activeTab);
-  const setActiveTab = useFocusUiStore((s) => s.setActiveTab);
-  const theme = useFocusUiStore((s) => s.theme);
-  const toggleTheme = useFocusUiStore((s) => s.toggleTheme);
-  const draftTask = useFocusUiStore((s) => s.draftTask);
-  const setDraftTask = useFocusUiStore((s) => s.setDraftTask);
-  const draftDurationMinutes = useFocusUiStore((s) => s.draftDurationMinutes);
-  const setDraftDurationMinutes = useFocusUiStore((s) => s.setDraftDurationMinutes);
+  const activeTab = useTaskUiStore((s) => s.activeTab);
+  const setActiveTab = useTaskUiStore((s) => s.setActiveTab);
+  const theme = useTaskUiStore((s) => s.theme);
+  const toggleTheme = useTaskUiStore((s) => s.toggleTheme);
+  const draftGoal = useTaskUiStore((s) => s.draftGoal);
+  const setDraftGoal = useTaskUiStore((s) => s.setDraftGoal);
 
   const snapshotQuery = useEngineSnapshotQuery();
   const configQuery = useAppConfigQuery();
-  const historyQuery = useFocusHistoryQuery();
-  const mutations = useFocusMutations();
+  const historyQuery = useTaskHistoryQuery();
+  const mutations = useTaskMutations();
 
   const [configDraft, setConfigDraft] = useState<AppConfig | null>(null);
 
   useEffect(() => {
     if (configQuery.data && configDraft === null) {
       setConfigDraft(configQuery.data);
-      setDraftDurationMinutes(configQuery.data.defaultDurationMinutes);
     }
-  }, [configQuery.data, configDraft, setDraftDurationMinutes]);
+  }, [configQuery.data, configDraft]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -146,20 +116,21 @@ export function TrayControl() {
   }, [mutations.hidePopover]);
 
   const snapshot = snapshotQuery.data;
-  const isIdle = !snapshot || snapshot.phase === "idle";
-  const isRunning = snapshot?.phase === "running";
-  const isPaused = snapshot?.phase === "paused";
-  const badge = statusBadgeProps(snapshot?.lastChoice ?? "idle");
+  const phase = snapshot?.phase ?? "idle";
+  const isActive =
+    phase === "planning" ||
+    phase === "running" ||
+    phase === "paused" ||
+    phase === "awaiting_confirmation";
+  const badge = phaseBadgeProps(snapshot?.phase);
 
-  function handleStart(event: FormEvent) {
+  function handleRunTask(event: FormEvent) {
     event.preventDefault();
-    if (draftTask.trim().length === 0) {
+    const clean = draftGoal.trim();
+    if (clean.length === 0) {
       return;
     }
-    mutations.startSession.mutate({
-      declaredTask: draftTask.trim(),
-      durationMinutes: draftDurationMinutes,
-    });
+    mutations.startTask.mutate({ goal: clean });
   }
 
   function handleSaveSettings(event: FormEvent) {
@@ -175,14 +146,14 @@ export function TrayControl() {
       <header className="mb-3 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-primary/15 text-xs font-bold text-primary">
-            FC
+            TC
           </span>
           <div>
             <h1 className="text-sm font-bold leading-tight text-foreground">
-              Focus Companion
+              Task Companion
             </h1>
             <p className="text-[11px] text-tertiary">
-              Clef + DeepSeek Cloud Companion
+              Ollama Computer-Use Agent
             </p>
           </div>
         </div>
@@ -210,7 +181,7 @@ export function TrayControl() {
       <TabBar activeTab={activeTab} onSelect={setActiveTab} />
 
       <div className="mt-3 flex-1 space-y-3 overflow-y-auto pr-0.5">
-        {activeTab === "focus" ? (
+        {activeTab === "task" ? (
           <>
             {snapshot && !snapshot.screenPermissionGranted ? (
               <Card className="border-warning/40 bg-warning/10">
@@ -220,12 +191,12 @@ export function TrayControl() {
                       Screen Recording Needed
                     </p>
                     <p className="text-[11px] text-foreground/80">
-                      Grant macOS Screen Recording so Vision OCR &amp; Clef can run in RAM.
+                      Grant macOS Screen Recording so the agent can inspect your screen in RAM.
                     </p>
                   </div>
                   <Button
                     variant="secondary"
-                    onClick={() => mutations.requestPermission.mutate()}
+                    onClick={() => mutations.requestScreenPermission.mutate()}
                   >
                     Grant
                   </Button>
@@ -233,192 +204,278 @@ export function TrayControl() {
               </Card>
             ) : null}
 
-            {isIdle ? (
-              <form onSubmit={handleStart} className="space-y-3">
-                <Card className="space-y-3">
-                  <Input
-                    id="declared-task-input"
-                    label="What are you focusing on?"
-                    placeholder="e.g., Implementing Rust Vision OCR pipeline"
-                    maxLength={240}
-                    value={draftTask}
-                    onChange={(e) => setDraftTask(e.target.value)}
+            {snapshot && !snapshot.accessibilityPermissionGranted ? (
+              <Card className="border-warning/40 bg-warning/10">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-semibold text-warning">
+                      Accessibility Needed
+                    </p>
+                    <p className="text-[11px] text-foreground/80">
+                      Grant macOS Accessibility so the agent can click, type, and scroll.
+                    </p>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    onClick={() =>
+                      mutations.requestAccessibilityPermission.mutate()
+                    }
+                  >
+                    Grant
+                  </Button>
+                </div>
+              </Card>
+            ) : null}
+
+            {!isActive ? (
+              <form onSubmit={handleRunTask} className="space-y-3">
+                <Card className="space-y-2.5">
+                  <TextArea
+                    id="task-goal-input"
+                    label="What should I do on your Mac?"
+                    placeholder="e.g., Open Notes, create a new note, and write a sprint checklist"
+                    rows={3}
+                    maxLength={500}
+                    value={draftGoal}
+                    onChange={(e) => setDraftGoal(e.target.value)}
                   />
 
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <label
-                        htmlFor="duration-minutes-input"
-                        className="text-xs font-medium text-foreground/80"
+                  <div className="flex flex-wrap gap-1.5">
+                    {EXAMPLE_GOALS.map((sample) => (
+                      <button
+                        key={sample}
+                        type="button"
+                        onClick={() => setDraftGoal(sample)}
+                        className="rounded-md border border-tertiary/25 bg-background px-2 py-1 text-left text-[10px] font-medium text-tertiary transition hover:border-primary/40 hover:text-foreground"
                       >
-                        Duration (1–240 mins)
-                      </label>
-                      <span className="text-xs font-bold text-primary">
-                        {draftDurationMinutes} min
-                      </span>
-                    </div>
-                    <input
-                      id="duration-minutes-input"
-                      type="range"
-                      min={1}
-                      max={240}
-                      value={draftDurationMinutes}
-                      onChange={(e) =>
-                        setDraftDurationMinutes(Number(e.target.value))
-                      }
-                      className="w-full accent-primary"
-                    />
-                    <div className="grid grid-cols-5 gap-1 pt-0.5">
-                      {DURATION_PRESETS.map((preset) => (
-                        <button
-                          key={preset}
-                          type="button"
-                          onClick={() => setDraftDurationMinutes(preset)}
-                          className={`rounded-md py-1 text-[11px] font-semibold transition ${
-                            draftDurationMinutes === preset
-                              ? "bg-primary text-background"
-                              : "bg-background text-tertiary hover:text-foreground"
-                          }`}
-                        >
-                          {preset}m
-                        </button>
-                      ))}
-                    </div>
+                        {sample}
+                      </button>
+                    ))}
                   </div>
 
                   <Button
                     type="submit"
                     className="w-full"
                     disabled={
-                      draftTask.trim().length === 0 ||
-                      mutations.startSession.isPending
+                      draftGoal.trim().length === 0 ||
+                      mutations.startTask.isPending
                     }
                   >
-                    Start Focus Session
+                    {mutations.startTask.isPending
+                      ? "Starting..."
+                      : "Run Task"}
                   </Button>
                 </Card>
+
+                {snapshot &&
+                (phase === "completed" ||
+                  phase === "failed" ||
+                  phase === "stopped") &&
+                snapshot.lastSummary ? (
+                  <Card className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">
+                        Last Run
+                      </span>
+                      <StatusBadge tone={badge.tone} label={badge.label} />
+                    </div>
+                    <p className="text-xs font-medium text-foreground">
+                      {snapshot.lastSummary}
+                    </p>
+                    {snapshot.lastError ? (
+                      <p className="rounded bg-error/15 px-2 py-1 text-[11px] text-error">
+                        {snapshot.lastError}
+                      </p>
+                    ) : null}
+                  </Card>
+                ) : null}
               </form>
             ) : (
-              <Card className="space-y-3">
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="text-[11px] uppercase tracking-wider text-tertiary">
-                      Active Task
-                    </p>
-                    <p className="truncate text-xs font-semibold text-foreground">
-                      {snapshot.declaredTask}
-                    </p>
+              <div className="space-y-3">
+                <Card className="space-y-2.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-tertiary">
+                        Active Goal
+                      </p>
+                      <p className="text-xs font-semibold text-foreground">
+                        {snapshot?.goal}
+                      </p>
+                    </div>
+                    <span className="shrink-0 rounded border border-tertiary/30 bg-background px-1.5 py-0.5 text-[10px] font-semibold text-tertiary">
+                      ⌃⌥S Kill
+                    </span>
                   </div>
-                  {snapshot.developerMode ? (
-                    <StatusBadge tone="info" label="4x Dev" />
-                  ) : null}
-                </div>
 
-                <div className="flex items-baseline justify-between">
-                  <span className="text-3xl font-bold tabular-nums tracking-tight text-foreground">
-                    {formatClock(snapshot.remainingFocusSeconds)}
-                  </span>
-                  <span className="text-[11px] text-tertiary">
-                    Checks: {snapshot.checkCount} · Nudges: {snapshot.nudgeCount}
-                  </span>
-                </div>
+                  <div className="flex items-center justify-between text-[11px] text-tertiary">
+                    <span>
+                      Step {snapshot?.currentStep ?? 0} /{" "}
+                      {snapshot?.maxSteps ?? 20}
+                    </span>
+                    <span className="truncate max-w-[170px]">
+                      {snapshot?.activeApp || "Detecting..."}
+                    </span>
+                  </div>
 
-                <MeterBar
-                  value={snapshot.elapsedFocusSeconds}
-                  max={snapshot.durationMinutes * 60}
-                  tone="primary"
-                  label="Session progress"
-                />
+                  <StepMeterBar
+                    value={snapshot?.currentStep ?? 0}
+                    max={snapshot?.maxSteps ?? 20}
+                  />
 
-                <div className="grid grid-cols-2 gap-2 pt-1">
-                  {isRunning ? (
+                  <p className="rounded-lg bg-background/80 px-2.5 py-2 text-xs text-foreground">
+                    {snapshot?.lastNarration}
+                  </p>
+
+                  <div className="grid grid-cols-2 gap-2 pt-0.5">
+                    {phase === "running" ? (
+                      <Button
+                        variant="secondary"
+                        onClick={() => mutations.pauseTask.mutate()}
+                      >
+                        Pause
+                      </Button>
+                    ) : phase === "paused" ? (
+                      <Button
+                        variant="primary"
+                        onClick={() => mutations.resumeTask.mutate()}
+                      >
+                        Resume
+                      </Button>
+                    ) : (
+                      <Button variant="secondary" disabled>
+                        {phase === "planning" ? "Planning..." : "Waiting..."}
+                      </Button>
+                    )}
                     <Button
-                      variant="secondary"
-                      onClick={() => mutations.pauseSession.mutate()}
+                      variant="danger"
+                      onClick={() => mutations.stopTask.mutate()}
                     >
-                      Pause
+                      Stop (⌃⌥S)
                     </Button>
-                  ) : isPaused ? (
-                    <Button
-                      variant="primary"
-                      onClick={() => mutations.resumeSession.mutate()}
-                    >
-                      Resume
-                    </Button>
-                  ) : null}
-                  <Button
-                    variant="danger"
-                    onClick={() => mutations.stopSession.mutate()}
-                  >
-                    End Session
-                  </Button>
-                </div>
-              </Card>
+                  </div>
+                </Card>
+
+                {snapshot?.pendingConfirmation ? (
+                  <Card className="space-y-2.5 border-warning/50 bg-warning/10">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-warning">
+                        Confirm Step #{snapshot.pendingConfirmation.stepNumber}
+                      </span>
+                      <span className="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] font-semibold text-warning">
+                        {snapshot.pendingConfirmation.actionType}
+                      </span>
+                    </div>
+                    <p className="text-xs font-semibold text-foreground">
+                      {snapshot.pendingConfirmation.description}
+                    </p>
+                    <p className="text-[11px] text-foreground/80">
+                      {snapshot.pendingConfirmation.reason}
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant="primary"
+                        onClick={() =>
+                          mutations.resolveConfirmation.mutate({
+                            confirmationId: snapshot.pendingConfirmation!.id,
+                            approved: true,
+                          })
+                        }
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        variant="danger"
+                        onClick={() =>
+                          mutations.resolveConfirmation.mutate({
+                            confirmationId: snapshot.pendingConfirmation!.id,
+                            approved: false,
+                          })
+                        }
+                      >
+                        Deny
+                      </Button>
+                    </div>
+                  </Card>
+                ) : null}
+
+                {(snapshot?.planSteps.length ?? 0) > 0 ? (
+                  <Card className="space-y-2">
+                    <span className="text-xs font-semibold text-foreground">
+                      Orchestrated Plan
+                    </span>
+                    <ol className="space-y-1">
+                      {snapshot?.planSteps.map((stepText, idx) => {
+                        const activeIdx = snapshot.activePlanIndex;
+                        const done = idx < activeIdx;
+                        const current = idx === activeIdx;
+                        return (
+                          <li
+                            key={`${idx}-${stepText}`}
+                            className={`flex items-start gap-2 rounded-md px-2 py-1 text-[11px] ${
+                              current
+                                ? "bg-primary/15 font-semibold text-foreground"
+                                : done
+                                  ? "text-tertiary line-through"
+                                  : "text-foreground/80"
+                            }`}
+                          >
+                            <span className="shrink-0 font-mono text-[10px] text-primary">
+                              {done ? "✓" : `${idx + 1}.`}
+                            </span>
+                            <span>{stepText}</span>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </Card>
+                ) : null}
+              </div>
             )}
 
-            <Card className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-foreground">
-                  Session Timeline
-                </span>
-                <span className="text-[11px] text-tertiary">
-                  p(off_task): {Math.round((snapshot?.lastProbOffTask ?? 0) * 100)}%
-                </span>
-              </div>
-              <TimelineBar segments={snapshot?.timeline ?? []} />
-              <div className="flex items-center justify-between text-[10px] text-tertiary">
-                <span className="inline-flex items-center gap-1">
-                  <span className="h-2 w-2 rounded-full bg-success" /> On-task
-                </span>
-                <span className="inline-flex items-center gap-1">
-                  <span className="h-2 w-2 rounded-full bg-warning" /> Off-task
-                </span>
-                <span className="inline-flex items-center gap-1">
-                  <span className="h-2 w-2 rounded-full bg-tertiary" /> Uncertain
-                </span>
-              </div>
-
-              <div className="space-y-1 pt-1">
-                <div className="flex items-center justify-between text-[11px] text-tertiary">
-                  <span>Off-task Evidence Span</span>
-                  <span>
-                    {Math.round(snapshot?.evidenceFocusSeconds ?? 0)}s /{" "}
-                    {Math.round(snapshot?.requiredEvidenceFocusSeconds ?? 120)}s
+            {(snapshot?.steps.length ?? 0) > 0 ? (
+              <Card className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-foreground">
+                    Live Action Feed
+                  </span>
+                  <span className="text-[10px] text-tertiary">
+                    {snapshot?.steps.length} actions
                   </span>
                 </div>
-                <MeterBar
-                  value={snapshot?.evidenceFocusSeconds ?? 0}
-                  max={snapshot?.requiredEvidenceFocusSeconds ?? 120}
-                  tone="warning"
-                  label="Off-task evidence accumulation"
-                />
-              </div>
+                <div className="max-h-40 space-y-1.5 overflow-y-auto pr-0.5">
+                  {[...(snapshot?.steps ?? [])].reverse().map((step) => (
+                    <div
+                      key={`${step.stepNumber}-${step.timestamp}`}
+                      className="rounded-lg border border-tertiary/20 bg-background/70 px-2.5 py-1.5"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
+                          #{step.stepNumber} · {step.actionType}
+                        </span>
+                        <span className="text-[10px] font-medium text-tertiary">
+                          {step.status}
+                        </span>
+                      </div>
+                      <p className="text-[11px] font-medium text-foreground">
+                        {step.description}
+                      </p>
+                      <p className="text-[10px] text-tertiary">
+                        {step.narration}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            ) : null}
 
-              {snapshot?.lastError ? (
-                <p className="rounded bg-error/15 px-2 py-1 text-[11px] text-error">
-                  {snapshot.lastError}
-                </p>
-              ) : null}
-            </Card>
-
-            <Card className="space-y-3">
-              <Switch
-                id="developer-mode-switch"
-                checked={snapshot?.developerMode ?? false}
-                onChange={(enabled) =>
-                  mutations.toggleDeveloperMode.mutate(enabled)
-                }
-                label="Developer Mode"
-                description="4x focus clock speed & 10s check interval"
-              />
-
+            <Card>
               <Button
                 variant="secondary"
                 className="w-full"
-                onClick={() => mutations.testNudge.mutate()}
-                disabled={mutations.testNudge.isPending}
+                onClick={() => mutations.testPointer.mutate()}
+                disabled={mutations.testPointer.isPending}
               >
-                Test Nudge Overlay
+                Test Pointer Overlay
               </Button>
             </Card>
           </>
@@ -429,23 +486,26 @@ export function TrayControl() {
             {(historyQuery.data ?? []).length === 0 ? (
               <Card>
                 <p className="text-center text-xs text-tertiary">
-                  Completed focus sessions will appear here. Screenshots and OCR text are never stored.
+                  Completed task runs will appear here. Screenshots and OCR text are never stored.
                 </p>
               </Card>
             ) : (
               (historyQuery.data ?? []).map((item) => (
-                <Card key={item.sessionId} className="space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-xs font-semibold text-foreground">
-                      {item.declaredTask}
+                <Card key={item.taskId} className="space-y-1.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-xs font-semibold text-foreground">
+                      {item.goal}
                     </p>
-                    <span className="shrink-0 text-[10px] font-medium text-primary">
-                      {item.plannedDurationMinutes}m
-                    </span>
+                    <StatusBadge
+                      tone={outcomeTone(item.outcome)}
+                      label={item.outcome}
+                    />
                   </div>
-                  <div className="flex items-center justify-between text-[11px] text-tertiary">
-                    <span>Checks: {item.checkCount}</span>
-                    <span>Nudges: {item.nudgeTimestamps.length}</span>
+                  <p className="text-[11px] text-foreground/80">
+                    {item.summary}
+                  </p>
+                  <div className="flex items-center justify-between text-[10px] text-tertiary">
+                    <span>Steps: {item.stepCount}</span>
                     <span>
                       {new Date(item.startedAt).toLocaleTimeString([], {
                         hour: "2-digit",
@@ -487,35 +547,68 @@ export function TrayControl() {
                 }
               />
               <Input
-                id="classifier-model-input"
-                label="System One Classifier Model (/v1/systemone)"
-                placeholder="clef or clef-flash"
-                value={configDraft.classifierModel}
+                id="vision-model-input"
+                label="Vision Agent Model (/api/chat)"
+                placeholder="qwen3-vl:235b-cloud or gemma3:12b"
+                value={configDraft.visionModel}
                 onChange={(e) =>
                   setConfigDraft({
                     ...configDraft,
-                    classifierModel: e.target.value,
+                    visionModel: e.target.value,
                   })
                 }
               />
-              <Input
-                id="nudge-model-input"
-                label="Nudge & Targeting Model (/api/chat)"
-                placeholder="deepseek-v4.1-flash:cloud"
-                value={configDraft.nudgeModel}
-                onChange={(e) =>
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  id="max-steps-input"
+                  label="Max Steps (1–50)"
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={configDraft.maxSteps}
+                  onChange={(e) =>
+                    setConfigDraft({
+                      ...configDraft,
+                      maxSteps: Number(e.target.value) || 20,
+                    })
+                  }
+                />
+                <Input
+                  id="step-delay-input"
+                  label="Step Delay (ms)"
+                  type="number"
+                  min={200}
+                  max={5000}
+                  step={100}
+                  value={configDraft.stepDelayMs}
+                  onChange={(e) =>
+                    setConfigDraft({
+                      ...configDraft,
+                      stepDelayMs: Number(e.target.value) || 900,
+                    })
+                  }
+                />
+              </div>
+              <Switch
+                id="confirm-risky-switch"
+                checked={configDraft.confirmRiskyActions}
+                onChange={(checked) =>
                   setConfigDraft({
                     ...configDraft,
-                    nudgeModel: e.target.value,
+                    confirmRiskyActions: checked,
                   })
                 }
+                label="Confirm Risky Actions"
+                description="Ask before deleting, sending, submitting, or Cmd+Q"
               />
               <Button
                 type="submit"
                 className="w-full"
                 disabled={mutations.saveConfig.isPending}
               >
-                {mutations.saveConfig.isPending ? "Saving..." : "Save Configuration"}
+                {mutations.saveConfig.isPending
+                  ? "Saving..."
+                  : "Save Configuration"}
               </Button>
               {mutations.saveConfig.isError ? (
                 <p className="text-[11px] text-error">
@@ -524,7 +617,7 @@ export function TrayControl() {
               ) : null}
               {mutations.saveConfig.isSuccess ? (
                 <p className="text-[11px] text-success">
-                  Configuration saved to FocusCompanion/config.json.
+                  Configuration saved to TaskCompanion/config.json.
                 </p>
               ) : null}
             </Card>

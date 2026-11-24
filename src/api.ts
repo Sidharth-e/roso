@@ -11,12 +11,12 @@ import { z } from "zod";
 import {
   AppConfigSchema,
   EngineSnapshotSchema,
-  NudgeEventPayloadSchema,
-  SessionHistoryRecordSchema,
+  PointerCuePayloadSchema,
+  TaskHistoryRecordSchema,
   type AppConfig,
   type EngineSnapshot,
-  type NudgeEventPayload,
-  type SessionHistoryRecord,
+  type PointerCuePayload,
+  type TaskHistoryRecord,
 } from "./types";
 
 export function createOllamaAxiosInstance(
@@ -59,7 +59,7 @@ export function createOllamaAxiosInstance(
 export const QUERY_KEYS = {
   snapshot: ["engine-snapshot"] as const,
   config: ["app-config"] as const,
-  history: ["focus-history"] as const,
+  history: ["task-history"] as const,
 };
 
 async function fetchEngineSnapshot(): Promise<EngineSnapshot> {
@@ -72,16 +72,16 @@ async function fetchAppConfig(): Promise<AppConfig> {
   return AppConfigSchema.parse(raw);
 }
 
-async function fetchFocusHistory(): Promise<SessionHistoryRecord[]> {
-  const raw = await invoke<unknown>("get_focus_history");
-  return z.array(SessionHistoryRecordSchema).parse(raw);
+async function fetchTaskHistory(): Promise<TaskHistoryRecord[]> {
+  const raw = await invoke<unknown>("get_task_history");
+  return z.array(TaskHistoryRecordSchema).parse(raw);
 }
 
 export function useEngineSnapshotQuery() {
   return useQuery({
     queryKey: QUERY_KEYS.snapshot,
     queryFn: fetchEngineSnapshot,
-    refetchInterval: 2000,
+    refetchInterval: 1500,
   });
 }
 
@@ -93,10 +93,10 @@ export function useAppConfigQuery() {
   });
 }
 
-export function useFocusHistoryQuery() {
+export function useTaskHistoryQuery() {
   return useQuery({
     queryKey: QUERY_KEYS.history,
-    queryFn: fetchFocusHistory,
+    queryFn: fetchTaskHistory,
   });
 }
 
@@ -114,6 +114,13 @@ export function useEngineEventSync() {
       const parsed = EngineSnapshotSchema.safeParse(event.payload);
       if (parsed.success) {
         queryClient.setQueryData(QUERY_KEYS.snapshot, parsed.data);
+        if (
+          parsed.data.phase === "completed" ||
+          parsed.data.phase === "failed" ||
+          parsed.data.phase === "stopped"
+        ) {
+          void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.history });
+        }
       }
     })
       .then((unlisten) => {
@@ -134,15 +141,12 @@ export function useEngineEventSync() {
   }, [queryClient]);
 }
 
-export function useFocusMutations() {
+export function useTaskMutations() {
   const queryClient = useQueryClient();
 
-  const startSession = useMutation({
-    mutationFn: async (params: {
-      declaredTask: string;
-      durationMinutes: number;
-    }) => {
-      const raw = await invoke<unknown>("start_focus_session", params);
+  const startTask = useMutation({
+    mutationFn: async (params: { goal: string }) => {
+      const raw = await invoke<unknown>("start_task", params);
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
@@ -150,9 +154,9 @@ export function useFocusMutations() {
     },
   });
 
-  const pauseSession = useMutation({
+  const pauseTask = useMutation({
     mutationFn: async () => {
-      const raw = await invoke<unknown>("pause_focus_session");
+      const raw = await invoke<unknown>("pause_task");
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
@@ -160,9 +164,9 @@ export function useFocusMutations() {
     },
   });
 
-  const resumeSession = useMutation({
+  const resumeTask = useMutation({
     mutationFn: async () => {
-      const raw = await invoke<unknown>("resume_focus_session");
+      const raw = await invoke<unknown>("resume_task");
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
@@ -170,9 +174,9 @@ export function useFocusMutations() {
     },
   });
 
-  const stopSession = useMutation({
+  const stopTask = useMutation({
     mutationFn: async () => {
-      const raw = await invoke<unknown>("stop_focus_session");
+      const raw = await invoke<unknown>("stop_task");
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
@@ -181,14 +185,16 @@ export function useFocusMutations() {
     },
   });
 
-  const toggleDeveloperMode = useMutation({
-    mutationFn: async (enabled: boolean) => {
-      const raw = await invoke<unknown>("toggle_developer_mode", { enabled });
+  const resolveConfirmation = useMutation({
+    mutationFn: async (params: {
+      confirmationId: string;
+      approved: boolean;
+    }) => {
+      const raw = await invoke<unknown>("resolve_confirmation", params);
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
-      void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.config });
     },
   });
 
@@ -203,7 +209,7 @@ export function useFocusMutations() {
     },
   });
 
-  const requestPermission = useMutation({
+  const requestScreenPermission = useMutation({
     mutationFn: async () => {
       const raw = await invoke<unknown>("request_screen_permission");
       return z.boolean().parse(raw);
@@ -213,10 +219,20 @@ export function useFocusMutations() {
     },
   });
 
-  const testNudge = useMutation({
-    mutationFn: async (): Promise<NudgeEventPayload> => {
-      const raw = await invoke<unknown>("fire_test_nudge");
-      return NudgeEventPayloadSchema.parse(raw);
+  const requestAccessibilityPermission = useMutation({
+    mutationFn: async () => {
+      const raw = await invoke<unknown>("request_accessibility_permission");
+      return z.boolean().parse(raw);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.snapshot });
+    },
+  });
+
+  const testPointer = useMutation({
+    mutationFn: async (): Promise<PointerCuePayload> => {
+      const raw = await invoke<unknown>("fire_test_pointer");
+      return PointerCuePayloadSchema.parse(raw);
     },
   });
 
@@ -227,14 +243,15 @@ export function useFocusMutations() {
   });
 
   return {
-    startSession,
-    pauseSession,
-    resumeSession,
-    stopSession,
-    toggleDeveloperMode,
+    startTask,
+    pauseTask,
+    resumeTask,
+    stopTask,
+    resolveConfirmation,
     saveConfig,
-    requestPermission,
-    testNudge,
+    requestScreenPermission,
+    requestAccessibilityPermission,
+    testPointer,
     hidePopover,
   };
 }
