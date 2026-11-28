@@ -416,7 +416,7 @@ export function TrayControl() {
                 <Card className="space-y-3">
                   <div className="flex items-center justify-between font-mono text-[11px] text-tertiary">
                     <span>
-                      STEP {snapshot?.currentStep ?? 0}/{snapshot?.maxSteps ?? 40} ·{" "}
+                      STEP {snapshot?.currentStep ?? 0}/{snapshot?.maxSteps ?? 100} ·{" "}
                       {formatElapsed(snapshot?.startedAt, nowMs)}
                     </span>
                     <span className="max-w-[200px] truncate">
@@ -425,7 +425,7 @@ export function TrayControl() {
                   </div>
                   <StepMeterBar
                     value={snapshot?.currentStep ?? 0}
-                    max={snapshot?.maxSteps ?? 40}
+                    max={snapshot?.maxSteps ?? 100}
                   />
                   {snapshot?.activeModel ? (
                     <ModelChip role={snapshot.activeRole} model={snapshot.activeModel} active />

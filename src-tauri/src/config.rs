@@ -14,7 +14,7 @@ pub const DEFAULT_CODING_ACTOR_MODEL: &str = "qwen3-vl:235b-cloud";
 pub const DEFAULT_WRITING_ACTOR_MODEL: &str = "kimi-k3.1-pro:cloud";
 pub const DEFAULT_RECOVERY_MODEL: &str = "qwen3-vl:235b-cloud";
 pub const VISION_MODEL: &str = DEFAULT_VISION_ACTOR_MODEL;
-pub const MAX_STEPS: u32 = 40;
+pub const MAX_STEPS: u32 = 100;
 pub const STEP_DELAY_MS: u64 = 250;
 pub const CONFIRM_RISKY_ACTIONS: bool = true;
 
@@ -774,7 +774,7 @@ mod tests {
 
         assert_eq!(OLLAMA_BASE_URL, "https://ollama.com");
         assert_eq!(VISION_MODEL, "deepseek-v4.1-flash:cloud");
-        assert_eq!(MAX_STEPS, 40);
+        assert_eq!(MAX_STEPS, 100);
         assert_eq!(STEP_DELAY_MS, 250);
         assert!(CONFIRM_RISKY_ACTIONS);
     }
