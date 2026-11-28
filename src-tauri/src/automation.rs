@@ -631,18 +631,31 @@ fn find_sensitive_keyword(
         "shutdown",
         "restart",
     ];
+    // Typed text only matches whole keywords ("send", "delete"): prefix matching would flag
+    // ordinary words like "postgres" or "formatting" and stall tasks on approval prompts.
+    for token in text
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        // Whole word = the stem plus a common inflection ("delet" -> delete/deleted/deleting).
+        const SUFFIXES: &[&str] = &["", "e", "s", "es", "d", "ed", "ing"];
+        if let Some(&prefix) = PREFIXES.iter().find(|&&p| {
+            SUFFIXES
+                .iter()
+                .any(|suf| token.len() == p.len() + suf.len() && token.starts_with(p) && token.ends_with(suf))
+        }) {
+            return Some(prefix);
+        }
+    }
+
     let combined = match target_text {
         Some(t) => format!(
-            "{} {} {}",
-            text.to_ascii_lowercase(),
+            "{} {}",
             narration.to_ascii_lowercase(),
             t.to_ascii_lowercase()
         ),
-        None => format!(
-            "{} {}",
-            text.to_ascii_lowercase(),
-            narration.to_ascii_lowercase()
-        ),
+        None => narration.to_ascii_lowercase(),
     };
 
     for token in combined
@@ -663,9 +676,11 @@ pub fn redact_secrets(text: &str) -> String {
     while let Some(start) = out.find("-----BEGIN") {
         if let Some(end_rel) = out[start..].find("-----END") {
             let after_end = start + end_rel;
-            let line_end = out[after_end..]
+            // Skip the opening "-----END" so the search finds the closing dashes.
+            let label_start = after_end + "-----END".len();
+            let line_end = out[label_start..]
                 .find("-----")
-                .map(|p| after_end + p + 5)
+                .map(|p| label_start + p + 5)
                 .unwrap_or(out.len());
             out.replace_range(start..line_end, "[REDACTED_KEY]");
         } else {
@@ -674,9 +689,22 @@ pub fn redact_secrets(text: &str) -> String {
         }
     }
 
-    let tokens: Vec<String> = out
-        .split_whitespace()
-        .map(|tok| {
+    // Redact token by token while keeping the original whitespace and line structure.
+    let mut result = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while !rest.is_empty() {
+        let ws_len = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        result.push_str(&rest[..ws_len]);
+        rest = &rest[ws_len..];
+        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..tok_len];
+        rest = &rest[tok_len..];
+        if tok.is_empty() {
+            continue;
+        }
+        {
             let trimmed = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')'));
             let is_secret_prefix = trimmed.starts_with("sk-")
                 || trimmed.starts_with("sk_live_")
@@ -696,13 +724,13 @@ pub fn redact_secrets(text: &str) -> String {
                 .all(|c| c.is_ascii_digit() || c == '-');
             let looks_like_card = all_card_chars && (13..=19).contains(&digit_count);
             if (is_secret_prefix && trimmed.len() >= 12) || looks_like_card {
-                "[REDACTED]".to_string()
+                result.push_str("[REDACTED]");
             } else {
-                tok.to_string()
+                result.push_str(tok);
             }
-        })
-        .collect();
-    tokens.join(" ")
+        }
+    }
+    result
 }
 
 pub fn clamp_point(x: f64, y: f64, metrics: ScreenMetrics) -> (f64, f64) {
@@ -2093,6 +2121,29 @@ fn execute_hid_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_text_matches_whole_keywords_only() {
+        assert_eq!(find_sensitive_keyword("select * from postgres", "", None), None);
+        assert_eq!(find_sensitive_keyword("formatting the sender", "", None), None);
+        assert_eq!(find_sensitive_keyword("please delete it", "", None), Some("delet"));
+        assert_eq!(find_sensitive_keyword("sending", "", None), Some("send"));
+        assert_eq!(find_sensitive_keyword("Send", "", None), Some("send"));
+        // Narration and target text keep prefix matching.
+        assert_eq!(find_sensitive_keyword("hello", "deleting the file", None), Some("delet"));
+        assert_eq!(find_sensitive_keyword("hello", "", Some("Send message")), Some("send"));
+    }
+
+    #[test]
+    fn redact_secrets_keeps_line_structure_and_removes_whole_key_block() {
+        let key = "intro\n-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\nline2\n  line3";
+        let out = redact_secrets(key);
+        assert_eq!(out, "intro\n[REDACTED_KEY]\nline2\n  line3");
+        assert_eq!(
+            redact_secrets("token sk-abcdefghijkl1234 ok\nnext"),
+            "token [REDACTED] ok\nnext"
+        );
+    }
 
     #[test]
     fn replace_is_blocked_only_for_known_non_text_roles() {

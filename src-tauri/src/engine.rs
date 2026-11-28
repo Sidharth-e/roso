@@ -2801,7 +2801,11 @@ impl TaskEngine {
                 .steps
                 .iter_mut()
                 .rev()
-                .find(|s| s.step_number == step_number && s.action_type != "recovery_plan")
+                .find(|s| {
+                    s.step_number == step_number
+                        && s.action_type != "recovery_plan"
+                        && s.status != "skipped"
+                })
             {
                 last.status = status.to_string();
                 last.verification_note = Some(note);

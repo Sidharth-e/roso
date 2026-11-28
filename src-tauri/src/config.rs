@@ -602,7 +602,12 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
     }
     let raw = fs::read_to_string(&path)?;
     match serde_json::from_str::<AppConfig>(&raw) {
-        Ok(parsed) => {
+        Ok(mut parsed) => {
+            // A bad base URL must not discard the rest of the config (including the Keychain
+            // key lookup below): fall back to the default endpoint and keep going.
+            if validate_ollama_base_url(&parsed.ollama_base_url).is_err() {
+                parsed.ollama_base_url = default_ollama_base_url();
+            }
             let mut sanitized = parsed.sanitized()?;
             if sanitized.ollama_api_key.is_empty() {
                 if let Some(kc_key) = keychain::load_api_key() {
