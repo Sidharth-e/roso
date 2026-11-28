@@ -285,8 +285,7 @@ interface TabBarProps {
 }
 
 const TABS: ReadonlyArray<{ id: TrayTab; label: string }> = [
-  { id: "task", label: "Task" },
-  { id: "live", label: "Live" },
+  { id: "task", label: "Command" },
   { id: "history", label: "History" },
   { id: "settings", label: "Settings" },
 ];
@@ -307,17 +306,12 @@ export function TabBar({ activeTab, onSelect }: TabBarProps) {
       event.preventDefault();
       const targetTab = TABS[nextIdx];
       onSelect(targetTab.id);
-      const nextEl = document.getElementById(`tab-${targetTab.id}`);
-      nextEl?.focus();
+      document.getElementById(`tab-${targetTab.id}`)?.focus();
     }
   }
 
   return (
-    <div
-      role="tablist"
-      aria-label="Task Companion views"
-      className="grid grid-cols-4 gap-1 rounded-lg bg-secondary/80 p-1"
-    >
+    <div role="tablist" aria-label="Task Companion views" className="nav-dock">
       {TABS.map((tab, idx) => {
         const selected = tab.id === activeTab;
         return (
@@ -331,17 +325,27 @@ export function TabBar({ activeTab, onSelect }: TabBarProps) {
             tabIndex={selected ? 0 : -1}
             onClick={() => onSelect(tab.id)}
             onKeyDown={(e) => handleKeyDown(e, idx)}
-            className={`rounded-md py-1.5 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${
-              selected
-                ? "bg-background text-foreground shadow-sm"
-                : "text-tertiary hover:text-foreground"
-            }`}
+            className={selected ? "nav-dock-item-active" : "nav-dock-item"}
           >
             {tab.label}
           </button>
         );
       })}
     </div>
+  );
+}
+
+export function SendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M8 13V3M8 3L3.5 7.5M8 3L12.5 7.5"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 
@@ -469,7 +473,8 @@ export function StepMeterBar({ value, max }: { value: number; max: number }) {
       aria-valuenow={Math.round(pct)}
       aria-valuemin={0}
       aria-valuemax={100}
-      className="h-1.5 w-full overflow-hidden rounded-full bg-background/80"
+      className="h-1 w-full overflow-hidden rounded-full bg-primary/10"
+      style={{ filter: "drop-shadow(0 0 4px rgb(var(--color-primary) / 0.8))" }}
     >
       <rect x={0} y={0} width={pct} height={6} className="fill-primary" />
     </svg>

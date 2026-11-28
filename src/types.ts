@@ -182,6 +182,6 @@ export const PointerCuePayloadSchema = z.object({
 });
 export type PointerCuePayload = z.infer<typeof PointerCuePayloadSchema>;
 
-export type TrayTab = "task" | "live" | "history" | "settings";
+export type TrayTab = "task" | "history" | "settings";
 export type PanelFilter = "all" | "plan" | "think" | "steps";
 export type ThemeMode = "light" | "dark";

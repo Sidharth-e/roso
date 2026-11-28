@@ -277,13 +277,6 @@ export function SettingsForm({
           label="Judge Step Verification"
           description="Judge verifies stalled steps and completion before stopping."
         />
-        <Switch
-          id="toggle-auto-panel"
-          checked={models.autoOpenPanel}
-          onChange={(checked) => updateModelField("autoOpenPanel", checked)}
-          label="Auto-Open Live HUD Panel"
-          description="Show the floating live planning & thinking HUD when a task starts."
-        />
       </Card>
 
       <Card className="space-y-2">

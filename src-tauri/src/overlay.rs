@@ -14,12 +14,12 @@ pub const TRAY_ID: &str = "task-companion-tray";
 pub const TRAY_WINDOW_LABEL: &str = "main";
 pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
 pub const PANEL_WINDOW_LABEL: &str = "panel";
-const POPOVER_WIDTH: f64 = 400.0;
-const POPOVER_HEIGHT: f64 = 620.0;
-const PANEL_WIDTH: f64 = 352.0;
-const PANEL_HEIGHT: f64 = 580.0;
-const PANEL_COLLAPSED_WIDTH: f64 = 256.0;
-const PANEL_COLLAPSED_HEIGHT: f64 = 52.0;
+const POPOVER_WIDTH: f64 = 560.0;
+const POPOVER_HEIGHT: f64 = 700.0;
+const PANEL_WIDTH: f64 = 380.0;
+const PANEL_HEIGHT: f64 = 620.0;
+const PANEL_COLLAPSED_WIDTH: f64 = 280.0;
+const PANEL_COLLAPSED_HEIGHT: f64 = 56.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,21 +212,18 @@ mod macos_panel {
             return;
         }
 
-        let (screen_frame, mouse) = active_screen_frame(mtm);
-        let min_x = screen_frame.origin.x + 12.0;
-        let max_x = (screen_frame.origin.x + screen_frame.size.width - POPOVER_WIDTH - 12.0)
-            .max(min_x);
-        let desired_x = if align_to_cursor {
-            (mouse.x - POPOVER_WIDTH * 0.5).clamp(min_x, max_x)
-        } else {
-            (screen_frame.origin.x + screen_frame.size.width - POPOVER_WIDTH - 18.0)
-                .clamp(min_x, max_x)
-        };
-        let top_y = screen_frame.origin.y + screen_frame.size.height - 34.0;
+        // The main window is a centered modal on whichever screen holds the cursor.
+        let _ = align_to_cursor;
+        let (screen_frame, _) = active_screen_frame(mtm);
+        let width = POPOVER_WIDTH.min(screen_frame.size.width - 24.0);
+        let height = POPOVER_HEIGHT.min(screen_frame.size.height - 48.0);
+        let x = screen_frame.origin.x + (screen_frame.size.width - width) * 0.5;
+        let y = screen_frame.origin.y + (screen_frame.size.height - height) * 0.5;
+        let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
 
         unsafe {
             let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
-            ns_panel.setFrameTopLeftPoint(NSPoint::new(desired_x, top_y));
+            ns_panel.setFrame_display(rect, true);
             ns_panel.orderFrontRegardless();
             ns_panel.makeKeyWindow();
         }
@@ -633,10 +630,23 @@ pub fn show_tray_popover(app_handle: &AppHandle, align_to_cursor: bool) {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = align_to_cursor;
+            let _ = win.center();
             let _ = win.show();
             let _ = win.set_focus();
         }
     });
+}
+
+/// Task started: hide the main modal and show only the live orchestrator HUD.
+pub fn enter_task_mode(app_handle: &AppHandle) {
+    hide_tray_popover(app_handle);
+    show_orchestration_panel(app_handle);
+}
+
+/// Task finished/stopped: hide the live orchestrator and bring the main modal back.
+pub fn exit_task_mode(app_handle: &AppHandle) {
+    hide_orchestration_panel(app_handle);
+    show_tray_popover(app_handle, false);
 }
 
 pub fn hide_tray_popover(app_handle: &AppHandle) {

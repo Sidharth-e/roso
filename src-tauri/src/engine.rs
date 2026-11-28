@@ -24,8 +24,9 @@ use crate::ocr::{
     try_ax_press_at_position, ScreenTargetMap,
 };
 use crate::overlay::{
-    clear_pointer_cue, companion_window_is_key, emit_pointer_cue, hide_tray_popover, set_hud_ignores_mouse_events,
-    show_orchestration_panel, show_tray_popover, sync_overlay_to_metrics,
+    clear_pointer_cue, companion_window_is_key, emit_pointer_cue, enter_task_mode, exit_task_mode,
+    hide_tray_popover, set_hud_ignores_mouse_events,
+    show_tray_popover, sync_overlay_to_metrics,
     update_tray_status_title, PointerCuePayload,
 };
 use chrono::{DateTime, Utc};
@@ -317,9 +318,8 @@ impl TaskEngine {
         *self.pause_tx.lock() = Some(pause_tx);
         *self.confirm_tx.lock() = None;
 
-        if cfg.models.auto_open_panel {
-            show_orchestration_panel(&app_handle);
-        }
+        // While a task runs, only the live orchestrator HUD is on screen.
+        enter_task_mode(&app_handle);
 
         let snap = self.snapshot();
         update_tray_status_title(&app_handle, Some(&snap));
@@ -484,7 +484,7 @@ impl TaskEngine {
                                 &kill_handle,
                                 Some("Stopped by emergency shortcut (⌃⌥S)".to_string()),
                             );
-                            show_tray_popover(&kill_handle, false);
+                            exit_task_mode(&kill_handle);
                             break;
                         }
                     }
@@ -2879,6 +2879,7 @@ impl TaskEngine {
         let snap = self.snapshot();
         update_tray_status_title(app_handle, Some(&snap));
         let _ = app_handle.emit("engine-snapshot", &snap);
+        exit_task_mode(app_handle);
     }
 }
 

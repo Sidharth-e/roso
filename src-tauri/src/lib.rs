@@ -16,8 +16,8 @@ use crate::config::{
 };
 use crate::engine::{EngineSnapshot, TaskEngine};
 use crate::overlay::{
-    hide_orchestration_panel, hide_tray_popover, initialize_windows_and_tray,
-    set_orchestration_panel_collapsed, show_orchestration_panel, show_tray_popover,
+    exit_task_mode, hide_orchestration_panel, hide_tray_popover, initialize_windows_and_tray,
+    set_orchestration_panel_collapsed, show_orchestration_panel,
     toggle_orchestration_panel, trigger_mock_pointer_cue, PointerCuePayload,
 };
 use std::sync::Arc;
@@ -102,7 +102,9 @@ async fn stop_task(
     app_handle: AppHandle,
     engine: State<'_, Arc<TaskEngine>>,
 ) -> Result<EngineSnapshot, String> {
-    Ok(engine.stop_task(&app_handle, Some("Task stopped by user".to_string())))
+    let snap = engine.stop_task(&app_handle, Some("Task stopped by user".to_string()));
+    exit_task_mode(&app_handle);
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -217,7 +219,7 @@ pub fn run() {
                 move |handle| {
                     let _ = engine_for_stop
                         .stop_task(handle, Some("Stopped from menu bar".to_string()));
-                    show_tray_popover(handle, false);
+                    exit_task_mode(handle);
                 },
             )?;
             Ok(())

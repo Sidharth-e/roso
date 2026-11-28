@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   useAppConfigQuery,
   useEngineEventSync,
@@ -12,12 +19,10 @@ import { useTaskUiStore } from "../store";
 import { CLOUD_OLLAMA_BASE_URL, isActivePhase } from "../types";
 import { ConfirmationCard } from "./ConfirmationCard";
 import { HistoryView } from "./HistoryView";
-import { OrchestrationInspector } from "./OrchestrationPanel";
+import { AiOrb, orbModeForPhase } from "./AiOrb";
 import { PermissionChecklist } from "./PermissionChecklist";
-import { PlanChecklist } from "./PlanChecklist";
 import { RunControls } from "./RunControls";
 import { SettingsForm } from "./SettingsForm";
-import { StepFeed } from "./StepFeed";
 import {
   Button,
   Card,
@@ -27,12 +32,10 @@ import {
   IconButton,
   ModelChip,
   MoonIcon,
-  StatusBadge,
+  SendIcon,
   StepMeterBar,
   SunIcon,
   TabBar,
-  TextArea,
-  categoryDisplayName,
   phaseBadgeProps,
 } from "./UiPrimitives";
 
@@ -41,6 +44,14 @@ const EXAMPLE_GOALS: ReadonlyArray<string> = [
   "Open Safari to github.com/trending and scroll down",
   "Open Calculator and compute 42 * 18",
 ];
+
+function greeting(nowMs: number): string {
+  const hour = new Date(nowMs).getHours();
+  if (hour < 5) return "Working late.";
+  if (hour < 12) return "Good morning.";
+  if (hour < 18) return "Good afternoon.";
+  return "Good evening.";
+}
 
 function formatElapsed(startedAt: string | null | undefined, nowMs: number): string {
   if (!startedAt) {
@@ -79,6 +90,9 @@ export function TrayControl() {
     message: string;
   } | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [typingEnergy, setTypingEnergy] = useState(0);
+  const typingTimer = useRef<number | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const snapshot = snapshotQuery.data;
   const config = configQuery.data;
@@ -86,6 +100,7 @@ export function TrayControl() {
   const isActive = isActivePhase(phase);
   const badge = phaseBadgeProps(snapshot?.phase);
   const pendingConf = snapshot?.pendingConfirmation ?? null;
+  const isFinished = phase === "completed" || phase === "failed" || phase === "stopped";
 
   useEffect(() => {
     if (phase === "awaiting_confirmation" && activeTab !== "task") {
@@ -94,11 +109,8 @@ export function TrayControl() {
   }, [phase, activeTab, setActiveTab]);
 
   useEffect(() => {
-    if (!isActive) {
-      return;
-    }
     setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const timer = window.setInterval(() => setNowMs(Date.now()), isActive ? 1000 : 30000);
     return () => window.clearInterval(timer);
   }, [isActive]);
 
@@ -111,6 +123,26 @@ export function TrayControl() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [mutations.hidePopover, pendingConf]);
+
+  // Re-focus the command bar whenever the modal comes back.
+  useEffect(() => {
+    function onFocus() {
+      if (useTaskUiStore.getState().activeTab === "task") {
+        inputRef.current?.focus();
+      }
+    }
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (typingTimer.current !== null) {
+        window.clearTimeout(typingTimer.current);
+      }
+    },
+    []
+  );
 
   const handleResolveConfirmation = useCallback(
     (approved: boolean) => {
@@ -125,19 +157,43 @@ export function TrayControl() {
     [pendingConf, mutations.resolveConfirmation]
   );
 
+  function pulseOrb() {
+    setTypingEnergy(1);
+    if (typingTimer.current !== null) {
+      window.clearTimeout(typingTimer.current);
+    }
+    typingTimer.current = window.setTimeout(() => setTypingEnergy(0), 450);
+  }
+
   function handleToggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
     setTheme(next);
     mutations.broadcastTheme.mutate(next);
   }
 
-  function handleRunTask(event: FormEvent) {
-    event.preventDefault();
+  const isCloud = config ? config.ollamaBaseUrl.startsWith(CLOUD_OLLAMA_BASE_URL) : true;
+  const needsCloudConsent = Boolean(config && isCloud && !config.cloudConsentAccepted);
+  const canRun =
+    draftGoal.trim().length > 0 && !mutations.startTask.isPending && !needsCloudConsent;
+
+  function runTask() {
     const clean = draftGoal.trim();
-    if (clean.length === 0) {
+    if (!canRun || clean.length === 0) {
       return;
     }
     mutations.startTask.mutate({ goal: clean });
+  }
+
+  function handleRunTask(event: FormEvent) {
+    event.preventDefault();
+    runTask();
+  }
+
+  function handleInputKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      runTask();
+    }
   }
 
   function handleTestConnection(targetUrl: string) {
@@ -145,10 +201,7 @@ export function TrayControl() {
     mutations.testOllamaConnection.mutate(targetUrl, {
       onSuccess: (models) => {
         setAvailableModels(models);
-        setConnectionStatus({
-          ok: true,
-          message: `Connected (${models.length} models)`,
-        });
+        setConnectionStatus({ ok: true, message: `Connected (${models.length} models)` });
       },
       onError: (err: unknown) => {
         setConnectionStatus({
@@ -159,244 +212,224 @@ export function TrayControl() {
     });
   }
 
-  const isCloud = config
-    ? config.ollamaBaseUrl.startsWith(CLOUD_OLLAMA_BASE_URL)
-    : true;
-  const needsCloudConsent = Boolean(config && isCloud && !config.cloudConsentAccepted);
-  const nextPlanStep =
-    snapshot && snapshot.planSteps.length > 0
-      ? snapshot.planSteps[snapshot.activePlanIndex + 1] ?? null
-      : null;
+  const orbMode =
+    mutations.startTask.isPending
+      ? "thinking"
+      : draftGoal.length > 0 && !isActive && !isFinished
+        ? "listening"
+        : orbModeForPhase(phase);
+
+  const headline = isActive
+    ? snapshot?.lastNarration || "Working on it…"
+    : isFinished && snapshot?.lastSummary
+      ? snapshot.lastSummary
+      : greeting(nowMs);
+
+  const subline = isActive
+    ? snapshot?.goal
+    : isFinished
+      ? phase === "completed"
+        ? "Task complete. What's next?"
+        : phase === "failed"
+          ? "That didn't go to plan. Try again or rephrase."
+          : "Task stopped. Ready when you are."
+      : "What should I do on your Mac?";
+
+  const onTaskTab = activeTab === "task";
 
   return (
-    <div className="popover-shell p-3.5">
-      <header className="mb-3 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-primary/15 text-xs font-bold text-primary">
-            TC
+    <div className="jarvis-shell">
+      <header className="flex items-center justify-between px-5 pt-4">
+        <div className="flex items-center gap-2.5">
+          <span
+            className={`h-2 w-2 rounded-full ${
+              badge.tone === "error"
+                ? "bg-error"
+                : badge.tone === "warning"
+                  ? "bg-warning"
+                  : badge.tone === "success"
+                    ? "bg-success"
+                    : "bg-primary"
+            } ${isActive ? "animate-pulse" : ""}`}
+            style={{ boxShadow: "0 0 10px currentColor" }}
+          />
+          <span className="hud-label">Task Companion</span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-tertiary">
+            / {badge.label}
           </span>
-          <div>
-            <h1 className="text-sm font-bold leading-tight text-foreground">
-              Task Companion
-            </h1>
-            <p className="text-xs text-tertiary">
-              Multi-Model Ollama Orchestrator
-            </p>
-          </div>
         </div>
         <div className="flex items-center gap-1.5">
-          <StatusBadge tone={badge.tone} label={badge.label} />
-          <IconButton
-            label="Toggle live orchestration HUD panel"
-            onClick={() => mutations.togglePanel.mutate()}
-          >
-            <HudIcon />
-          </IconButton>
+          {isActive ? (
+            <IconButton
+              label="Show live orchestrator"
+              onClick={() => mutations.showPanel.mutate()}
+            >
+              <HudIcon />
+            </IconButton>
+          ) : null}
           <IconButton
             label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
             onClick={handleToggleTheme}
           >
             {theme === "dark" ? <SunIcon /> : <MoonIcon />}
           </IconButton>
-          <IconButton
-            label="Close popover"
-            onClick={() => mutations.hidePopover.mutate()}
-          >
+          <IconButton label="Close (Esc)" onClick={() => mutations.hidePopover.mutate()}>
             <CloseIcon />
           </IconButton>
         </div>
       </header>
 
-      <ErrorToast />
+      <div className="px-5 pt-2">
+        <ErrorToast />
+        {snapshotQuery.isError ? (
+          <div className="mb-2 rounded-xl border border-error/40 bg-error/10 px-3 py-2 text-xs text-error">
+            Failed to read engine status: {snapshotQuery.error.message}
+          </div>
+        ) : null}
+      </div>
 
-      {snapshotQuery.isError ? (
-        <div className="mb-2.5 rounded-lg border border-error/40 bg-error/15 px-3 py-2 text-xs text-error">
-          Failed to read engine status: {snapshotQuery.error.message}
-        </div>
-      ) : null}
-
-      {pendingConf ? (
-        <div className="mb-2.5">
-          <ConfirmationCard
-            confirmation={pendingConf}
-            isPending={mutations.resolveConfirmation.isPending}
-            onResolve={handleResolveConfirmation}
-          />
-        </div>
-      ) : null}
-
-      <TabBar activeTab={activeTab} onSelect={setActiveTab} />
-
-      <div className="mt-3 flex-1 space-y-3 overflow-y-auto pr-0.5">
-        {activeTab === "task" ? (
-          <div
-            id="panel-task"
-            role="tabpanel"
-            aria-labelledby="tab-task"
-            className="space-y-3"
-          >
-            <PermissionChecklist
-              snapshot={snapshot}
-              config={config}
-              isRequesting={
-                mutations.requestScreenPermission.isPending ||
-                mutations.requestAccessibilityPermission.isPending
-              }
-              onRequestScreen={() => mutations.requestScreenPermission.mutate()}
-              onRequestAccessibility={() =>
-                mutations.requestAccessibilityPermission.mutate()
-              }
-              onOpenSettings={() => setActiveTab("settings")}
-            />
-
-            {needsCloudConsent && config ? (
-              <Card className="space-y-2 border-info/40 bg-info/10">
-                <p className="text-xs font-bold text-foreground">
-                  Cloud Privacy Disclosure
+      <main className="flex-1 overflow-y-auto px-5 pb-3">
+        {onTaskTab ? (
+          <div id="panel-task" role="tabpanel" aria-labelledby="tab-task" className="flex flex-col">
+            <section className="flex flex-col items-center pt-1 text-center">
+              <AiOrb size={210} mode={orbMode} energy={typingEnergy} />
+              <h1
+                className="-mt-2 max-w-[440px] text-balance text-xl font-semibold tracking-tight text-foreground"
+                aria-live="polite"
+              >
+                {headline}
+              </h1>
+              {subline ? (
+                <p className="mt-1 max-w-[440px] text-sm text-tertiary">{subline}</p>
+              ) : null}
+              {snapshot?.lastError && isFinished ? (
+                <p className="mt-2 max-w-[440px] rounded-lg bg-error/10 px-3 py-1.5 text-xs text-error">
+                  {snapshot.lastError}
                 </p>
-                <p className="text-xs text-foreground/85">
-                  Using Ollama Cloud sends in-memory screenshots, window titles, and target text to ollama.com during active tasks.
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  <Button
-                    variant="primary"
-                    disabled={mutations.saveConfig.isPending}
-                    onClick={() =>
-                      mutations.saveConfig.mutate({
-                        ollamaBaseUrl: config.ollamaBaseUrl,
-                        ollamaApiKey: "",
-                        clearApiKey: false,
-                        cloudConsentAccepted: true,
-                        models: config.models,
-                      })
-                    }
-                  >
-                    Accept & Continue
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => setActiveTab("settings")}
-                  >
-                    Use Local Ollama
-                  </Button>
-                </div>
-              </Card>
-            ) : null}
+              ) : null}
+            </section>
 
-            {!isActive ? (
-              <form onSubmit={handleRunTask} className="space-y-3">
-                <Card className="space-y-2.5">
-                  <TextArea
-                    id="task-goal-input"
-                    label="What should I do on your Mac?"
-                    placeholder="e.g., Open Notes, create a new note, and write a sprint checklist"
-                    rows={3}
-                    maxLength={500}
-                    value={draftGoal}
-                    onChange={(e) => setDraftGoal(e.target.value)}
-                  />
+            <div className="mt-5 space-y-3">
+              {pendingConf ? (
+                <ConfirmationCard
+                  confirmation={pendingConf}
+                  isPending={mutations.resolveConfirmation.isPending}
+                  onResolve={handleResolveConfirmation}
+                />
+              ) : null}
 
-                  <div className="flex flex-wrap gap-1.5">
+              <PermissionChecklist
+                snapshot={snapshot}
+                config={config}
+                isRequesting={
+                  mutations.requestScreenPermission.isPending ||
+                  mutations.requestAccessibilityPermission.isPending
+                }
+                onRequestScreen={() => mutations.requestScreenPermission.mutate()}
+                onRequestAccessibility={() => mutations.requestAccessibilityPermission.mutate()}
+                onOpenSettings={() => setActiveTab("settings")}
+              />
+
+              {needsCloudConsent && config ? (
+                <Card className="space-y-2 border-info/30">
+                  <p className="hud-label">Cloud privacy</p>
+                  <p className="text-xs text-foreground/85">
+                    Using Ollama Cloud sends in-memory screenshots, window titles, and target
+                    text to ollama.com during active tasks.
+                  </p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button
+                      variant="primary"
+                      disabled={mutations.saveConfig.isPending}
+                      onClick={() =>
+                        mutations.saveConfig.mutate({
+                          ollamaBaseUrl: config.ollamaBaseUrl,
+                          ollamaApiKey: "",
+                          clearApiKey: false,
+                          cloudConsentAccepted: true,
+                          models: config.models,
+                        })
+                      }
+                    >
+                      Accept & Continue
+                    </Button>
+                    <Button variant="secondary" onClick={() => setActiveTab("settings")}>
+                      Use Local Ollama
+                    </Button>
+                  </div>
+                </Card>
+              ) : null}
+
+              {!isActive ? (
+                <form onSubmit={handleRunTask} className="space-y-3">
+                  <label htmlFor="task-goal-input" className="sr-only">
+                    What should I do on your Mac?
+                  </label>
+                  <div className="command-bar">
+                    <textarea
+                      id="task-goal-input"
+                      ref={inputRef}
+                      autoFocus
+                      rows={1}
+                      maxLength={500}
+                      className="command-input"
+                      placeholder="Ask me to do something on your Mac…"
+                      value={draftGoal}
+                      onKeyDown={handleInputKeyDown}
+                      onChange={(e) => {
+                        setDraftGoal(e.target.value);
+                        pulseOrb();
+                        const el = e.target;
+                        el.style.height = "auto";
+                        el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
+                      }}
+                    />
+                    <button
+                      type="submit"
+                      className="send-btn"
+                      disabled={!canRun}
+                      aria-label={mutations.startTask.isPending ? "Starting task" : "Run task"}
+                      title="Run (Enter)"
+                    >
+                      <SendIcon />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap justify-center gap-1.5">
                     {EXAMPLE_GOALS.map((sample) => (
                       <button
                         key={sample}
                         type="button"
-                        onClick={() => setDraftGoal(sample)}
-                        className="rounded-md border border-tertiary/25 bg-background px-2 py-1 text-left text-xs font-medium text-tertiary transition hover:border-primary/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                        onClick={() => {
+                          setDraftGoal(sample);
+                          pulseOrb();
+                          inputRef.current?.focus();
+                        }}
+                        className="suggestion-chip"
                       >
                         {sample}
                       </button>
                     ))}
                   </div>
-
-                  <Button
-                    type="submit"
-                    className="w-full"
-                    disabled={
-                      draftGoal.trim().length === 0 ||
-                      mutations.startTask.isPending ||
-                      needsCloudConsent
-                    }
-                  >
-                    {mutations.startTask.isPending ? "Starting..." : "Run Task"}
-                  </Button>
-                </Card>
-
-                {snapshot &&
-                (phase === "completed" ||
-                  phase === "failed" ||
-                  phase === "stopped") &&
-                snapshot.lastSummary ? (
-                  <Card className="space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-semibold text-tertiary">
-                        Last Run
-                      </span>
-                      <StatusBadge tone={badge.tone} label={badge.label} />
-                    </div>
-                    <p className="text-xs font-medium text-foreground">
-                      {snapshot.lastSummary}
-                    </p>
-                    {snapshot.lastError ? (
-                      <p className="rounded bg-error/15 px-2 py-1 text-xs text-error">
-                        {snapshot.lastError}
-                      </p>
-                    ) : null}
-                  </Card>
-                ) : null}
-              </form>
-            ) : (
-              <div className="space-y-3">
-                <Card className="space-y-2.5">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <p className="text-xs font-semibold text-foreground">
-                        {snapshot?.lastNarration || snapshot?.goal}
-                      </p>
-                      {nextPlanStep ? (
-                        <p className="text-xs text-tertiary">
-                          Next: {nextPlanStep}
-                        </p>
-                      ) : null}
-                    </div>
-                    <span className="shrink-0 rounded border border-tertiary/30 bg-background px-1.5 py-0.5 text-[10px] font-semibold text-tertiary">
-                      ⌃⌥S Kill
-                    </span>
-                  </div>
-
-                  <div className="flex items-center justify-between text-xs text-tertiary">
+                </form>
+              ) : (
+                <Card className="space-y-3">
+                  <div className="flex items-center justify-between font-mono text-[11px] text-tertiary">
                     <span>
-                      Step {snapshot?.currentStep ?? 0}/{snapshot?.maxSteps ?? 40} ·{" "}
+                      STEP {snapshot?.currentStep ?? 0}/{snapshot?.maxSteps ?? 40} ·{" "}
                       {formatElapsed(snapshot?.startedAt, nowMs)}
                     </span>
-                    <span className="max-w-[170px] truncate">
-                      {snapshot?.activeApp || "Detecting..."}
+                    <span className="max-w-[200px] truncate">
+                      {snapshot?.activeApp || "Detecting…"}
                     </span>
                   </div>
-
                   <StepMeterBar
                     value={snapshot?.currentStep ?? 0}
                     max={snapshot?.maxSteps ?? 40}
                   />
-
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {snapshot?.classification ? (
-                      <StatusBadge
-                        tone="info"
-                        label={categoryDisplayName(
-                          snapshot.classification.category
-                        )}
-                      />
-                    ) : null}
-                    {snapshot?.activeModel ? (
-                      <ModelChip
-                        role={snapshot.activeRole}
-                        model={snapshot.activeModel}
-                        active={isActive}
-                      />
-                    ) : null}
-                  </div>
-
+                  {snapshot?.activeModel ? (
+                    <ModelChip role={snapshot.activeRole} model={snapshot.activeModel} active />
+                  ) : null}
                   <RunControls
                     phase={phase}
                     isBusy={
@@ -409,73 +442,14 @@ export function TrayControl() {
                     onStop={() => mutations.stopTask.mutate()}
                   />
                 </Card>
-
-                <PlanChecklist
-                  planSteps={snapshot?.planSteps ?? []}
-                  activePlanIndex={snapshot?.activePlanIndex ?? 0}
-                  phase={phase}
-                />
-
-                {snapshot?.lastDiagnosis ? (
-                  <Card className="space-y-1 border-warning/40 bg-warning/10">
-                    <p className="text-xs font-semibold text-warning">
-                      Recovery #{snapshot.recoveryCount}
-                    </p>
-                    <p className="text-xs text-foreground/85">
-                      {snapshot.lastDiagnosis}
-                    </p>
-                  </Card>
-                ) : null}
-              </div>
-            )}
-
-            <StepFeed
-              steps={snapshot?.steps ?? []}
-              title="Live Action Feed"
-              compact={false}
-            />
-
-            <Card>
-              <Button
-                variant="secondary"
-                className="w-full"
-                onClick={() => mutations.testPointer.mutate()}
-                disabled={mutations.testPointer.isPending}
-              >
-                Test Pointer Overlay
-              </Button>
-            </Card>
-          </div>
-        ) : null}
-
-        {activeTab === "live" ? (
-          <div
-            id="panel-live"
-            role="tabpanel"
-            aria-labelledby="tab-live"
-            className="space-y-3"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-semibold text-tertiary">
-                Synced Live Inspector
-              </span>
-              <Button
-                variant="secondary"
-                onClick={() => mutations.showPanel.mutate()}
-              >
-                Pop Out Floating HUD
-              </Button>
+              )}
             </div>
-            <OrchestrationInspector snapshot={snapshot} />
           </div>
         ) : null}
 
         {activeTab === "history" ? (
-          <div
-            id="panel-history"
-            role="tabpanel"
-            aria-labelledby="tab-history"
-          >
+          <div id="panel-history" role="tabpanel" aria-labelledby="tab-history" className="pt-2">
+            <SectionHeading title="History" orbMode={orbModeForPhase(phase)} />
             <HistoryView
               records={historyQuery.data ?? []}
               isError={historyQuery.isError}
@@ -488,11 +462,8 @@ export function TrayControl() {
         ) : null}
 
         {activeTab === "settings" && config ? (
-          <div
-            id="panel-settings"
-            role="tabpanel"
-            aria-labelledby="tab-settings"
-          >
+          <div id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" className="pt-2">
+            <SectionHeading title="Settings" orbMode={orbModeForPhase(phase)} />
             <SettingsForm
               config={config}
               isSaving={mutations.saveConfig.isPending}
@@ -510,8 +481,46 @@ export function TrayControl() {
               onSave={(payload) => mutations.saveConfig.mutate(payload)}
               onTestConnection={handleTestConnection}
             />
+            <Card className="mt-3">
+              <Button
+                variant="secondary"
+                className="w-full"
+                onClick={() => mutations.testPointer.mutate()}
+                disabled={mutations.testPointer.isPending}
+              >
+                Test Pointer Overlay
+              </Button>
+            </Card>
           </div>
         ) : null}
+      </main>
+
+      <footer className="flex items-center justify-between gap-2 border-t border-primary/10 px-5 py-3">
+        <span className="w-20 font-mono text-[10px] uppercase tracking-[0.16em] text-tertiary/70">
+          Esc close
+        </span>
+        <TabBar activeTab={activeTab} onSelect={setActiveTab} />
+        <span className="w-20 text-right font-mono text-[10px] uppercase tracking-[0.16em] text-tertiary/70">
+          ⌃⌥S kill
+        </span>
+      </footer>
+    </div>
+  );
+}
+
+function SectionHeading({
+  title,
+  orbMode,
+}: {
+  title: string;
+  orbMode: ReturnType<typeof orbModeForPhase>;
+}) {
+  return (
+    <div className="mb-3 flex items-center gap-3">
+      <AiOrb size={44} mode={orbMode} rings={false} />
+      <div>
+        <p className="hud-label">Task Companion</p>
+        <h2 className="text-lg font-semibold tracking-tight text-foreground">{title}</h2>
       </div>
     </div>
   );

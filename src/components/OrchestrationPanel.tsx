@@ -13,6 +13,7 @@ import {
   type PanelFilter,
 } from "../types";
 import { ConfirmationCard } from "./ConfirmationCard";
+import { AiOrb, orbModeForPhase } from "./AiOrb";
 import { PlanChecklist } from "./PlanChecklist";
 import { RunControls } from "./RunControls";
 import { StepFeed } from "./StepFeed";
@@ -251,8 +252,8 @@ export function OrchestrationInspector({
       ) : null}
 
       {snapshot.currentThought ? (
-        <div className="rounded-card border border-primary/30 bg-primary/10 px-3 py-2">
-          <p className="text-xs font-bold text-primary">Live Thinking</p>
+        <div className="rounded-2xl border border-primary/30 bg-primary/10 px-3 py-2.5">
+          <p className="hud-label">Live Thinking</p>
           <p className="mt-0.5 text-xs leading-relaxed text-foreground">
             {snapshot.currentThought}
           </p>
@@ -262,7 +263,7 @@ export function OrchestrationInspector({
       <div
         role="tablist"
         aria-label="Orchestration panel sections"
-        className="grid grid-cols-4 gap-1 rounded-lg bg-secondary/80 p-1"
+        className="grid grid-cols-4 gap-1 rounded-full border border-primary/15 bg-secondary/50 p-1"
       >
         {FILTER_OPTIONS.map((option, idx) => {
           const selected = panelFilter === option.id;
@@ -365,14 +366,19 @@ export function FloatingOrchestrationHud() {
     mutations.setPanelCollapsed.mutate(next);
   }
 
+  const orbMode = orbModeForPhase(snapshot?.phase);
+
   if (panelCollapsed) {
     return (
       <div className="hud-pill">
         <div className="flex min-w-0 items-center gap-2">
-          <StatusBadge tone={badge.tone} label={badge.label} />
-          <span className="truncate font-mono text-xs text-foreground/85">
-            {snapshot?.activeModel || "Orchestrator"}
-          </span>
+          <AiOrb size={46} mode={orbMode} rings={false} className="shrink-0" />
+          <div className="min-w-0">
+            <p className="hud-label leading-none">{badge.label}</p>
+            <p className="mt-1 truncate font-mono text-[11px] text-foreground/80">
+              {snapshot?.activeModel || "Orchestrator"}
+            </p>
+          </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           {active ? (
@@ -380,15 +386,12 @@ export function FloatingOrchestrationHud() {
               type="button"
               onClick={() => mutations.stopTask.mutate()}
               aria-label="Stop active task"
-              className="rounded-md bg-error/15 px-1.5 py-0.5 text-xs font-semibold text-error hover:bg-error/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/40"
+              className="rounded-full bg-error/15 px-2.5 py-1 text-xs font-semibold text-error hover:bg-error/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/40"
             >
               Stop
             </button>
           ) : null}
-          <IconButton
-            label="Expand live orchestration panel"
-            onClick={handleToggleCollapse}
-          >
+          <IconButton label="Expand live orchestration panel" onClick={handleToggleCollapse}>
             <ExpandIcon />
           </IconButton>
         </div>
@@ -397,39 +400,26 @@ export function FloatingOrchestrationHud() {
   }
 
   return (
-    <div className="hud-shell p-3">
-      <header className="mb-2.5 flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-xs font-bold text-primary">
-            AI
-          </span>
+    <div className="jarvis-shell hud-shell p-3.5">
+      <header className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <AiOrb size={56} mode={orbMode} rings={false} className="-m-1.5 shrink-0" />
           <div className="min-w-0">
-            <h1 className="truncate text-xs font-bold text-foreground">
-              Live Orchestrator
-            </h1>
-            <p className="truncate text-xs text-tertiary">
-              Multi-Model Agent HUD
-            </p>
+            <p className="hud-label">Live Orchestrator</p>
+            <p className="truncate text-sm font-semibold text-foreground">{badge.label}</p>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          <StatusBadge tone={badge.tone} label={badge.label} />
           <IconButton
             label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
             onClick={handleToggleTheme}
           >
             {theme === "dark" ? <SunIcon /> : <MoonIcon />}
           </IconButton>
-          <IconButton
-            label="Collapse orchestration panel"
-            onClick={handleToggleCollapse}
-          >
+          <IconButton label="Collapse orchestration panel" onClick={handleToggleCollapse}>
             <MinimizeIcon />
           </IconButton>
-          <IconButton
-            label="Hide orchestration panel"
-            onClick={() => mutations.hidePanel.mutate()}
-          >
+          <IconButton label="Hide orchestration panel" onClick={() => mutations.hidePanel.mutate()}>
             <CloseIcon />
           </IconButton>
         </div>
@@ -448,7 +438,7 @@ export function FloatingOrchestrationHud() {
       </div>
 
       {active ? (
-        <footer className="mt-2.5 border-t border-tertiary/20 pt-2.5">
+        <footer className="mt-3 border-t border-primary/10 pt-3">
           <RunControls
             phase={phase}
             isBusy={
