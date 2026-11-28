@@ -1,33 +1,39 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   useAppConfigQuery,
   useEngineEventSync,
   useEngineSnapshotQuery,
+  useFocusPermissionRefresh,
   useTaskHistoryQuery,
   useTaskMutations,
   useThemeEventSync,
 } from "../api";
 import { useTaskUiStore } from "../store";
-import {
-  DEFAULT_MODEL_ROUTING,
-  type AppConfig,
-  type ModelRoutingConfig,
-} from "../types";
+import { CLOUD_OLLAMA_BASE_URL, isActivePhase } from "../types";
+import { ConfirmationCard } from "./ConfirmationCard";
+import { HistoryView } from "./HistoryView";
 import { OrchestrationInspector } from "./OrchestrationPanel";
+import { PermissionChecklist } from "./PermissionChecklist";
+import { PlanChecklist } from "./PlanChecklist";
+import { RunControls } from "./RunControls";
+import { SettingsForm } from "./SettingsForm";
+import { StepFeed } from "./StepFeed";
 import {
   Button,
   Card,
-  Input,
+  CloseIcon,
+  ErrorToast,
+  HudIcon,
+  IconButton,
   ModelChip,
+  MoonIcon,
   StatusBadge,
   StepMeterBar,
-  Switch,
+  SunIcon,
   TabBar,
   TextArea,
   categoryDisplayName,
-  outcomeTone,
   phaseBadgeProps,
-  stepStatusClass,
 } from "./UiPrimitives";
 
 const EXAMPLE_GOALS: ReadonlyArray<string> = [
@@ -36,9 +42,24 @@ const EXAMPLE_GOALS: ReadonlyArray<string> = [
   "Open Calculator and compute 42 * 18",
 ];
 
+function formatElapsed(startedAt: string | null | undefined, nowMs: number): string {
+  if (!startedAt) {
+    return "0:00";
+  }
+  const startMs = Date.parse(startedAt);
+  if (Number.isNaN(startMs)) {
+    return "0:00";
+  }
+  const totalSec = Math.max(0, Math.floor((nowMs - startMs) / 1000));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
 export function TrayControl() {
   useEngineEventSync();
   useThemeEventSync();
+  useFocusPermissionRefresh();
 
   const activeTab = useTaskUiStore((s) => s.activeTab);
   const setActiveTab = useTaskUiStore((s) => s.setActiveTab);
@@ -52,35 +73,57 @@ export function TrayControl() {
   const historyQuery = useTaskHistoryQuery();
   const mutations = useTaskMutations();
 
-  const [configDraft, setConfigDraft] = useState<AppConfig | null>(null);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const snapshot = snapshotQuery.data;
+  const config = configQuery.data;
+  const phase = snapshot?.phase ?? "idle";
+  const isActive = isActivePhase(phase);
+  const badge = phaseBadgeProps(snapshot?.phase);
+  const pendingConf = snapshot?.pendingConfirmation ?? null;
 
   useEffect(() => {
-    if (configQuery.data && configDraft === null) {
-      setConfigDraft(configQuery.data);
+    if (phase === "awaiting_confirmation" && activeTab !== "task") {
+      setActiveTab("task");
     }
-  }, [configQuery.data, configDraft]);
+  }, [phase, activeTab, setActiveTab]);
+
+  useEffect(() => {
+    if (!isActive) {
+      return;
+    }
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isActive]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !pendingConf) {
         mutations.hidePopover.mutate();
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [mutations.hidePopover]);
+  }, [mutations.hidePopover, pendingConf]);
 
-  const snapshot = snapshotQuery.data;
-  const phase = snapshot?.phase ?? "idle";
-  const isActive =
-    phase === "classifying" ||
-    phase === "planning" ||
-    phase === "running" ||
-    phase === "verifying" ||
-    phase === "recovering" ||
-    phase === "paused" ||
-    phase === "awaiting_confirmation";
-  const badge = phaseBadgeProps(snapshot?.phase);
+  const handleResolveConfirmation = useCallback(
+    (approved: boolean) => {
+      if (!pendingConf) {
+        return;
+      }
+      mutations.resolveConfirmation.mutate({
+        confirmationId: pendingConf.id,
+        approved,
+      });
+    },
+    [pendingConf, mutations.resolveConfirmation]
+  );
 
   function handleToggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
@@ -97,31 +140,33 @@ export function TrayControl() {
     mutations.startTask.mutate({ goal: clean });
   }
 
-  function handleSaveSettings(event: FormEvent) {
-    event.preventDefault();
-    if (!configDraft) {
-      return;
-    }
-    mutations.saveConfig.mutate(configDraft, {
-      onSuccess: (saved) => setConfigDraft(saved),
-    });
-  }
-
-  function updateModelField<K extends keyof ModelRoutingConfig>(
-    key: K,
-    value: ModelRoutingConfig[K]
-  ) {
-    if (!configDraft) {
-      return;
-    }
-    setConfigDraft({
-      ...configDraft,
-      models: {
-        ...configDraft.models,
-        [key]: value,
+  function handleTestConnection(targetUrl: string) {
+    setConnectionStatus(null);
+    mutations.testOllamaConnection.mutate(targetUrl, {
+      onSuccess: (models) => {
+        setAvailableModels(models);
+        setConnectionStatus({
+          ok: true,
+          message: `Connected (${models.length} models)`,
+        });
+      },
+      onError: (err: unknown) => {
+        setConnectionStatus({
+          ok: false,
+          message: err instanceof Error ? err.message : "Connection failed",
+        });
       },
     });
   }
+
+  const isCloud = config
+    ? config.ollamaBaseUrl.startsWith(CLOUD_OLLAMA_BASE_URL)
+    : true;
+  const needsCloudConsent = Boolean(config && isCloud && !config.cloudConsentAccepted);
+  const nextPlanStep =
+    snapshot && snapshot.planSteps.length > 0
+      ? snapshot.planSteps[snapshot.activePlanIndex + 1] ?? null
+      : null;
 
   return (
     <div className="popover-shell p-3.5">
@@ -134,84 +179,105 @@ export function TrayControl() {
             <h1 className="text-sm font-bold leading-tight text-foreground">
               Task Companion
             </h1>
-            <p className="text-[11px] text-tertiary">
+            <p className="text-xs text-tertiary">
               Multi-Model Ollama Orchestrator
             </p>
           </div>
         </div>
         <div className="flex items-center gap-1.5">
           <StatusBadge tone={badge.tone} label={badge.label} />
-          <button
-            type="button"
+          <IconButton
+            label="Toggle live orchestration HUD panel"
             onClick={() => mutations.togglePanel.mutate()}
-            aria-label="Toggle live orchestration HUD panel"
-            className="rounded-lg border border-primary/35 bg-primary/10 px-2 py-1 text-[11px] font-semibold text-primary hover:bg-primary/20 focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
-            HUD
-          </button>
-          <button
-            type="button"
+            <HudIcon />
+          </IconButton>
+          <IconButton
+            label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
             onClick={handleToggleTheme}
-            aria-label="Toggle color theme"
-            className="rounded-lg border border-tertiary/30 bg-secondary px-2 py-1 text-[11px] font-semibold text-foreground hover:bg-secondary/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
-            {theme === "dark" ? "Light" : "Dark"}
-          </button>
-          <button
-            type="button"
+            {theme === "dark" ? <SunIcon /> : <MoonIcon />}
+          </IconButton>
+          <IconButton
+            label="Close popover"
             onClick={() => mutations.hidePopover.mutate()}
-            aria-label="Close popover"
-            className="rounded-lg border border-tertiary/30 bg-secondary px-2 py-1 text-[11px] font-semibold text-tertiary hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
-            ✕
-          </button>
+            <CloseIcon />
+          </IconButton>
         </div>
       </header>
+
+      <ErrorToast />
+
+      {snapshotQuery.isError ? (
+        <div className="mb-2.5 rounded-lg border border-error/40 bg-error/15 px-3 py-2 text-xs text-error">
+          Failed to read engine status: {snapshotQuery.error.message}
+        </div>
+      ) : null}
+
+      {pendingConf ? (
+        <div className="mb-2.5">
+          <ConfirmationCard
+            confirmation={pendingConf}
+            isPending={mutations.resolveConfirmation.isPending}
+            onResolve={handleResolveConfirmation}
+          />
+        </div>
+      ) : null}
 
       <TabBar activeTab={activeTab} onSelect={setActiveTab} />
 
       <div className="mt-3 flex-1 space-y-3 overflow-y-auto pr-0.5">
         {activeTab === "task" ? (
-          <>
-            {snapshot && !snapshot.screenPermissionGranted ? (
-              <Card className="border-warning/40 bg-warning/10">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <p className="text-xs font-semibold text-warning">
-                      Screen Recording Needed
-                    </p>
-                    <p className="text-[11px] text-foreground/80">
-                      Grant macOS Screen Recording so the agent can inspect your screen in RAM.
-                    </p>
-                  </div>
-                  <Button
-                    variant="secondary"
-                    onClick={() => mutations.requestScreenPermission.mutate()}
-                  >
-                    Grant
-                  </Button>
-                </div>
-              </Card>
-            ) : null}
+          <div
+            id="panel-task"
+            role="tabpanel"
+            aria-labelledby="tab-task"
+            className="space-y-3"
+          >
+            <PermissionChecklist
+              snapshot={snapshot}
+              config={config}
+              isRequesting={
+                mutations.requestScreenPermission.isPending ||
+                mutations.requestAccessibilityPermission.isPending
+              }
+              onRequestScreen={() => mutations.requestScreenPermission.mutate()}
+              onRequestAccessibility={() =>
+                mutations.requestAccessibilityPermission.mutate()
+              }
+              onOpenSettings={() => setActiveTab("settings")}
+            />
 
-            {snapshot && !snapshot.accessibilityPermissionGranted ? (
-              <Card className="border-warning/40 bg-warning/10">
-                <div className="flex items-center justify-between gap-2">
-                  <div>
-                    <p className="text-xs font-semibold text-warning">
-                      Accessibility Needed
-                    </p>
-                    <p className="text-[11px] text-foreground/80">
-                      Grant macOS Accessibility so the agent can click, type, and scroll.
-                    </p>
-                  </div>
+            {needsCloudConsent && config ? (
+              <Card className="space-y-2 border-info/40 bg-info/10">
+                <p className="text-xs font-bold text-foreground">
+                  Cloud Privacy Disclosure
+                </p>
+                <p className="text-xs text-foreground/85">
+                  Using Ollama Cloud sends in-memory screenshots, window titles, and target text to ollama.com during active tasks.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
                   <Button
-                    variant="secondary"
+                    variant="primary"
+                    disabled={mutations.saveConfig.isPending}
                     onClick={() =>
-                      mutations.requestAccessibilityPermission.mutate()
+                      mutations.saveConfig.mutate({
+                        ollamaBaseUrl: config.ollamaBaseUrl,
+                        ollamaApiKey: "",
+                        clearApiKey: false,
+                        cloudConsentAccepted: true,
+                        models: config.models,
+                      })
                     }
                   >
-                    Grant
+                    Accept & Continue
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setActiveTab("settings")}
+                  >
+                    Use Local Ollama
                   </Button>
                 </div>
               </Card>
@@ -236,7 +302,7 @@ export function TrayControl() {
                         key={sample}
                         type="button"
                         onClick={() => setDraftGoal(sample)}
-                        className="rounded-md border border-tertiary/25 bg-background px-2 py-1 text-left text-[10px] font-medium text-tertiary transition hover:border-primary/40 hover:text-foreground"
+                        className="rounded-md border border-tertiary/25 bg-background px-2 py-1 text-left text-xs font-medium text-tertiary transition hover:border-primary/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
                       >
                         {sample}
                       </button>
@@ -248,12 +314,11 @@ export function TrayControl() {
                     className="w-full"
                     disabled={
                       draftGoal.trim().length === 0 ||
-                      mutations.startTask.isPending
+                      mutations.startTask.isPending ||
+                      needsCloudConsent
                     }
                   >
-                    {mutations.startTask.isPending
-                      ? "Starting..."
-                      : "Run Task"}
+                    {mutations.startTask.isPending ? "Starting..." : "Run Task"}
                   </Button>
                 </Card>
 
@@ -264,7 +329,7 @@ export function TrayControl() {
                 snapshot.lastSummary ? (
                   <Card className="space-y-1.5">
                     <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">
+                      <span className="text-xs font-semibold text-tertiary">
                         Last Run
                       </span>
                       <StatusBadge tone={badge.tone} label={badge.label} />
@@ -273,7 +338,7 @@ export function TrayControl() {
                       {snapshot.lastSummary}
                     </p>
                     {snapshot.lastError ? (
-                      <p className="rounded bg-error/15 px-2 py-1 text-[11px] text-error">
+                      <p className="rounded bg-error/15 px-2 py-1 text-xs text-error">
                         {snapshot.lastError}
                       </p>
                     ) : null}
@@ -285,38 +350,42 @@ export function TrayControl() {
                 <Card className="space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-tertiary">
-                        Active Goal
-                      </p>
                       <p className="text-xs font-semibold text-foreground">
-                        {snapshot?.goal}
+                        {snapshot?.lastNarration || snapshot?.goal}
                       </p>
+                      {nextPlanStep ? (
+                        <p className="text-xs text-tertiary">
+                          Next: {nextPlanStep}
+                        </p>
+                      ) : null}
                     </div>
                     <span className="shrink-0 rounded border border-tertiary/30 bg-background px-1.5 py-0.5 text-[10px] font-semibold text-tertiary">
                       ⌃⌥S Kill
                     </span>
                   </div>
 
-                  <div className="flex items-center justify-between text-[11px] text-tertiary">
+                  <div className="flex items-center justify-between text-xs text-tertiary">
                     <span>
-                      Step {snapshot?.currentStep ?? 0} /{" "}
-                      {snapshot?.maxSteps ?? 20}
+                      Step {snapshot?.currentStep ?? 0}/{snapshot?.maxSteps ?? 40} ·{" "}
+                      {formatElapsed(snapshot?.startedAt, nowMs)}
                     </span>
-                    <span className="truncate max-w-[170px]">
+                    <span className="max-w-[170px] truncate">
                       {snapshot?.activeApp || "Detecting..."}
                     </span>
                   </div>
 
                   <StepMeterBar
                     value={snapshot?.currentStep ?? 0}
-                    max={snapshot?.maxSteps ?? 20}
+                    max={snapshot?.maxSteps ?? 40}
                   />
 
                   <div className="flex flex-wrap items-center gap-1.5">
                     {snapshot?.classification ? (
                       <StatusBadge
                         tone="info"
-                        label={categoryDisplayName(snapshot.classification.category)}
+                        label={categoryDisplayName(
+                          snapshot.classification.category
+                        )}
                       />
                     ) : null}
                     {snapshot?.activeModel ? (
@@ -328,120 +397,31 @@ export function TrayControl() {
                     ) : null}
                   </div>
 
-                  <p className="rounded-lg bg-background/80 px-2.5 py-2 text-xs text-foreground">
-                    {snapshot?.lastNarration}
-                  </p>
-
-                  <div className="grid grid-cols-2 gap-2 pt-0.5">
-                    {phase === "running" ? (
-                      <Button
-                        variant="secondary"
-                        onClick={() => mutations.pauseTask.mutate()}
-                      >
-                        Pause
-                      </Button>
-                    ) : phase === "paused" ? (
-                      <Button
-                        variant="primary"
-                        onClick={() => mutations.resumeTask.mutate()}
-                      >
-                        Resume
-                      </Button>
-                    ) : (
-                      <Button variant="secondary" disabled>
-                        {badge.label}...
-                      </Button>
-                    )}
-                    <Button
-                      variant="danger"
-                      onClick={() => mutations.stopTask.mutate()}
-                    >
-                      Stop (⌃⌥S)
-                    </Button>
-                  </div>
+                  <RunControls
+                    phase={phase}
+                    isBusy={
+                      mutations.pauseTask.isPending ||
+                      mutations.resumeTask.isPending ||
+                      mutations.stopTask.isPending
+                    }
+                    onPause={() => mutations.pauseTask.mutate()}
+                    onResume={() => mutations.resumeTask.mutate()}
+                    onStop={() => mutations.stopTask.mutate()}
+                  />
                 </Card>
 
-                {snapshot?.pendingConfirmation ? (
-                  <Card className="space-y-2.5 border-warning/50 bg-warning/10">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-bold text-warning">
-                        Confirm Step #{snapshot.pendingConfirmation.stepNumber}
-                      </span>
-                      <span className="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] font-semibold text-warning">
-                        {snapshot.pendingConfirmation.actionType}
-                      </span>
-                    </div>
-                    <p className="text-xs font-semibold text-foreground">
-                      {snapshot.pendingConfirmation.description}
-                    </p>
-                    <p className="text-[11px] text-foreground/80">
-                      {snapshot.pendingConfirmation.reason}
-                    </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Button
-                        variant="primary"
-                        onClick={() =>
-                          mutations.resolveConfirmation.mutate({
-                            confirmationId: snapshot.pendingConfirmation!.id,
-                            approved: true,
-                          })
-                        }
-                      >
-                        Approve
-                      </Button>
-                      <Button
-                        variant="danger"
-                        onClick={() =>
-                          mutations.resolveConfirmation.mutate({
-                            confirmationId: snapshot.pendingConfirmation!.id,
-                            approved: false,
-                          })
-                        }
-                      >
-                        Deny
-                      </Button>
-                    </div>
-                  </Card>
-                ) : null}
-
-                {(snapshot?.planSteps.length ?? 0) > 0 ? (
-                  <Card className="space-y-2">
-                    <span className="text-xs font-semibold text-foreground">
-                      Orchestrated Plan
-                    </span>
-                    <ol className="space-y-1">
-                      {snapshot?.planSteps.map((stepText, idx) => {
-                        const activeIdx = snapshot.activePlanIndex;
-                        const done = idx < activeIdx;
-                        const current = idx === activeIdx;
-                        return (
-                          <li
-                            key={`${idx}-${stepText}`}
-                            className={`flex items-start gap-2 rounded-md px-2 py-1 text-[11px] ${
-                              current
-                                ? "bg-primary/15 font-semibold text-foreground"
-                                : done
-                                  ? "text-tertiary line-through"
-                                  : "text-foreground/80"
-                            }`}
-                          >
-                            <span className="shrink-0 font-mono text-[10px] text-primary">
-                              {done ? "✓" : `${idx + 1}.`}
-                            </span>
-                            <span>{stepText}</span>
-                          </li>
-                        );
-                      })}
-                    </ol>
-                  </Card>
-                ) : null}
+                <PlanChecklist
+                  planSteps={snapshot?.planSteps ?? []}
+                  activePlanIndex={snapshot?.activePlanIndex ?? 0}
+                  phase={phase}
+                />
 
                 {snapshot?.lastDiagnosis ? (
                   <Card className="space-y-1 border-warning/40 bg-warning/10">
-                    <p className="text-[11px] font-semibold text-warning">
+                    <p className="text-xs font-semibold text-warning">
                       Recovery #{snapshot.recoveryCount}
                     </p>
-                    <p className="text-[11px] text-foreground/85">
+                    <p className="text-xs text-foreground/85">
                       {snapshot.lastDiagnosis}
                     </p>
                   </Card>
@@ -449,48 +429,11 @@ export function TrayControl() {
               </div>
             )}
 
-            {(snapshot?.steps.length ?? 0) > 0 ? (
-              <Card className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-foreground">
-                    Live Action Feed
-                  </span>
-                  <span className="text-[10px] text-tertiary">
-                    {snapshot?.steps.length} actions
-                  </span>
-                </div>
-                <div className="max-h-40 space-y-1.5 overflow-y-auto pr-0.5">
-                  {[...(snapshot?.steps ?? [])].reverse().map((step, idx) => (
-                    <div
-                      key={`${step.stepNumber}-${step.actionType}-${idx}-${step.timestamp}`}
-                      className="rounded-lg border border-tertiary/20 bg-background/70 px-2.5 py-1.5"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-primary">
-                          #{step.stepNumber} · {step.actionType}
-                        </span>
-                        <span
-                          className={`text-[10px] font-medium ${stepStatusClass(step.status)}`}
-                        >
-                          {step.status}
-                        </span>
-                      </div>
-                      <p className="text-[11px] font-medium text-foreground">
-                        {step.description}
-                      </p>
-                      <p className="text-[10px] text-tertiary">
-                        {step.narration}
-                      </p>
-                      {step.verificationNote ? (
-                        <p className="mt-0.5 text-[10px] text-foreground/75">
-                          Check: {step.verificationNote}
-                        </p>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              </Card>
-            ) : null}
+            <StepFeed
+              steps={snapshot?.steps ?? []}
+              title="Live Action Feed"
+              compact={false}
+            />
 
             <Card>
               <Button
@@ -502,13 +445,18 @@ export function TrayControl() {
                 Test Pointer Overlay
               </Button>
             </Card>
-          </>
+          </div>
         ) : null}
 
         {activeTab === "live" ? (
-          <div className="space-y-3">
+          <div
+            id="panel-live"
+            role="tabpanel"
+            aria-labelledby="tab-live"
+            className="space-y-3"
+          >
             <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-tertiary">
+              <span className="text-xs font-semibold text-tertiary">
                 Synced Live Inspector
               </span>
               <Button
@@ -523,186 +471,46 @@ export function TrayControl() {
         ) : null}
 
         {activeTab === "history" ? (
-          <div className="space-y-2">
-            {(historyQuery.data ?? []).length === 0 ? (
-              <Card>
-                <p className="text-center text-xs text-tertiary">
-                  Completed task runs will appear here. Screenshots and OCR text are never stored.
-                </p>
-              </Card>
-            ) : (
-              (historyQuery.data ?? []).map((item) => (
-                <Card key={item.taskId} className="space-y-1.5">
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="text-xs font-semibold text-foreground">
-                      {item.goal}
-                    </p>
-                    <StatusBadge
-                      tone={outcomeTone(item.outcome)}
-                      label={item.outcome}
-                    />
-                  </div>
-                  {(item.category || item.selectedModel) ? (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      {item.category ? (
-                        <StatusBadge
-                          tone="info"
-                          label={categoryDisplayName(item.category)}
-                        />
-                      ) : null}
-                      {item.selectedModel ? (
-                        <ModelChip role="actor" model={item.selectedModel} />
-                      ) : null}
-                    </div>
-                  ) : null}
-                  <p className="text-[11px] text-foreground/80">
-                    {item.summary}
-                  </p>
-                  <div className="flex items-center justify-between text-[10px] text-tertiary">
-                    <span>Steps: {item.stepCount}</span>
-                    <span>
-                      {new Date(item.startedAt).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })}
-                    </span>
-                  </div>
-                </Card>
-              ))
-            )}
+          <div
+            id="panel-history"
+            role="tabpanel"
+            aria-labelledby="tab-history"
+          >
+            <HistoryView
+              records={historyQuery.data ?? []}
+              isError={historyQuery.isError}
+              onRunAgain={(goal) => {
+                setDraftGoal(goal);
+                setActiveTab("task");
+              }}
+            />
           </div>
         ) : null}
 
-        {activeTab === "settings" && configDraft ? (
-          <form onSubmit={handleSaveSettings} className="space-y-3">
-            <Card className="space-y-2.5">
-              <Input
-                id="ollama-api-key"
-                label="Ollama Cloud API Key"
-                type="password"
-                placeholder="Stored in Application Support (0600)"
-                value={configDraft.ollamaApiKey}
-                onChange={(e) =>
-                  setConfigDraft({
-                    ...configDraft,
-                    ollamaApiKey: e.target.value,
-                  })
-                }
-              />
-            </Card>
-
-            <Card className="space-y-2.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-semibold text-foreground">
-                  Multi-Model Routing (Ollama Cloud)
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setConfigDraft({
-                      ...configDraft,
-                      models: { ...DEFAULT_MODEL_ROUTING },
-                    })
-                  }
-                  className="text-[11px] font-semibold text-primary hover:underline focus:outline-none"
-                >
-                  Reset Defaults
-                </button>
-              </div>
-              <Input
-                id="model-judge"
-                label="Judge & Classifier Model"
-                type="text"
-                value={configDraft.models.judgeModel}
-                onChange={(e) => updateModelField("judgeModel", e.target.value)}
-              />
-              <Input
-                id="model-planner"
-                label="Planner Model"
-                type="text"
-                value={configDraft.models.plannerModel}
-                onChange={(e) => updateModelField("plannerModel", e.target.value)}
-              />
-              <Input
-                id="model-vision-actor"
-                label="Vision / General UI Actor Model"
-                type="text"
-                value={configDraft.models.visionActorModel}
-                onChange={(e) =>
-                  updateModelField("visionActorModel", e.target.value)
-                }
-              />
-              <Input
-                id="model-coding-actor"
-                label="Coding / Terminal Actor Model"
-                type="text"
-                value={configDraft.models.codingActorModel}
-                onChange={(e) =>
-                  updateModelField("codingActorModel", e.target.value)
-                }
-              />
-              <Input
-                id="model-writing-actor"
-                label="Writing / Notes Actor Model"
-                type="text"
-                value={configDraft.models.writingActorModel}
-                onChange={(e) =>
-                  updateModelField("writingActorModel", e.target.value)
-                }
-              />
-              <Input
-                id="model-recovery"
-                label="Recovery Specialist Model"
-                type="text"
-                value={configDraft.models.recoveryModel}
-                onChange={(e) => updateModelField("recoveryModel", e.target.value)}
-              />
-            </Card>
-
-            <Card className="space-y-3">
-              <span className="text-xs font-semibold text-foreground">
-                Orchestration Options
-              </span>
-              <Switch
-                id="toggle-judge-verify"
-                checked={configDraft.models.enableJudgeVerification}
-                onChange={(checked) =>
-                  updateModelField("enableJudgeVerification", checked)
-                }
-                label="Judge Step Verification"
-                description="Judge verifies stalled steps and completion before stopping."
-              />
-              <Switch
-                id="toggle-auto-panel"
-                checked={configDraft.models.autoOpenPanel}
-                onChange={(checked) => updateModelField("autoOpenPanel", checked)}
-                label="Auto-Open Live HUD Panel"
-                description="Show the floating live planning & thinking HUD when a task starts."
-              />
-            </Card>
-
-            <Card className="space-y-2">
-              <Button
-                type="submit"
-                className="w-full"
-                disabled={mutations.saveConfig.isPending}
-              >
-                {mutations.saveConfig.isPending
-                  ? "Saving..."
-                  : "Save Configuration"}
-              </Button>
-              {mutations.saveConfig.isError ? (
-                <p className="text-[11px] text-error">
-                  {mutations.saveConfig.error.message}
-                </p>
-              ) : null}
-              {mutations.saveConfig.isSuccess ? (
-                <p className="text-[11px] text-success">
-                  Configuration saved to TaskCompanion/config.json.
-                </p>
-              ) : null}
-            </Card>
-          </form>
+        {activeTab === "settings" && config ? (
+          <div
+            id="panel-settings"
+            role="tabpanel"
+            aria-labelledby="tab-settings"
+          >
+            <SettingsForm
+              config={config}
+              isSaving={mutations.saveConfig.isPending}
+              saveError={
+                mutations.saveConfig.isError
+                  ? mutations.saveConfig.error instanceof Error
+                    ? mutations.saveConfig.error.message
+                    : "Failed to save configuration"
+                  : null
+              }
+              saveSuccess={mutations.saveConfig.isSuccess}
+              isTesting={mutations.testOllamaConnection.isPending}
+              availableModels={availableModels}
+              connectionStatus={connectionStatus}
+              onSave={(payload) => mutations.saveConfig.mutate(payload)}
+              onTestConnection={handleTestConnection}
+            />
+          </div>
         ) : null}
       </div>
     </div>

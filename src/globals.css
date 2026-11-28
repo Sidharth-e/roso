@@ -6,7 +6,7 @@
   :root {
     --color-primary: 37 99 235;
     --color-secondary: 226 232 240;
-    --color-tertiary: 148 163 184;
+    --color-tertiary: 71 85 105;
     --color-background: 248 250 252;
     --color-foreground: 15 23 42;
     --color-success: 22 163 74;
@@ -18,7 +18,7 @@
   .dark {
     --color-primary: 96 165 250;
     --color-secondary: 30 41 59;
-    --color-tertiary: 100 116 139;
+    --color-tertiary: 148 163 184;
     --color-background: 15 23 42;
     --color-foreground: 241 245 249;
     --color-success: 34 197 94;
@@ -51,11 +51,11 @@
   }
 
   .ui-input {
-    @apply w-full rounded-lg border border-tertiary/35 bg-background px-3 py-2 text-sm text-foreground placeholder:text-tertiary focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/30 transition;
+    @apply w-full rounded-lg border border-tertiary/35 bg-background px-3 py-2 text-sm text-foreground placeholder:text-tertiary focus-visible:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 transition;
   }
 
   .ui-btn {
-    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .ui-btn-primary {
@@ -68,6 +68,10 @@
 
   .ui-btn-danger {
     @apply ui-btn bg-error/15 text-error border border-error/30 hover:bg-error/25;
+  }
+
+  .icon-btn {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded-lg border border-tertiary/30 bg-secondary text-foreground transition hover:bg-secondary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .ui-badge {
@@ -99,7 +103,7 @@
   }
 
   .filter-pill {
-    @apply rounded-md px-2 py-1 text-[11px] font-semibold text-tertiary transition hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40;
+    @apply rounded-md px-2 py-1 text-[11px] font-semibold text-tertiary transition hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40;
   }
 
   .filter-pill-active {

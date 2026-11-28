@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xcap::Monitor;
 
-pub const MAX_DOWNSCALED_WIDTH: u32 = 1024;
-const JPEG_QUALITY: u8 = 72;
+pub const MAX_DOWNSCALED_WIDTH: u32 = 1280;
+const JPEG_QUALITY: u8 = 80;
+pub const DIFF_THUMBNAIL_WIDTH: u32 = 256;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -22,13 +23,21 @@ pub enum CaptureError {
     ImageEncode(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveWindowMetadata {
     pub app_name: String,
     pub window_title: String,
     pub process_id: u64,
     pub is_system_locked: bool,
+    #[serde(default)]
+    pub window_x: f64,
+    #[serde(default)]
+    pub window_y: f64,
+    #[serde(default)]
+    pub window_width: f64,
+    #[serde(default)]
+    pub window_height: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -51,6 +60,13 @@ pub struct AnnotationBox {
     pub w_norm: f64,
     pub h_norm: f64,
     pub is_interactive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrayThumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
 }
 
 pub struct UnencodedCaptureFrame {
@@ -105,6 +121,10 @@ pub fn read_active_window_metadata() -> ActiveWindowMetadata {
                 window_title,
                 process_id: win.process_id,
                 is_system_locked,
+                window_x: win.position.x,
+                window_y: win.position.y,
+                window_width: win.position.width,
+                window_height: win.position.height,
             }
         }
         Err(_) => ActiveWindowMetadata {
@@ -112,6 +132,10 @@ pub fn read_active_window_metadata() -> ActiveWindowMetadata {
             window_title: String::new(),
             process_id: 0,
             is_system_locked: false,
+            window_x: 0.0,
+            window_y: 0.0,
+            window_width: 0.0,
+            window_height: 0.0,
         },
     }
 }
@@ -127,7 +151,7 @@ pub fn capture_raw_frame_in_ram() -> Result<UnencodedCaptureFrame, CaptureError>
     }
 
     let active_window = read_active_window_metadata();
-    let monitor = select_primary_monitor()?;
+    let monitor = select_monitor_for_window(&active_window)?;
     let full_res_rgba = monitor
         .capture_image()
         .map_err(|err| CaptureError::ScreenCapture(err.to_string()))?;
@@ -138,6 +162,18 @@ pub fn capture_raw_frame_in_ram() -> Result<UnencodedCaptureFrame, CaptureError>
         active_window,
         screen_metrics,
     })
+}
+
+pub fn capture_active_thumbnail_in_ram() -> Result<GrayThumbnail, CaptureError> {
+    if !has_screen_recording_permission() {
+        return Err(CaptureError::PermissionDenied);
+    }
+    let active_window = read_active_window_metadata();
+    let monitor = select_monitor_for_window(&active_window)?;
+    let rgba = monitor
+        .capture_image()
+        .map_err(|err| CaptureError::ScreenCapture(err.to_string()))?;
+    Ok(compute_gray_thumbnail(&rgba, DIFF_THUMBNAIL_WIDTH))
 }
 
 pub fn capture_primary_display_in_ram() -> Result<RawCaptureFrame, CaptureError> {
@@ -157,6 +193,97 @@ pub fn downscale_and_encode_jpeg_base64(rgba: &RgbaImage) -> Result<String, Capt
     encode_rgb_jpeg_base64(&rgb_image)
 }
 
+pub fn compute_gray_thumbnail(rgba: &RgbaImage, max_width: u32) -> GrayThumbnail {
+    let (src_w, src_h) = rgba.dimensions();
+    if src_w == 0 || src_h == 0 || max_width == 0 {
+        return GrayThumbnail {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    }
+
+    let dst_w = src_w.min(max_width);
+    let dst_h = if src_w <= max_width {
+        src_h
+    } else {
+        ((f64::from(src_h) * (f64::from(dst_w) / f64::from(src_w))).round() as u32).max(1)
+    };
+
+    let src = rgba.as_raw();
+    let src_stride = (src_w as usize) * 4;
+    let mut pixels = vec![0u8; (dst_w as usize) * (dst_h as usize)];
+
+    let x_ranges: Vec<(usize, usize)> = (0..dst_w)
+        .map(|dx| {
+            let x0 = ((u64::from(dx) * u64::from(src_w)) / u64::from(dst_w)) as usize;
+            let x1 = (((u64::from(dx) + 1) * u64::from(src_w)) / u64::from(dst_w))
+                .max(x0 as u64 + 1)
+                .min(u64::from(src_w)) as usize;
+            (x0, x1)
+        })
+        .collect();
+
+    for dy in 0..dst_h {
+        let y0 = ((u64::from(dy) * u64::from(src_h)) / u64::from(dst_h)) as usize;
+        let y1 = (((u64::from(dy) + 1) * u64::from(src_h)) / u64::from(dst_h))
+            .max(y0 as u64 + 1)
+            .min(u64::from(src_h)) as usize;
+        let row_offset = (dy as usize) * (dst_w as usize);
+
+        for (dx, &(x0, x1)) in x_ranges.iter().enumerate() {
+            let mut sum_luma: u64 = 0;
+            let mut count: u64 = 0;
+            for sy in y0..y1 {
+                let row = &src[sy * src_stride..(sy + 1) * src_stride];
+                for sx in x0..x1 {
+                    let off = sx * 4;
+                    let r = u64::from(row[off]);
+                    let g = u64::from(row[off + 1]);
+                    let b = u64::from(row[off + 2]);
+                    sum_luma += (77 * r + 150 * g + 29 * b) >> 8;
+                    count += 1;
+                }
+            }
+            pixels[row_offset + dx] = (sum_luma / count.max(1)) as u8;
+        }
+    }
+
+    GrayThumbnail {
+        width: dst_w,
+        height: dst_h,
+        pixels,
+    }
+}
+
+pub fn compute_thumbnail_diff_ratio(before: &GrayThumbnail, after: &GrayThumbnail) -> f64 {
+    if before.width != after.width || before.height != after.height {
+        return 1.0;
+    }
+    if before.pixels.is_empty() {
+        return 0.0;
+    }
+    let changed = before
+        .pixels
+        .iter()
+        .zip(after.pixels.iter())
+        .filter(|(&a, &b)| (i32::from(a) - i32::from(b)).abs() > 10)
+        .count();
+    changed as f64 / before.pixels.len() as f64
+}
+
+pub fn is_thumbnail_uniform(thumb: &GrayThumbnail) -> bool {
+    let Some(&first) = thumb.pixels.first() else {
+        return true;
+    };
+    let similar = thumb
+        .pixels
+        .iter()
+        .filter(|&&p| (i32::from(p) - i32::from(first)).abs() <= 3)
+        .count();
+    similar * 100 > thumb.pixels.len() * 99
+}
+
 pub fn compute_frame_diff_ratio(before: &RgbaImage, after: &RgbaImage) -> f64 {
     if before.dimensions() != after.dimensions() {
         return 1.0;
@@ -165,27 +292,9 @@ pub fn compute_frame_diff_ratio(before: &RgbaImage, after: &RgbaImage) -> f64 {
     if w == 0 || h == 0 {
         return 0.0;
     }
-    let cols = 64u32.min(w);
-    let rows = 36u32.min(h);
-    let mut changed: u64 = 0;
-    let total = u64::from(cols) * u64::from(rows);
-
-    for gy in 0..rows {
-        let py = ((u64::from(gy) * u64::from(h)) / u64::from(rows)) as u32;
-        for gx in 0..cols {
-            let px = ((u64::from(gx) * u64::from(w)) / u64::from(cols)) as u32;
-            let p1 = before.get_pixel(px, py);
-            let p2 = after.get_pixel(px, py);
-            let diff = (i32::from(p1[0]) - i32::from(p2[0])).abs()
-                + (i32::from(p1[1]) - i32::from(p2[1])).abs()
-                + (i32::from(p1[2]) - i32::from(p2[2])).abs();
-            if diff > 36 {
-                changed += 1;
-            }
-        }
-    }
-
-    changed as f64 / total as f64
+    let thumb_a = compute_gray_thumbnail(before, DIFF_THUMBNAIL_WIDTH);
+    let thumb_b = compute_gray_thumbnail(after, DIFF_THUMBNAIL_WIDTH);
+    compute_thumbnail_diff_ratio(&thumb_a, &thumb_b)
 }
 
 pub fn render_annotated_jpeg_base64(
@@ -262,13 +371,13 @@ pub fn downscale_rgba_to_rgb(rgba: &RgbaImage, max_width: u32) -> RgbImage {
     let dst_h = ((f64::from(src_h) * (f64::from(dst_w) / f64::from(src_w))).round() as u32).max(1);
     let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 3];
 
-    let x_map: Vec<(usize, usize, u32, u32)> = (0..dst_w)
+    let x_ranges: Vec<(usize, usize)> = (0..dst_w)
         .map(|dx| {
-            let fx = (u64::from(dx) * u64::from(src_w - 1) * 256) / u64::from((dst_w - 1).max(1));
-            let x0 = (fx >> 8) as usize;
-            let x1 = (x0 + 1).min((src_w - 1) as usize);
-            let wx = (fx & 0xFF) as u32;
-            (x0 * 4, x1 * 4, 256 - wx, wx)
+            let x0 = ((u64::from(dx) * u64::from(src_w)) / u64::from(dst_w)) as usize;
+            let x1 = (((u64::from(dx) + 1) * u64::from(src_w)) / u64::from(dst_w))
+                .max(x0 as u64 + 1)
+                .min(u64::from(src_w)) as usize;
+            (x0, x1)
         })
         .collect();
 
@@ -276,31 +385,34 @@ pub fn downscale_rgba_to_rgb(rgba: &RgbaImage, max_width: u32) -> RgbImage {
     let dst_stride = (dst_w as usize) * 3;
 
     for dy in 0..dst_h {
-        let fy = (u64::from(dy) * u64::from(src_h - 1) * 256) / u64::from((dst_h - 1).max(1));
-        let y0 = (fy >> 8) as usize;
-        let y1 = (y0 + 1).min((src_h - 1) as usize);
-        let wy = (fy & 0xFF) as u32;
-        let inv_wy = 256 - wy;
-
-        let row0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
-        let row1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
+        let y0 = ((u64::from(dy) * u64::from(src_h)) / u64::from(dst_h)) as usize;
+        let y1 = (((u64::from(dy) + 1) * u64::from(src_h)) / u64::from(dst_h))
+            .max(y0 as u64 + 1)
+            .min(u64::from(src_h)) as usize;
         let dst_row = &mut out[(dy as usize) * dst_stride..((dy as usize) + 1) * dst_stride];
 
-        for (dx, &(x0_off, x1_off, inv_wx, wx)) in x_map.iter().enumerate() {
-            let w00 = inv_wx * inv_wy;
-            let w10 = wx * inv_wy;
-            let w01 = inv_wx * wy;
-            let w11 = wx * wy;
-            let dst_off = dx * 3;
+        for (dx, &(x0, x1)) in x_ranges.iter().enumerate() {
+            let mut sum_r: u64 = 0;
+            let mut sum_g: u64 = 0;
+            let mut sum_b: u64 = 0;
+            let mut count: u64 = 0;
 
-            for c in 0..3 {
-                let p00 = u32::from(row0[x0_off + c]);
-                let p10 = u32::from(row0[x1_off + c]);
-                let p01 = u32::from(row1[x0_off + c]);
-                let p11 = u32::from(row1[x1_off + c]);
-                let val = (p00 * w00 + p10 * w10 + p01 * w01 + p11 * w11 + 32768) >> 16;
-                dst_row[dst_off + c] = val as u8;
+            for sy in y0..y1 {
+                let row = &src[sy * src_stride..(sy + 1) * src_stride];
+                for sx in x0..x1 {
+                    let off = sx * 4;
+                    sum_r += u64::from(row[off]);
+                    sum_g += u64::from(row[off + 1]);
+                    sum_b += u64::from(row[off + 2]);
+                    count += 1;
+                }
             }
+
+            let denom = count.max(1);
+            let dst_off = dx * 3;
+            dst_row[dst_off] = ((sum_r + denom / 2) / denom) as u8;
+            dst_row[dst_off + 1] = ((sum_g + denom / 2) / denom) as u8;
+            dst_row[dst_off + 2] = ((sum_b + denom / 2) / denom) as u8;
         }
     }
 
@@ -384,16 +496,17 @@ fn draw_coordinate_grid(img: &mut RgbImage) {
         let gy = ((f64::from(h) * frac).round() as i32).clamp(0, h as i32 - 1);
 
         for py in 0..h as i32 {
-            blend_pixel(img, gx, py, grid_color, 0.22);
+            blend_pixel(img, gx, py, grid_color, 0.14);
         }
         for px in 0..w as i32 {
-            blend_pixel(img, px, gy, grid_color, 0.22);
+            blend_pixel(img, px, gy, grid_color, 0.14);
         }
 
         let label = format!("0.{step}");
         let top_x = (gx + 2).clamp(0, (w as i32 - 20).max(0));
-        fill_rect(img, top_x, 2, 19, 10, [15, 23, 42]);
-        draw_bitmap_text(img, top_x + 1, 3, &label, [226, 232, 240]);
+        let top_y = 26.min((h as i32 - 12).max(0));
+        fill_rect(img, top_x, top_y, 19, 10, [15, 23, 42]);
+        draw_bitmap_text(img, top_x + 1, top_y + 1, &label, [226, 232, 240]);
 
         let left_y = (gy + 2).clamp(0, (h as i32 - 10).max(0));
         fill_rect(img, 2, left_y, 19, 10, [15, 23, 42]);
@@ -478,6 +591,34 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         _ => [0; 7],
     }
+}
+
+fn select_monitor_for_window(active: &ActiveWindowMetadata) -> Result<Monitor, CaptureError> {
+    let monitors = Monitor::all().map_err(|err| CaptureError::ScreenCapture(err.to_string()))?;
+    if monitors.is_empty() {
+        return Err(CaptureError::NoPrimaryDisplay);
+    }
+    if active.window_width > 0.0 && active.window_height > 0.0 {
+        let cx = active.window_x + active.window_width * 0.5;
+        let cy = active.window_y + active.window_height * 0.5;
+        if let Some(matched) = monitors.iter().find(|m| {
+            let mx = f64::from(m.x().unwrap_or(0));
+            let my = f64::from(m.y().unwrap_or(0));
+            let mw = f64::from(m.width().unwrap_or(0));
+            let mh = f64::from(m.height().unwrap_or(0));
+            cx >= mx && cx < mx + mw && cy >= my && cy < my + mh
+        }) {
+            return Ok(matched.clone());
+        }
+    }
+    if let Some(primary) = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .cloned()
+    {
+        return Ok(primary);
+    }
+    Ok(monitors[0].clone())
 }
 
 fn select_primary_monitor() -> Result<Monitor, CaptureError> {
@@ -588,7 +729,7 @@ mod tests {
     use image::Rgba;
 
     #[test]
-    fn downscales_wide_image_to_1024_and_encodes_raw_base64_without_prefix() {
+    fn downscales_wide_image_to_1280_and_encodes_raw_base64_without_prefix() {
         let img = RgbaImage::from_pixel(2560, 1440, Rgba([24, 48, 96, 255]));
         let encoded = downscale_and_encode_jpeg_base64(&img).expect("jpeg encode should succeed");
         assert!(!encoded.is_empty());
@@ -598,12 +739,12 @@ mod tests {
             .decode(&encoded)
             .expect("valid base64 output");
         let decoded_img = image::load_from_memory(&decoded_bytes).expect("valid jpeg bytes");
-        assert_eq!(decoded_img.width(), 1024);
-        assert_eq!(decoded_img.height(), 576);
+        assert_eq!(decoded_img.width(), 1280);
+        assert_eq!(decoded_img.height(), 720);
     }
 
     #[test]
-    fn preserves_dimensions_when_width_below_1024() {
+    fn preserves_dimensions_when_width_below_1280() {
         let img = RgbaImage::from_pixel(800, 600, Rgba([120, 130, 140, 255]));
         let encoded = downscale_and_encode_jpeg_base64(&img).expect("jpeg encode should succeed");
         let decoded_bytes = BASE64_STANDARD
@@ -638,8 +779,8 @@ mod tests {
         let encoded = render_annotated_jpeg_base64(&img, &boxes).expect("annotated jpeg");
         let bytes = BASE64_STANDARD.decode(&encoded).expect("valid base64");
         let decoded = image::load_from_memory(&bytes).expect("valid annotated jpeg");
-        assert_eq!(decoded.width(), 1024);
-        assert_eq!(decoded.height(), 640);
+        assert_eq!(decoded.width(), 1280);
+        assert_eq!(decoded.height(), 800);
     }
 
     #[cfg(target_os = "macos")]
@@ -653,11 +794,28 @@ mod tests {
     }
 
     #[test]
-    fn computes_visual_diff_ratio_across_frames() {
-        let a = RgbaImage::from_pixel(320, 180, Rgba([20, 30, 40, 255]));
-        let b = RgbaImage::from_pixel(320, 180, Rgba([20, 30, 40, 255]));
-        let c = RgbaImage::from_pixel(320, 180, Rgba([220, 230, 240, 255]));
+    fn computes_visual_diff_ratio_across_frames_and_catches_small_edits() {
+        let a = RgbaImage::from_pixel(1280, 720, Rgba([20, 30, 40, 255]));
+        let b = RgbaImage::from_pixel(1280, 720, Rgba([20, 30, 40, 255]));
+        let c = RgbaImage::from_pixel(1280, 720, Rgba([220, 230, 240, 255]));
         assert!((compute_frame_diff_ratio(&a, &b) - 0.0).abs() < 1e-6);
         assert!(compute_frame_diff_ratio(&a, &c) > 0.99);
+
+        let mut d = a.clone();
+        for py in 11..19 {
+            for px in 11..19 {
+                d.put_pixel(px, py, Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert!(compute_frame_diff_ratio(&a, &d) > 0.0);
+        assert!(is_thumbnail_uniform(&compute_gray_thumbnail(&a, 256)));
+
+        let mut non_uniform = a.clone();
+        for py in 0..200 {
+            for px in 0..200 {
+                non_uniform.put_pixel(px, py, Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert!(!is_thumbnail_uniform(&compute_gray_thumbnail(&non_uniform, 256)));
     }
 }

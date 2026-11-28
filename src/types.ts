@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+export const CLOUD_OLLAMA_BASE_URL = "https://ollama.com";
+export const LOCAL_OLLAMA_BASE_URL = "http://localhost:11434";
+
 export const TaskPhaseSchema = z.enum([
   "idle",
   "classifying",
@@ -14,6 +17,18 @@ export const TaskPhaseSchema = z.enum([
   "stopped",
 ]);
 export type TaskPhase = z.infer<typeof TaskPhaseSchema>;
+
+export function isActivePhase(phase: TaskPhase): boolean {
+  return (
+    phase === "classifying" ||
+    phase === "planning" ||
+    phase === "running" ||
+    phase === "verifying" ||
+    phase === "recovering" ||
+    phase === "paused" ||
+    phase === "awaiting_confirmation"
+  );
+}
 
 export const TaskClassificationSchema = z.object({
   category: z.string(),
@@ -63,6 +78,10 @@ export const PendingConfirmationSchema = z.object({
   description: z.string(),
   narration: z.string(),
   reason: z.string(),
+  fullPayload: z.string().nullable().optional(),
+  targetApp: z.string().nullable().optional(),
+  targetUrl: z.string().nullable().optional(),
+  expiresAt: z.string().nullable().optional(),
 });
 export type PendingConfirmation = z.infer<typeof PendingConfirmationSchema>;
 
@@ -70,6 +89,7 @@ export const EngineSnapshotSchema = z.object({
   phase: TaskPhaseSchema,
   taskId: z.string().nullable(),
   goal: z.string(),
+  startedAt: z.string().nullable().optional(),
   classification: TaskClassificationSchema.nullable(),
   activeRole: z.string(),
   activeModel: z.string(),
@@ -116,10 +136,21 @@ export const DEFAULT_MODEL_ROUTING: ModelRoutingConfig = {
 };
 
 export const AppConfigSchema = z.object({
-  ollamaApiKey: z.string(),
+  ollamaBaseUrl: z.string(),
+  hasApiKey: z.boolean(),
+  apiKeyPreview: z.string(),
+  cloudConsentAccepted: z.boolean(),
   models: ModelRoutingConfigSchema,
 });
 export type AppConfig = z.infer<typeof AppConfigSchema>;
+
+export interface UpdateAppConfigPayload {
+  ollamaBaseUrl: string;
+  ollamaApiKey: string;
+  clearApiKey: boolean;
+  cloudConsentAccepted: boolean;
+  models: ModelRoutingConfig;
+}
 
 export const TaskHistoryRecordSchema = z.object({
   taskId: z.string(),

@@ -1,9 +1,11 @@
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
+  KeyboardEvent,
   ReactNode,
   TextareaHTMLAttributes,
 } from "react";
+import { useTaskUiStore } from "../store";
 import type { TaskPhase, TrayTab } from "../types";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -31,6 +33,102 @@ export function Button({
   );
 }
 
+interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  label: string;
+  children: ReactNode;
+}
+
+export function IconButton({
+  label,
+  className = "",
+  type = "button",
+  children,
+  ...rest
+}: IconButtonProps) {
+  return (
+    <button
+      type={type}
+      aria-label={label}
+      title={label}
+      className={`icon-btn ${className}`}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function HudIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M9.5 2.5V13.5" stroke="currentColor" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+export function SunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="3" stroke="currentColor" strokeWidth="1.5" />
+      <path
+        d="M8 1.5V3M8 13V14.5M1.5 8H3M13 8H14.5M3.4 3.4L4.5 4.5M11.5 11.5L12.6 12.6M12.6 3.4L11.5 4.5M4.5 11.5L3.4 12.6"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+export function MoonIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M12.8 10.2A5.5 5.5 0 0 1 5.8 3.2a5.5 5.5 0 1 0 7 7Z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+export function CloseIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M4 4L12 12M12 4L4 12"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+export function MinimizeIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M3.5 10.5H12.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function ExpandIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M6 3.5H12.5V10M12.5 3.5L7.5 8.5M10 12.5H3.5V6"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   label: string;
   id: string;
@@ -39,7 +137,7 @@ interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
 export function Input({ label, id, className = "", ...rest }: InputProps) {
   return (
     <div className="flex flex-col gap-1">
-      <label htmlFor={id} className="text-xs font-medium text-foreground/80">
+      <label htmlFor={id} className="text-xs font-medium text-foreground/85">
         {label}
       </label>
       <input id={id} className={`ui-input ${className}`} {...rest} />
@@ -55,7 +153,7 @@ interface TextAreaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
 export function TextArea({ label, id, className = "", ...rest }: TextAreaProps) {
   return (
     <div className="flex flex-col gap-1">
-      <label htmlFor={id} className="text-xs font-medium text-foreground/80">
+      <label htmlFor={id} className="text-xs font-medium text-foreground/85">
         {label}
       </label>
       <textarea id={id} className={`ui-input resize-none ${className}`} {...rest} />
@@ -88,7 +186,7 @@ export function Switch({
           {label}
         </label>
         {description ? (
-          <span className="text-[11px] text-tertiary">{description}</span>
+          <span className="text-xs text-tertiary">{description}</span>
         ) : null}
       </div>
       <button
@@ -97,7 +195,7 @@ export function Switch({
         role="switch"
         aria-checked={checked}
         onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary/40 ${
+        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${
           checked ? "bg-primary" : "bg-tertiary/40"
         }`}
       >
@@ -155,6 +253,32 @@ export function Card({ children, className = "" }: CardProps) {
   return <section className={`surface-card ${className}`}>{children}</section>;
 }
 
+export function ErrorToast() {
+  const toastError = useTaskUiStore((s) => s.toastError);
+  const clearToastError = useTaskUiStore((s) => s.clearToastError);
+
+  if (!toastError) {
+    return null;
+  }
+
+  return (
+    <div
+      role="alert"
+      className="mb-2.5 flex items-start justify-between gap-2 rounded-lg border border-error/40 bg-error/15 px-3 py-2 text-xs text-error"
+    >
+      <span className="min-w-0 break-words font-medium">{toastError}</span>
+      <button
+        type="button"
+        onClick={clearToastError}
+        aria-label="Dismiss error"
+        className="shrink-0 rounded px-1 py-0.5 text-xs font-bold text-error hover:bg-error/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/40"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
 interface TabBarProps {
   activeTab: TrayTab;
   onSelect: (tab: TrayTab) => void;
@@ -168,20 +292,46 @@ const TABS: ReadonlyArray<{ id: TrayTab; label: string }> = [
 ];
 
 export function TabBar({ activeTab, onSelect }: TabBarProps) {
+  function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>, idx: number) {
+    let nextIdx: number | null = null;
+    if (event.key === "ArrowRight") {
+      nextIdx = (idx + 1) % TABS.length;
+    } else if (event.key === "ArrowLeft") {
+      nextIdx = (idx - 1 + TABS.length) % TABS.length;
+    } else if (event.key === "Home") {
+      nextIdx = 0;
+    } else if (event.key === "End") {
+      nextIdx = TABS.length - 1;
+    }
+    if (nextIdx !== null) {
+      event.preventDefault();
+      const targetTab = TABS[nextIdx];
+      onSelect(targetTab.id);
+      const nextEl = document.getElementById(`tab-${targetTab.id}`);
+      nextEl?.focus();
+    }
+  }
+
   return (
-    <nav
+    <div
+      role="tablist"
       aria-label="Task Companion views"
       className="grid grid-cols-4 gap-1 rounded-lg bg-secondary/80 p-1"
     >
-      {TABS.map((tab) => {
+      {TABS.map((tab, idx) => {
         const selected = tab.id === activeTab;
         return (
           <button
             key={tab.id}
+            id={`tab-${tab.id}`}
             type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={`panel-${tab.id}`}
+            tabIndex={selected ? 0 : -1}
             onClick={() => onSelect(tab.id)}
-            aria-current={selected ? "page" : undefined}
-            className={`rounded-md py-1.5 text-xs font-semibold transition focus:outline-none focus:ring-2 focus:ring-primary/40 ${
+            onKeyDown={(e) => handleKeyDown(e, idx)}
+            className={`rounded-md py-1.5 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${
               selected
                 ? "bg-background text-foreground shadow-sm"
                 : "text-tertiary hover:text-foreground"
@@ -191,7 +341,7 @@ export function TabBar({ activeTab, onSelect }: TabBarProps) {
           </button>
         );
       })}
-    </nav>
+    </div>
   );
 }
 
@@ -267,10 +417,10 @@ export function outcomeTone(
   if (outcome === "completed") {
     return "success";
   }
-  if (outcome === "failed") {
+  if (outcome === "failed" || outcome === "max_steps" || outcome === "unverified" || outcome === "recovery_exhausted") {
     return "error";
   }
-  if (outcome === "stopped" || outcome === "max_steps") {
+  if (outcome === "stopped") {
     return "warning";
   }
   return "neutral";
@@ -280,7 +430,7 @@ export function stepStatusClass(status: string): string {
   if (status === "verified" || status === "done") {
     return "text-success";
   }
-  if (status === "failed" || status === "unverified_failed") {
+  if (status === "failed" || status === "unverified_failed" || status === "denied") {
     return "text-error";
   }
   if (status === "recovery" || status === "retrying") {

@@ -1,4 +1,3 @@
-import axios, { type AxiosInstance } from "axios";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
@@ -18,51 +17,30 @@ import {
   type PointerCuePayload,
   type TaskHistoryRecord,
   type ThemeMode,
+  type UpdateAppConfigPayload,
 } from "./types";
 import { useTaskUiStore } from "./store";
 
-export function createOllamaAxiosInstance(
-  baseURL: string,
-  apiKey: string
-): AxiosInstance {
-  const client = axios.create({
-    baseURL,
-    timeout: 10000,
-    headers: {
-      "Content-Type": "application/json",
-    },
-  });
-
-  client.interceptors.request.use((config) => {
-    const trimmed = apiKey.trim();
-    if (trimmed.length > 0) {
-      config.headers.Authorization = `Bearer ${trimmed}`;
-    }
-    return config;
-  });
-
-  client.interceptors.response.use(
-    (response) => response,
-    (error: unknown) => {
-      if (axios.isAxiosError(error)) {
-        const message =
-          error.response?.status !== undefined
-            ? `Ollama HTTP ${error.response.status}`
-            : error.message;
-        return Promise.reject(new Error(message));
-      }
-      return Promise.reject(new Error("Unexpected network failure"));
-    }
-  );
-
-  return client;
-}
+const IS_DEV =
+  typeof window !== "undefined" &&
+  window.location.hostname === "localhost" &&
+  window.location.port === "1420";
 
 export const QUERY_KEYS = {
   snapshot: ["engine-snapshot"] as const,
   config: ["app-config"] as const,
   history: ["task-history"] as const,
 };
+
+function reportMutationError(error: unknown): void {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Unexpected action error";
+  useTaskUiStore.getState().setToastError(message);
+}
 
 async function fetchEngineSnapshot(): Promise<EngineSnapshot> {
   const raw = await invoke<unknown>("get_engine_snapshot");
@@ -83,7 +61,7 @@ export function useEngineSnapshotQuery() {
   return useQuery({
     queryKey: QUERY_KEYS.snapshot,
     queryFn: fetchEngineSnapshot,
-    refetchInterval: 1500,
+    refetchInterval: 10000,
   });
 }
 
@@ -100,6 +78,18 @@ export function useTaskHistoryQuery() {
     queryKey: QUERY_KEYS.history,
     queryFn: fetchTaskHistory,
   });
+}
+
+export function useFocusPermissionRefresh() {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    function onFocus() {
+      void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.snapshot });
+    }
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [queryClient]);
 }
 
 export function useEngineEventSync() {
@@ -123,6 +113,8 @@ export function useEngineEventSync() {
         ) {
           void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.history });
         }
+      } else if (IS_DEV) {
+        console.warn("Invalid engine-snapshot payload", parsed.error);
       }
     })
       .then((unlisten) => {
@@ -132,7 +124,11 @@ export function useEngineEventSync() {
           unlisten();
         }
       })
-      .catch(() => undefined);
+      .catch((err: unknown) => {
+        if (IS_DEV) {
+          console.warn("Failed to listen for engine-snapshot", err);
+        }
+      });
 
     return () => {
       active = false;
@@ -163,7 +159,11 @@ export function useThemeEventSync() {
           unlisten();
         }
       })
-      .catch(() => undefined);
+      .catch((err: unknown) => {
+        if (IS_DEV) {
+          console.warn("Failed to listen for theme-changed", err);
+        }
+      });
 
     return () => {
       active = false;
@@ -183,8 +183,10 @@ export function useTaskMutations() {
       return EngineSnapshotSchema.parse(raw);
     },
     onSuccess: (snapshot) => {
+      useTaskUiStore.getState().clearToastError();
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
     },
+    onError: reportMutationError,
   });
 
   const pauseTask = useMutation({
@@ -195,6 +197,7 @@ export function useTaskMutations() {
     onSuccess: (snapshot) => {
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
     },
+    onError: reportMutationError,
   });
 
   const resumeTask = useMutation({
@@ -205,6 +208,7 @@ export function useTaskMutations() {
     onSuccess: (snapshot) => {
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
     },
+    onError: reportMutationError,
   });
 
   const stopTask = useMutation({
@@ -216,6 +220,7 @@ export function useTaskMutations() {
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
       void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.history });
     },
+    onError: reportMutationError,
   });
 
   const resolveConfirmation = useMutation({
@@ -229,17 +234,30 @@ export function useTaskMutations() {
     onSuccess: (snapshot) => {
       queryClient.setQueryData(QUERY_KEYS.snapshot, snapshot);
     },
+    onError: reportMutationError,
   });
 
   const saveConfig = useMutation({
-    mutationFn: async (config: AppConfig) => {
+    mutationFn: async (config: UpdateAppConfigPayload) => {
       const raw = await invoke<unknown>("update_app_config", { config });
       return AppConfigSchema.parse(raw);
     },
     onSuccess: (saved) => {
+      useTaskUiStore.getState().clearToastError();
       queryClient.setQueryData(QUERY_KEYS.config, saved);
       void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.snapshot });
     },
+    onError: reportMutationError,
+  });
+
+  const testOllamaConnection = useMutation({
+    mutationFn: async (baseUrl?: string) => {
+      const raw = await invoke<unknown>("test_ollama_connection", {
+        baseUrl: baseUrl ?? null,
+      });
+      return z.array(z.string()).parse(raw);
+    },
+    onError: reportMutationError,
   });
 
   const requestScreenPermission = useMutation({
@@ -250,6 +268,7 @@ export function useTaskMutations() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.snapshot });
     },
+    onError: reportMutationError,
   });
 
   const requestAccessibilityPermission = useMutation({
@@ -260,6 +279,7 @@ export function useTaskMutations() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: QUERY_KEYS.snapshot });
     },
+    onError: reportMutationError,
   });
 
   const testPointer = useMutation({
@@ -267,30 +287,35 @@ export function useTaskMutations() {
       const raw = await invoke<unknown>("fire_test_pointer");
       return PointerCuePayloadSchema.parse(raw);
     },
+    onError: reportMutationError,
   });
 
   const hidePopover = useMutation({
     mutationFn: async (): Promise<void> => {
       await invoke<unknown>("hide_tray_window");
     },
+    onError: reportMutationError,
   });
 
   const showPanel = useMutation({
     mutationFn: async (): Promise<void> => {
       await invoke<unknown>("show_orchestration_panel_window");
     },
+    onError: reportMutationError,
   });
 
   const hidePanel = useMutation({
     mutationFn: async (): Promise<void> => {
       await invoke<unknown>("hide_orchestration_panel_window");
     },
+    onError: reportMutationError,
   });
 
   const togglePanel = useMutation({
     mutationFn: async (): Promise<void> => {
       await invoke<unknown>("toggle_orchestration_panel_window");
     },
+    onError: reportMutationError,
   });
 
   const setPanelCollapsed = useMutation({
@@ -299,12 +324,14 @@ export function useTaskMutations() {
         collapsed,
       });
     },
+    onError: reportMutationError,
   });
 
   const broadcastTheme = useMutation({
     mutationFn: async (theme: ThemeMode): Promise<void> => {
       await invoke<unknown>("broadcast_theme_mode", { theme });
     },
+    onError: reportMutationError,
   });
 
   return {
@@ -314,6 +341,7 @@ export function useTaskMutations() {
     stopTask,
     resolveConfirmation,
     saveConfig,
+    testOllamaConnection,
     requestScreenPermission,
     requestAccessibilityPermission,
     testPointer,

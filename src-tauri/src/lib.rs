@@ -6,10 +6,13 @@ pub mod engine;
 pub mod ocr;
 pub mod overlay;
 
-use crate::automation::request_accessibility_permission as request_ax_permission;
+use crate::automation::{
+    refresh_cached_keyboard_layout, request_accessibility_permission as request_ax_permission,
+};
 use crate::capture::request_screen_recording_permission;
 use crate::config::{
-    load_config, load_history, save_config, validate_goal_input, AppConfig, TaskHistoryRecord,
+    load_config, load_history, save_config, validate_goal_input, validate_ollama_base_url,
+    PublicAppConfig, TaskHistoryRecord, UpdateAppConfigRequest,
 };
 use crate::engine::{EngineSnapshot, TaskEngine};
 use crate::overlay::{
@@ -26,21 +29,46 @@ async fn get_engine_snapshot(engine: State<'_, Arc<TaskEngine>>) -> Result<Engin
 }
 
 #[tauri::command]
-async fn get_app_config(engine: State<'_, Arc<TaskEngine>>) -> Result<AppConfig, String> {
-    Ok(engine.config())
+async fn get_app_config(engine: State<'_, Arc<TaskEngine>>) -> Result<PublicAppConfig, String> {
+    Ok(engine.config().to_public())
 }
 
 #[tauri::command]
 async fn update_app_config(
     engine: State<'_, Arc<TaskEngine>>,
-    config: AppConfig,
-) -> Result<AppConfig, String> {
-    let saved = tokio::task::spawn_blocking(move || save_config(&config))
+    config: UpdateAppConfigRequest,
+) -> Result<PublicAppConfig, String> {
+    let next = engine
+        .config()
+        .apply_update(config)
+        .map_err(|e| e.to_string())?;
+    let saved = tokio::task::spawn_blocking(move || save_config(&next))
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    engine.update_config(saved.clone());
-    Ok(saved)
+    let public = saved.to_public();
+    engine.update_config(saved);
+    Ok(public)
+}
+
+#[tauri::command]
+async fn test_ollama_connection(
+    engine: State<'_, Arc<TaskEngine>>,
+    base_url: Option<String>,
+) -> Result<Vec<String>, String> {
+    let cfg = engine.config();
+    let target_url = match base_url {
+        Some(raw) if !raw.trim().is_empty() => {
+            validate_ollama_base_url(&raw).map_err(|e| e.to_string())?
+        }
+        _ => cfg.resolved_base_url(),
+    };
+    let api_key = cfg.resolved_api_key();
+    engine
+        .client()
+        .test_connection_and_list_models(&target_url, &api_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -176,6 +204,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            refresh_cached_keyboard_layout();
+
             let engine_for_pointer = Arc::clone(&engine_for_setup);
             let engine_for_stop = Arc::clone(&engine_for_setup);
             initialize_windows_and_tray(
@@ -196,6 +226,7 @@ pub fn run() {
             get_engine_snapshot,
             get_app_config,
             update_app_config,
+            test_ollama_connection,
             start_task,
             pause_task,
             resume_task,

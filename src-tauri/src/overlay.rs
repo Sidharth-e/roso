@@ -1,4 +1,4 @@
-use crate::capture::primary_screen_metrics;
+use crate::capture::{primary_screen_metrics, ScreenMetrics};
 use crate::engine::{EngineSnapshot, TaskPhase};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -9,9 +9,6 @@ use tauri::{
 #[cfg(not(target_os = "macos"))]
 use tauri::{LogicalPosition, LogicalSize, Position, Size};
 use uuid::Uuid;
-
-#[cfg(target_os = "macos")]
-use std::cell::Cell;
 
 pub const TRAY_ID: &str = "task-companion-tray";
 pub const TRAY_WINDOW_LABEL: &str = "main";
@@ -45,24 +42,26 @@ pub struct PointerCuePayload {
 mod macos_panel {
     use super::*;
     use objc2::runtime::{AnyClass, AnyObject, NSObject};
-    use objc2::{define_class, msg_send, ClassType, DefinedClass, MainThreadOnly};
+    use objc2::{define_class, msg_send, ClassType, MainThreadOnly};
     use objc2_app_kit::{
         NSColor, NSEvent, NSPanel, NSPopUpMenuWindowLevel, NSResponder, NSScreen, NSWindow,
         NSWindowCollectionBehavior, NSWindowStyleMask,
     };
-    use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
+    use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
+    use parking_lot::Mutex;
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
 
-    #[derive(Debug)]
-    pub struct PanelCompatIvars {
-        pub focusable: Cell<bool>,
-        pub maximizable: Cell<bool>,
+    static FOCUSABLE_PANELS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+
+    fn focusable_set() -> &'static Mutex<HashSet<usize>> {
+        FOCUSABLE_PANELS.get_or_init(|| Mutex::new(HashSet::new()))
     }
 
     define_class!(
         #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
         #[thread_kind = MainThreadOnly]
         #[name = "FocusCompanionPanel"]
-        #[ivars = PanelCompatIvars]
         #[derive(Debug)]
         pub struct FocusCompanionPanel;
 
@@ -82,7 +81,8 @@ mod macos_panel {
 
             #[unsafe(method(canBecomeKeyWindow))]
             fn can_become_key_window(&self) -> bool {
-                self.ivars().focusable.get()
+                let key = (self as *const FocusCompanionPanel) as usize;
+                focusable_set().lock().contains(&key)
             }
 
             #[unsafe(method(constrainFrameRect:toScreen:))]
@@ -134,18 +134,24 @@ mod macos_panel {
                 object_setClass(obj_ptr, target_cls);
             }
 
-            let panel_ref: &FocusCompanionPanel = &*raw_ptr.cast::<FocusCompanionPanel>();
-            panel_ref.ivars().focusable.set(can_become_key);
-            panel_ref.ivars().maximizable.set(false);
+            {
+                let mut set = focusable_set().lock();
+                let key = raw_ptr as usize;
+                if can_become_key {
+                    set.insert(key);
+                } else {
+                    set.remove(&key);
+                }
+            }
 
-            let ns_panel: &NSPanel = panel_ref;
+            let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
             ns_panel.setStyleMask(
                 NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
             );
             ns_panel.setFloatingPanel(true);
             ns_panel.setHidesOnDeactivate(false);
             ns_panel.setWorksWhenModal(true);
-            ns_panel.setBecomesKeyOnlyIfNeeded(!can_become_key);
+            ns_panel.setBecomesKeyOnlyIfNeeded(true);
             ns_panel.setLevel(NSPopUpMenuWindowLevel + level_offset);
 
             let space_mode = if stationary {
@@ -189,10 +195,7 @@ mod macos_panel {
             return (first.frame(), mouse);
         }
         (
-            NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                objc2_foundation::NSSize::new(1440.0, 900.0),
-            ),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)),
             mouse,
         )
     }
@@ -263,10 +266,7 @@ mod macos_panel {
         if let Some(main) = NSScreen::mainScreen(mtm) {
             return main.frame();
         }
-        NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            objc2_foundation::NSSize::new(1440.0, 900.0),
-        )
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0))
     }
 
     pub fn sync_overlay_to_primary_screen(window: &WebviewWindow) -> (f64, f64) {
@@ -288,6 +288,27 @@ mod macos_panel {
         (screen_frame.size.width, screen_frame.size.height)
     }
 
+    pub fn sync_overlay_to_screen_metrics(window: &WebviewWindow, metrics: ScreenMetrics) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let primary = primary_screen_frame(mtm);
+        let cocoa_y = primary.size.height - (metrics.origin_y + metrics.logical_height);
+        let rect = NSRect::new(
+            NSPoint::new(metrics.origin_x, cocoa_y),
+            NSSize::new(metrics.logical_width, metrics.logical_height),
+        );
+        if let Ok(raw_ptr) = window.ns_window() {
+            if !raw_ptr.is_null() {
+                unsafe {
+                    let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
+                    ns_panel.setIgnoresMouseEvents(true);
+                    ns_panel.setFrame_display(rect, true);
+                }
+            }
+        }
+    }
+
     pub fn order_overlay_front(window: &WebviewWindow) {
         if let Ok(raw_ptr) = window.ns_window() {
             if !raw_ptr.is_null() {
@@ -301,7 +322,7 @@ mod macos_panel {
     }
 
     pub fn position_and_show_hud_panel(window: &WebviewWindow, width: f64, height: f64) {
-        promote_to_panel(window, false, 1, true, false, true);
+        promote_to_panel(window, true, 1, true, false, true);
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -316,10 +337,7 @@ mod macos_panel {
             .max(screen_frame.origin.x + 12.0);
         let top_y = screen_frame.origin.y + screen_frame.size.height - 42.0;
         let origin_y = (top_y - height).max(screen_frame.origin.y + 12.0);
-        let rect = NSRect::new(
-            NSPoint::new(x, origin_y),
-            objc2_foundation::NSSize::new(width, height),
-        );
+        let rect = NSRect::new(NSPoint::new(x, origin_y), NSSize::new(width, height));
         unsafe {
             let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
             ns_panel.setIgnoresMouseEvents(false);
@@ -343,13 +361,21 @@ mod macos_panel {
             .max(screen_frame.origin.x + 12.0);
         let top_y = screen_frame.origin.y + screen_frame.size.height - 42.0;
         let origin_y = (top_y - height).max(screen_frame.origin.y + 12.0);
-        let rect = NSRect::new(
-            NSPoint::new(x, origin_y),
-            objc2_foundation::NSSize::new(width, height),
-        );
+        let rect = NSRect::new(NSPoint::new(x, origin_y), NSSize::new(width, height));
         unsafe {
             let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
             ns_panel.setFrame_display(rect, true);
+        }
+    }
+
+    pub fn set_panel_ignores_mouse_events(window: &WebviewWindow, ignore: bool) {
+        if let Ok(raw_ptr) = window.ns_window() {
+            if !raw_ptr.is_null() {
+                unsafe {
+                    let ns_panel: &NSPanel = &*raw_ptr.cast::<NSPanel>();
+                    ns_panel.setIgnoresMouseEvents(ignore);
+                }
+            }
         }
     }
 }
@@ -495,6 +521,8 @@ fn ensure_windows_created(app_handle: &AppHandle) -> tauri::Result<()> {
         .always_on_top(true)
         .visible_on_all_workspaces(true)
         .focused(false)
+        // The HUD stays visible while the agent types, so it must never become the key
+        // window: clicking Pause/Resume would otherwise route agent keystrokes into it.
         .focusable(false)
         .skip_taskbar(true)
         .shadow(false)
@@ -538,6 +566,58 @@ pub fn configure_overlay_window(app_handle: &AppHandle) {
             let _ = overlay.show();
         }
     });
+}
+
+pub fn sync_overlay_to_metrics(app_handle: &AppHandle, metrics: ScreenMetrics) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(overlay) = handle.get_webview_window(OVERLAY_WINDOW_LABEL) else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::sync_overlay_to_screen_metrics(&overlay, metrics);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = overlay.set_position(Position::Logical(LogicalPosition::new(
+                metrics.origin_x,
+                metrics.origin_y,
+            )));
+            let _ = overlay.set_size(Size::Logical(LogicalSize::new(
+                metrics.logical_width,
+                metrics.logical_height,
+            )));
+        }
+    });
+}
+
+/// True when one of the companion's own windows holds keyboard focus, meaning
+/// synthesized keystrokes would land in our UI instead of the target app.
+pub fn companion_window_is_key(app_handle: &AppHandle) -> bool {
+    [TRAY_WINDOW_LABEL, PANEL_WINDOW_LABEL].iter().any(|label| {
+        app_handle
+            .get_webview_window(label)
+            .is_some_and(|w| w.is_focused().unwrap_or(false))
+    })
+}
+
+pub fn set_hud_ignores_mouse_events(app_handle: &AppHandle, ignore: bool) {
+    let handle = app_handle.clone();
+    let _ = app_handle.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window(PANEL_WINDOW_LABEL) else {
+            return;
+        };
+        let _ = win.set_ignore_cursor_events(ignore);
+        #[cfg(target_os = "macos")]
+        {
+            macos_panel::set_panel_ignores_mouse_events(&win, ignore);
+        }
+    });
+}
+
+pub fn clear_pointer_cue(app_handle: &AppHandle) {
+    let _ = app_handle.emit("clear-pointer-cue", ());
 }
 
 pub fn show_tray_popover(app_handle: &AppHandle, align_to_cursor: bool) {
@@ -805,6 +885,6 @@ mod tests {
         let panel_size = NSPanel::class().instance_size();
         let custom_panel_size = FocusCompanionPanel::class().instance_size();
         assert_eq!(window_size, panel_size);
-        assert!(custom_panel_size >= panel_size + 2);
+        assert_eq!(custom_panel_size, panel_size);
     }
 }
