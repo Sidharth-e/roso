@@ -393,7 +393,9 @@ fn write_private_file(path: &Path, content: &str) -> Result<(), ConfigError> {
     }
 }
 
-#[cfg(all(target_os = "macos", not(test)))]
+// Debug builds are ad-hoc signed with a new hash every build, so Keychain "Always Allow"
+// never sticks. Skip the Keychain there; the key stays in the 0600 config file instead.
+#[cfg(all(target_os = "macos", not(test), not(debug_assertions)))]
 mod keychain {
     use std::ffi::c_void;
 
@@ -579,7 +581,7 @@ mod keychain {
     }
 }
 
-#[cfg(not(all(target_os = "macos", not(test))))]
+#[cfg(not(all(target_os = "macos", not(test), not(debug_assertions))))]
 mod keychain {
     pub fn load_api_key() -> Option<String> {
         None
